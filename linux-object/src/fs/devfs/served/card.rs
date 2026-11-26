@@ -137,12 +137,34 @@ pub fn serve_card(
         .map_err(|_| LxError::EINVAL)?;
     super::remember(koid, &link);
     let card: Arc<dyn DrmScheme> = Arc::new(remote);
+    enable_nouveau_uapi(&*card);
     drm::register_driver(card.clone());
     drm::build_gpu_nodes();
     add_nodes();
     info!("served drm: the card {} is served", card.name());
     Ok(ServedCard { link, card })
 }
+
+/// `nvidia.nouveau_uapi` on the boot line, which no kernel card could take
+/// then: a served card that has it takes it now, as the kernel's would have
+/// at boot. Before the card is registered, so its node is a nouveau one
+/// from the first open.
+#[cfg(target_arch = "x86_64")]
+fn enable_nouveau_uapi(card: &dyn DrmScheme) {
+    use zcore_drivers::display::{
+        nouveau_uapi_enabled, nouveau_uapi_requested, set_nouveau_uapi_enabled,
+    };
+    if nouveau_uapi_requested() && !nouveau_uapi_enabled() && card.nouveau_uapi_capable() {
+        set_nouveau_uapi_enabled(true);
+        info!(
+            "served drm: nvidia.nouveau_uapi enabled for the served card {}",
+            card.name()
+        );
+    }
+}
+
+#[cfg(not(target_arch = "x86_64"))]
+fn enable_nouveau_uapi(_card: &dyn DrmScheme) {}
 
 /// A `/dev/dri` node for every card that has none: one served after the
 /// boot made the nodes, and `/dev/dri` itself on a machine whose boot found

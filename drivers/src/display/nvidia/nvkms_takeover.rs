@@ -168,6 +168,11 @@ pub fn set_requested(v: bool) {
     REQUESTED.store(v, Ordering::Relaxed);
 }
 
+/// Whether `nvidia.nvkms` was asked for ([`set_requested`]).
+pub fn requested() -> bool {
+    REQUESTED.load(Ordering::Relaxed)
+}
+
 /// [`NvidiaGpu::drives_own_display`]: this card lights its own monitors
 /// through nvkms, as its own DRM device does in Linux: `nvidia.nvkms` (and
 /// `nvidia.gem_vram`, since nvkms only scans out VRAM) on a card that is

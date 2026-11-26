@@ -40,6 +40,7 @@ use std::process::exit;
 use zcore_drivers::builder::IoMapper;
 use zcore_drivers::bus::pci_drivers::PciDriver;
 use zcore_drivers::display::boot_display::{self, BootDisplay};
+use zcore_drivers::display::driver_flags::{self, DriverFlags};
 
 const NAME: &str = "udrv-nvidia";
 
@@ -86,6 +87,18 @@ fn run(only: Option<usize>) {
     // the GPUs whose initiators it is pinned in, which are those there are
     // when it is made.
     gpu::install_dma(&gpus).unwrap_or_else(|e| fail(e));
+    // The boot line's `nvidia.*` switches, as the kernel's driver was
+    // told them, before any GPU comes up (the RM's registry among them).
+    match driver_flags() {
+        Ok(flags) => {
+            println!(
+                "{NAME}: nvidia.* switches {:#x}, registry {:?}",
+                flags.bits, flags.registry
+            );
+            flags.install();
+        }
+        Err(e) => println!("{NAME}: the boot line's nvidia.* switches are unknown ({e}); defaults"),
+    }
     // What the kernel's driver is told at boot, before any GPU comes up:
     // which of them scans out the console decides how it is brought up.
     match boot_display() {
@@ -153,6 +166,13 @@ fn boot_display() -> Result<BootDisplay, udrivers::zx::Status> {
     let mut bytes = [0u8; boot_display::LEN];
     udrivers::claim::boot_display(&mut bytes)?;
     Ok(BootDisplay::decode(&bytes))
+}
+
+/// The boot line's `nvidia.*` switches, as the kernel's driver was told.
+fn driver_flags() -> Result<DriverFlags, udrivers::zx::Status> {
+    let mut bytes = vec![0u8; driver_flags::MAX];
+    let n = udrivers::claim::driver_flags(&mut bytes)?;
+    DriverFlags::decode(&bytes[..n]).ok_or(udrivers::zx::Status::IO)
 }
 
 fn describe(display: &BootDisplay) -> String {
@@ -968,6 +988,27 @@ fn check(vendor: u16, device: u16) {
     ok(
         "...and the driver is told it as the kernel's is",
         zcore_drivers::display::boot_fb_info() == display.fb,
+    );
+    // The boot line's switches: `nvidia.nouveau_uapi` on it (or not) is
+    // told, and the driver here takes it.
+    let flags = driver_flags().unwrap_or_else(|e| fail(format!("driver flags: {e}")));
+    let cmdline = std::fs::read_to_string("/proc/cmdline").unwrap_or_default();
+    let asked = cmdline
+        .split([':', ' ', '\t', '\n'])
+        .any(|t| t == "nvidia.nouveau_uapi");
+    println!(
+        "{NAME}: nvidia.* switches {:#x} (nvidia.nouveau_uapi {}on the boot line)",
+        flags.bits,
+        if asked { "" } else { "not " }
+    );
+    ok(
+        "the boot line's nvidia.nouveau_uapi is told as it is",
+        (flags.bits & driver_flags::NOUVEAU_UAPI != 0) == asked,
+    );
+    flags.install();
+    ok(
+        "...and the driver here takes it",
+        zcore_drivers::display::nouveau_uapi_enabled() == asked,
     );
     gpu::install_dma(&gpus).unwrap_or_else(|e| fail(e));
     extern "C" {

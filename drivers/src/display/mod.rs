@@ -16,6 +16,8 @@ pub use requested_mode::{prefer_requested, requested_mode, set_requested_mode};
 #[cfg(target_arch = "x86_64")]
 pub mod boot_display;
 #[cfg(target_arch = "x86_64")]
+pub mod driver_flags;
+#[cfg(target_arch = "x86_64")]
 mod nouveau_uapi;
 #[cfg(target_arch = "x86_64")]
 mod nvidia;
@@ -49,6 +51,11 @@ pub use nouveau_uapi::{enabled as nouveau_uapi_enabled, set_enabled as set_nouve
 #[cfg(target_arch = "x86_64")]
 pub use nouveau_uapi::{
     exec_wait_list, is_exec_ioctl, EXEC_MAX_WAITS, EXEC_REQUEST_BYTES, EXEC_SYNC_BYTES,
+};
+/// `nvidia.nouveau_uapi` asked for at boot, for a card served later.
+#[cfg(target_arch = "x86_64")]
+pub use nouveau_uapi::{
+    requested as nouveau_uapi_requested, set_requested as set_nouveau_uapi_requested,
 };
 /// Honouring a compressed PTE kind at `VM_BIND` (`nvidia.gem_comptags`),
 /// reached from `zCore`'s cmdline parsing by way of `kernel_hal::drivers`.

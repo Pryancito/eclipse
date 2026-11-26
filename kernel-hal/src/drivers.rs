@@ -387,6 +387,14 @@ pub fn set_nouveau_uapi_enabled(v: bool) {
     zcore_drivers::display::set_nouveau_uapi_enabled(v);
 }
 
+/// Records that the boot line asked for the nouveau-compatible uAPI, so a
+/// card a process serves later is enabled for it when it comes. No-op off
+/// x86_64.
+#[cfg(target_arch = "x86_64")]
+pub fn set_nouveau_uapi_requested(v: bool) {
+    zcore_drivers::display::set_nouveau_uapi_requested(v);
+}
+
 /// Lets `VM_BIND` honour a compressed PTE kind instead of downgrading it
 /// (`nvidia.gem_comptags`). Default off, and additionally refused unless the
 /// GPU reports a comptag mode in which the line comes from the physical
@@ -577,6 +585,8 @@ pub fn set_rm_thread_id_provider(f: fn() -> u64) {
 pub fn set_rm_thread_id_provider(_f: fn() -> u64) {}
 #[cfg(not(target_arch = "x86_64"))]
 pub fn set_nouveau_uapi_enabled(_v: bool) {}
+#[cfg(not(target_arch = "x86_64"))]
+pub fn set_nouveau_uapi_requested(_v: bool) {}
 
 /// Whether the nouveau-uAPI `EXEC` ioctl takes the direct-submit path (GP
 /// entries, GPPut and doorbell written by the kernel, fence resolved lazily)

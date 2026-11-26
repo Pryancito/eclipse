@@ -57,7 +57,7 @@ pub fn set_enabled(v: bool) {
     ENABLED.store(v, Ordering::Relaxed);
 }
 
-pub(super) fn enabled() -> bool {
+pub(crate) fn enabled() -> bool {
     ENABLED.load(Ordering::Relaxed)
 }
 
