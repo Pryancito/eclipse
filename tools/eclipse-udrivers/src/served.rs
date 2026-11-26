@@ -423,6 +423,14 @@ impl Node {
         })
     }
 
+    /// Give the kernel back the pages of `loan`, which it lent the RM this
+    /// process serves with an escape (`ECLIPSE_NVCTL_RETURN`): the RM is
+    /// done with them.
+    pub fn give_back_nvctl(loan: u64) -> Result<(), Status> {
+        // SAFETY: no memory is passed.
+        unsafe { zx::call(nr::ECLIPSE_NVCTL_RETURN, [loan as usize, 0, 0, 0, 0, 0]) }.map(|_| ())
+    }
+
     /// While the value lives, [`caller_read`] and [`caller_write`] reach
     /// the memory of the program whose request `req` is: for an answer
     /// not made through [`Node::answer`] whose request lends it (the

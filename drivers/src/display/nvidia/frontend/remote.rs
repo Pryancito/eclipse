@@ -19,16 +19,33 @@
 //! process holds, system memory in what it pinned (the loader says which,
 //! [`Owns`]), or the RM is told it was not recorded.
 //!
-//! This carries the plain escapes, the mappings and `release`. The others
-//! (lent pages, OS events, UVM) are refused with `NV_ERR_NOT_SUPPORTED`
-//! until they are carried too.
+//! An escape that lends the RM pages of the caller's (an OS descriptor:
+//! memory libcuda allocated itself) lends them to the process: the kernel
+//! pinned them, and the loader makes them reachable to the process's GPUs
+//! ([`Lender`], its IOMMU grants) before the process gets their physical
+//! addresses ([`op::RM_ESCAPE_LENDING`]). They are the process's until its
+//! RM lets them go (`os_unlock_user_pages`, or the call ending with them
+//! untaken), which it says with `ECLIPSE_NVCTL_RETURN` ([`give_back`]). A
+//! process that ends with pages it was lent leaves the grants where they
+//! are, quarantined with its devices until those are reset.
+//!
+//! This carries the plain escapes, the lent pages, the mappings and
+//! `release`. The others (OS events, UVM) are refused with
+//! `NV_ERR_NOT_SUPPORTED` until they are carried too.
 
-use super::{Caller, Card, MmapContext, MmapMemory, RawMmapContext, CALLER_NAME_LEN, GPU_UUID_LEN};
+use super::{
+    Caller, Card, MmapContext, MmapMemory, RawMmapContext, UserPages, CALLER_NAME_LEN, GPU_UUID_LEN,
+};
+use alloc::boxed::Box;
+use alloc::collections::BTreeMap;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::convert::TryFrom;
+use core::sync::atomic::{AtomicU64, Ordering};
 use lock::Mutex;
-use nvidia_rm_sys::types::{NV_ERR_INVALID_STATE, NV_ERR_OPERATING_SYSTEM, NV_STATUS};
+use nvidia_rm_sys::types::{
+    NV_ERR_INSUFFICIENT_RESOURCES, NV_ERR_INVALID_STATE, NV_ERR_OPERATING_SYSTEM, NV_STATUS,
+};
 
 /// The link's operations, numbered apart from a served node's (`1..=16`)
 /// and a served DRM card's (`64..`).
@@ -46,7 +63,14 @@ pub mod op {
     /// The kernel did not record the mapping: `a` = why; the message and
     /// the answer as [`RM_ESCAPE`]'s.
     pub const MAP_UNRECORDED: u32 = 131;
+    /// An escape with pages lent: as [`RM_ESCAPE`], with the loan
+    /// ([`super::LOAN_LEN`] bytes, then each page's physical address)
+    /// between the caller and the payload. The answer as [`RM_ESCAPE`]'s.
+    pub const RM_ESCAPE_LENDING: u32 = 132;
 }
+
+/// The most bytes a message carries: a slot of the link.
+pub const MESSAGE_MAX: usize = 64 * 1024;
 
 /// `EINVAL`, `ENOSYS`: what a message that is not one is answered with.
 pub const EINVAL: i32 = 22;
@@ -74,11 +98,35 @@ pub struct ServedCard {
 /// `Some(false)` for memory it pinned, `None` for neither.
 pub type Owns = Arc<dyn Fn(u64, u64) -> Option<bool> + Send + Sync>;
 
+/// What makes pages the kernel pinned for the RM reachable to the
+/// process's GPUs (the IOMMU's grants), the loader's to give. `None` when
+/// they cannot be: the escape fails as one that cannot pin.
+pub type Lender = Arc<dyn Fn(&UserPages) -> Option<Box<dyn Loan>> + Send + Sync>;
+
+/// What a [`Lender`] did, until it is undone.
+pub trait Loan: Send {
+    /// The process's RM is done with the pages: its GPUs lose them.
+    fn give_back(self: Box<Self>);
+}
+
+/// What the kernel knows of the process serving the RM, besides its link.
+pub struct Server {
+    pub owns: Owns,
+    pub lend: Lender,
+    /// The process, as [`give_back`] is told who asks.
+    pub id: u64,
+}
+
 pub(super) struct Served {
     link: Arc<dyn Link>,
-    owns: Owns,
+    server: Server,
     rm_up: bool,
     cards: Vec<ServedCard>,
+    /// Pages lent to the process, by loan, until it gives them back. Those
+    /// it never gives back are dropped with it ungiven: what the GPUs were
+    /// granted stays theirs until the loader resets them.
+    loans: Mutex<BTreeMap<u64, (UserPages, Box<dyn Loan>)>>,
+    next_loan: AtomicU64,
 }
 
 static SERVED: Mutex<Option<Arc<Served>>> = Mutex::new(None);
@@ -100,7 +148,11 @@ pub enum Refused {
 
 /// Take the RM of the process at the other end of `link`, which says what
 /// it has in `hello`. Its GPUs are the cards from then on.
-pub fn serve(link: Arc<dyn Link>, hello: &[u8], owns: Owns) -> Result<Vec<ServedCard>, Refused> {
+pub fn serve(
+    link: Arc<dyn Link>,
+    hello: &[u8],
+    server: Server,
+) -> Result<Vec<ServedCard>, Refused> {
     let (rm_up, cards) = parse_hello(hello).ok_or(Refused::Invalid)?;
     if super::local_rm_up() {
         return Err(Refused::Taken);
@@ -111,20 +163,49 @@ pub fn serve(link: Arc<dyn Link>, hello: &[u8], owns: Owns) -> Result<Vec<Served
     }
     *served = Some(Arc::new(Served {
         link,
-        owns,
+        server,
         rm_up,
         cards: cards.clone(),
+        loans: Mutex::new(BTreeMap::new()),
+        next_loan: AtomicU64::new(1),
     }));
     Ok(cards)
+}
+
+/// `ECLIPSE_NVCTL_RETURN`: the process `server` gives back the pages of
+/// `loan`. `false` for a loan it does not have, or a process that does not
+/// serve the RM.
+pub fn give_back(server: u64, loan: u64) -> bool {
+    let Some(served) = served() else {
+        return false;
+    };
+    if served.server.id != server {
+        return false;
+    }
+    let lent = served.loans.lock().remove(&loan);
+    match lent {
+        Some((pages, loan)) => {
+            // The GPUs lose the pages before the kernel unpins them.
+            loan.give_back();
+            drop(pages);
+            true
+        }
+        None => false,
+    }
 }
 
 /// The process behind `link` is gone, and its RM with it: the device files
 /// find no RM and no GPUs again.
 pub fn gone(link: &Arc<dyn Link>) {
     let mut served = SERVED.lock();
-    if served.as_ref().is_some_and(|s| Arc::ptr_eq(&s.link, link)) {
-        *served = None;
-    }
+    let was = match served.as_ref() {
+        Some(s) if Arc::ptr_eq(&s.link, link) => served.take(),
+        _ => None,
+    };
+    drop(served);
+    // What it was lent is unpinned (its loans are dropped ungiven) with
+    // the lock let go.
+    drop(was);
 }
 
 impl Served {
@@ -163,6 +244,61 @@ impl Served {
 
     pub(super) fn release(&self, os_info: usize) {
         self.link.tell(op::RELEASE, os_info as u64);
+    }
+
+    /// [`Self::rm_escape`], with `pages` lent to the process's RM.
+    pub(super) fn rm_escape_lending(
+        &self,
+        cmd: u32,
+        payload: &mut [u8],
+        caller: &Caller,
+        pages: UserPages,
+    ) -> NV_STATUS {
+        let len = CALLER_LEN + LOAN_LEN + pages.phys.len() * 8 + payload.len();
+        if len > MESSAGE_MAX {
+            warn!(
+                "[nvidiactl] escape {cmd:#x}: {} pages are more than the RM's process can be lent at once",
+                pages.phys.len()
+            );
+            return NV_ERR_INSUFFICIENT_RESOURCES;
+        }
+        let Some(loan) = (self.server.lend)(&pages) else {
+            warn!("[nvidiactl] escape {cmd:#x}: the pages could not be lent to the RM's GPUs");
+            return NV_ERR_INSUFFICIENT_RESOURCES;
+        };
+        let id = self.next_loan.fetch_add(1, Ordering::Relaxed);
+        let mut msg = Vec::with_capacity(len);
+        msg.extend_from_slice(&encode_caller(caller));
+        msg.extend_from_slice(&encode_loan(id, &pages));
+        for phys in &pages.phys {
+            msg.extend_from_slice(&phys.to_le_bytes());
+        }
+        msg.extend_from_slice(payload);
+        self.loans.lock().insert(id, (pages, loan));
+        match self.link.call(op::RM_ESCAPE_LENDING, cmd as u64, &msg) {
+            Ok((status, back)) if back.len() == payload.len() => {
+                payload.copy_from_slice(&back);
+                status as NV_STATUS
+            }
+            Ok(_) => {
+                warn!("[nvidiactl] escape {cmd:#x}: the RM's process answered another size");
+                NV_ERR_OPERATING_SYSTEM
+            }
+            Err(errno) => {
+                warn!("[nvidiactl] escape {cmd:#x}: the RM's process did not answer ({errno})");
+                // A message it refused it never made pages of, and gives
+                // nothing back: the loan is undone here. One it may have
+                // been in the middle of (it is gone) stays, as all of a
+                // gone process's do.
+                if errno != ENODEV {
+                    if let Some((pages, loan)) = self.loans.lock().remove(&id) {
+                        loan.give_back();
+                        drop(pages);
+                    }
+                }
+                NV_ERR_OPERATING_SYSTEM
+            }
+        }
     }
 
     pub(super) fn rm_map_memory(
@@ -207,7 +343,7 @@ impl Served {
     /// what it pinned.
     fn may_map(&self, m: &MmapContext) -> bool {
         let device = m.memory != MmapMemory::System;
-        (self.owns)(m.start, m.size) == Some(device)
+        (self.server.owns)(m.start, m.size) == Some(device)
     }
 
     pub(super) fn map_unrecorded(&self, payload: &mut [u8], caller: &Caller, why: NV_STATUS) {
@@ -228,6 +364,71 @@ fn with_caller(caller: &Caller, payload: &[u8]) -> Vec<u8> {
     msg.extend_from_slice(payload);
     msg
 }
+
+/// A loan on the link: its id, the user address of its first page,
+/// whether it is writable (`u32`), its page count (`u32`), and 8 bytes
+/// kept at zero.
+pub const LOAN_LEN: usize = 32;
+
+fn encode_loan(id: u64, pages: &UserPages) -> [u8; LOAN_LEN] {
+    let mut b = [0u8; LOAN_LEN];
+    b[0..8].copy_from_slice(&id.to_le_bytes());
+    b[8..16].copy_from_slice(&(pages.va as u64).to_le_bytes());
+    b[16..20].copy_from_slice(&(pages.writable as u32).to_le_bytes());
+    b[20..24].copy_from_slice(&(pages.phys.len() as u32).to_le_bytes());
+    b
+}
+
+/// The pages of the loan at the start of `data`, as the process's RM takes
+/// them, and the bytes after them.
+fn decode_loan(data: &[u8]) -> Option<(UserPages, &[u8])> {
+    let head = data.get(..LOAN_LEN)?;
+    if u64_at(head, 24) != 0 {
+        return None;
+    }
+    let writable = match u32_at(head, 16) {
+        0 => false,
+        1 => true,
+        _ => return None,
+    };
+    let count = u32_at(head, 20) as usize;
+    let end = LOAN_LEN.checked_add(count.checked_mul(8)?)?;
+    let phys = data
+        .get(LOAN_LEN..end)?
+        .chunks_exact(8)
+        .map(|b| u64_at(b, 0))
+        .collect();
+    let pages = UserPages {
+        va: usize::try_from(u64_at(head, 8)).ok()?,
+        phys,
+        writable,
+        keep: Box::new(Lent(u64_at(head, 0))),
+    };
+    Some((pages, &data[end..]))
+}
+
+/// Pages lent to this process, which go back to the kernel when they are
+/// dropped: when the RM unlocks them, or did not take them.
+struct Lent(u64);
+
+impl Drop for Lent {
+    fn drop(&mut self) {
+        if let Some(give_back) = *GIVE_BACK.lock() {
+            give_back(self.0);
+        }
+    }
+}
+
+static GIVE_BACK: Mutex<Option<fn(u64)>> = Mutex::new(None);
+
+/// How this process gives the kernel back a loan its RM is done with
+/// (`ECLIPSE_NVCTL_RETURN`), before it serves.
+pub fn set_give_back(give_back: fn(u64)) {
+    *GIVE_BACK.lock() = Some(give_back);
+}
+
+/// `ENODEV`: the link's server is gone.
+const ENODEV: i32 = 19;
 
 /// A mapping on the link: `RawMmapContext`'s words, in its order.
 pub const MAPPING_LEN: usize = 40;
@@ -268,6 +469,13 @@ fn decode_mapping(b: &[u8]) -> RawMmapContext {
 pub trait Rm {
     fn escape(&self, cmd: u32, payload: &mut [u8], caller: &Caller) -> NV_STATUS;
     fn release(&self, os_info: usize);
+    fn escape_lending(
+        &self,
+        cmd: u32,
+        payload: &mut [u8],
+        caller: &Caller,
+        pages: UserPages,
+    ) -> NV_STATUS;
     fn map_memory(&self, payload: &mut [u8], caller: &Caller) -> (NV_STATUS, Option<MmapContext>);
     fn map_unrecorded(&self, payload: &mut [u8], caller: &Caller, why: NV_STATUS);
 }
@@ -282,6 +490,16 @@ impl Rm for ThisRm {
 
     fn release(&self, os_info: usize) {
         super::release(os_info)
+    }
+
+    fn escape_lending(
+        &self,
+        cmd: u32,
+        payload: &mut [u8],
+        caller: &Caller,
+        pages: UserPages,
+    ) -> NV_STATUS {
+        super::rm_escape_lending(cmd, payload, caller, Some(pages))
     }
 
     fn map_memory(&self, payload: &mut [u8], caller: &Caller) -> (NV_STATUS, Option<MmapContext>) {
@@ -310,6 +528,17 @@ pub fn answer(rm: &dyn Rm, op: u32, a: u64, data: &[u8], out: &mut Vec<u8>) -> R
             let cmd = u32::try_from(a).map_err(|_| EINVAL)?;
             let caller = with_payload(out)?;
             Ok(rm.escape(cmd, out, &caller) as u64)
+        }
+        op::RM_ESCAPE_LENDING => {
+            let cmd = u32::try_from(a).map_err(|_| EINVAL)?;
+            let caller = data
+                .get(..CALLER_LEN)
+                .and_then(decode_caller)
+                .ok_or(EINVAL)?;
+            let (pages, payload) = decode_loan(&data[CALLER_LEN..]).ok_or(EINVAL)?;
+            out.clear();
+            out.extend_from_slice(payload);
+            Ok(rm.escape_lending(cmd, out, &caller, pages) as u64)
         }
         op::RM_MAP_MEMORY => {
             let caller = with_payload(out)?;

@@ -168,20 +168,30 @@ pub(super) fn nvctl_serve(proc: &Arc<Process>, args: &[usize; 6]) -> ZxResult {
     let hello = kernel_hal::user::UserInPtr::<u8>::from(args[2])
         .read_array(args[3])
         .map_err(|_| ZxError::INVALID_ARGS)?;
-    let (whose, pinned) = (proc.clone(), proc.clone());
+    let (whose, pinned, lender) = (proc.clone(), proc.clone(), proc.clone());
     let owns: nvctl::Owns =
         Arc::new(move |start, size| super::device_claim::owns_memory(&whose, start, size));
     let system: nvctl::SystemVmo =
         Arc::new(move |start, len| super::device_claim::pinned_slice(&pinned, start, len));
-    let rm =
-        nvctl::serve_rm(proc.linux(), fifo.clone(), window, &hello, owns, system).map_err(|e| {
-            match e {
-                LxError::EPERM => ZxError::ACCESS_DENIED,
-                LxError::ENODEV => ZxError::NOT_SUPPORTED,
-                LxError::EEXIST => ZxError::ALREADY_EXISTS,
-                _ => ZxError::INVALID_ARGS,
-            }
-        })?;
+    let lend: nvctl::Lender = Arc::new(move |pages| {
+        let runs = linux_object::fs::devfs::nvidia::runs_of(pages)?;
+        let loan =
+            super::device_claim::lend_to_devices(&lender, runs, &pages.phys, pages.writable)?;
+        Some(alloc::boxed::Box::new(loan) as alloc::boxed::Box<dyn nvctl::Loan>)
+    });
+    let server = nvctl::Server {
+        owns,
+        lend,
+        id: proc.id(),
+    };
+    let rm = nvctl::serve_rm(proc.linux(), fifo.clone(), window, &hello, server, system).map_err(
+        |e| match e {
+            LxError::EPERM => ZxError::ACCESS_DENIED,
+            LxError::ENODEV => ZxError::NOT_SUPPORTED,
+            LxError::EEXIST => ZxError::ALREADY_EXISTS,
+            _ => ZxError::INVALID_ARGS,
+        },
+    )?;
     let pid = proc.id() as usize;
     rm.killed_with(alloc::boxed::Box::new(move || {
         let kill = linux_object::signal::Signal::SIGKILL;
@@ -204,6 +214,35 @@ pub(super) fn nvctl_serve(proc: &Arc<Process>, args: &[usize; 6]) -> ZxResult {
         rm.gone();
     });
     Ok(())
+}
+
+#[cfg(target_arch = "x86_64")]
+impl linux_object::fs::devfs::served::nvctl::Loan for super::device_claim::GpuLoan {
+    fn give_back(mut self: alloc::boxed::Box<Self>) {
+        self.give_back_now();
+    }
+}
+
+/// `eclipse_nvctl_return(loan)`: the RM this process serves is done with
+/// the pages of `loan`, which [`ECLIPSE_NVCTL_SERVE`] lent it with an
+/// escape: its devices lose them, and the kernel unpins them. `NOT_FOUND`
+/// for a loan it does not have (given back already, or never its), and to
+/// a process that serves no RM.
+pub const ECLIPSE_NVCTL_RETURN: u32 = super::ECLIPSE_GATEWAY_EXT + 26;
+
+#[cfg(target_arch = "x86_64")]
+pub(super) fn nvctl_return(proc: &Arc<Process>, args: &[usize; 6]) -> ZxResult {
+    use linux_object::fs::devfs::served::nvctl;
+    if nvctl::give_back(proc.id(), args[0] as u64) {
+        Ok(())
+    } else {
+        Err(ZxError::NOT_FOUND)
+    }
+}
+
+#[cfg(not(target_arch = "x86_64"))]
+pub(super) fn nvctl_return(_proc: &Arc<Process>, _args: &[usize; 6]) -> ZxResult {
+    Err(ZxError::NOT_SUPPORTED)
 }
 
 #[cfg(not(target_arch = "x86_64"))]

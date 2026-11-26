@@ -11,6 +11,12 @@
 //! meanwhile or however it ends. An aperture is a window of a BAR, as with
 //! the kernel's RM.
 //!
+//! Pages of the caller's that an escape lends the RM (an OS descriptor)
+//! the kernel pins as it does for its own RM, and the loader makes
+//! reachable to the process's GPUs ([`Lender`]) before the process is
+//! told where they are. They are unpinned when it gives them back
+//! ([`give_back`]).
+//!
 //! An escape lends the process the caller's memory for as long as it
 //! waits: the RM follows the pointers in its parameters as it goes, and
 //! the kernel copies each range for it (`ECLIPSE_DEV_MEMORY`), in the
@@ -22,8 +28,8 @@ use alloc::vec;
 use alloc::vec::Vec;
 
 use lock::Mutex;
-pub use zcore_drivers::display::nvctl::remote::Owns;
 use zcore_drivers::display::nvctl::remote::{self, Link as RmLink, Refused};
+pub use zcore_drivers::display::nvctl::remote::{Lender, Loan, Owns, Server};
 use zircon_object::ipc::Fifo;
 use zircon_object::object::KernelObject;
 use zircon_object::vm::VmObject;
@@ -107,8 +113,8 @@ impl ServedRm {
 /// Take the RM the process at the other end of `fifo` serves, which says
 /// what it has in `hello`, as the one `/dev/nvidiactl` reaches.
 ///
-/// `owns` says what of the memory the RM maps is the process's, and
-/// `system` maps what it pinned.
+/// `server` says what of the memory the RM maps is the process's and lends
+/// it pages, and `system` maps what it pinned.
 ///
 /// `EPERM` for a process that may not; `ENODEV` with no `/dev/nvidiactl`
 /// (`nvidia.nvidiactl` is off); `EEXIST` while the kernel's own RM is up or
@@ -119,7 +125,7 @@ pub fn serve_rm(
     fifo: Arc<Fifo>,
     window: Arc<VmObject>,
     hello: &[u8],
-    owns: Owns,
+    server: Server,
     system: SystemVmo,
 ) -> LxResult<ServedRm> {
     if !proc.capable(crate::process::CAP_SYS_ADMIN) {
@@ -133,7 +139,7 @@ pub fn serve_rm(
     let rm: Arc<dyn RmLink> = Arc::new(OverLink(link.clone()));
     // Before the RM is the device files': a mapping can be made at once.
     let mut slot = SYSTEM.lock();
-    let cards = remote::serve(rm.clone(), hello, owns).map_err(|e| match e {
+    let cards = remote::serve(rm.clone(), hello, server).map_err(|e| match e {
         Refused::Taken => LxError::EEXIST,
         Refused::Invalid => LxError::EINVAL,
     })?;
@@ -146,4 +152,11 @@ pub fn serve_rm(
         cards.len()
     );
     Ok(ServedRm { link, rm })
+}
+
+/// `ECLIPSE_NVCTL_RETURN`: the process `server` (its koid) gives back the
+/// pages of loan `loan`. `false` for a loan it does not have, or a process
+/// that does not serve the RM.
+pub fn give_back(server: u64, loan: u64) -> bool {
+    remote::give_back(server, loan)
 }

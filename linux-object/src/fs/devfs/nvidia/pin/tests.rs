@@ -57,13 +57,17 @@ fn pinned_pages_stay_until_the_rm_lets_them_go() {
     assert_eq!(pages.phys, committed, "each page's own frame, in order");
     assert_eq!(vmo.decommit(0, 3 * PAGE_SIZE), Err(ZxError::BAD_STATE));
 
-    let runs = pages.keep.downcast_ref::<Pins>().unwrap();
-    assert_eq!(
-        runs.0.len(),
-        1,
-        "one run for consecutive pages of one object"
-    );
-    assert_eq!((runs.0[0].1, runs.0[0].2), (0, 3 * PAGE_SIZE));
+    let runs = runs_of(&pages).unwrap();
+    assert_eq!(runs.len(), 1, "one run for consecutive pages of one object");
+    assert!(Arc::ptr_eq(&runs[0].0, &vmo));
+    assert_eq!((runs[0].1, runs[0].2), (0, 3 * PAGE_SIZE));
+    let other = nvctl::UserPages {
+        va: 0,
+        phys: Vec::new(),
+        writable: false,
+        keep: Box::new(()),
+    };
+    assert!(runs_of(&other).is_none(), "pages pinned otherwise");
 
     drop(pages);
     vmo.decommit(0, 3 * PAGE_SIZE).unwrap();

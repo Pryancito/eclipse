@@ -73,6 +73,16 @@ pub fn pin_user_pages(
     })
 }
 
+/// The runs of pages [`pin_user_pages`] pinned, in order, as `(object,
+/// offset, length)`: what the RM's process's GPUs are granted when the RM
+/// is a process's. `None` for pages pinned otherwise.
+pub fn runs_of(pages: &nvctl::UserPages) -> Option<&[(Arc<VmObject>, usize, usize)]> {
+    pages
+        .keep
+        .downcast_ref::<Pins>()
+        .map(|pins| pins.0.as_slice())
+}
+
 /// The physical address of the page at `page`, pinned into `pins`.
 fn pin_page(vmar: &VmAddressRegion, page: usize, write: bool, pins: &mut Pins) -> LxResult<u64> {
     let mut access = MMUFlags::READ;

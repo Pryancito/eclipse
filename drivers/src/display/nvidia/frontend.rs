@@ -129,15 +129,21 @@ pub fn rm_escape(cmd: u32, payload: &mut [u8], caller: &Caller) -> NV_STATUS {
 
 /// `nvidia_rm_sys::frontend::user_pages::rm_escape_lending`, refused with
 /// `NV_ERR_NOT_READY` while there is no RM core to run it, and `pages`
-/// unpinned at once.
+/// unpinned at once. A process's RM is lent the pages ([`remote`]).
 pub fn rm_escape_lending(
     cmd: u32,
     payload: &mut [u8],
     caller: &Caller,
     pages: Option<UserPages>,
 ) -> NV_STATUS {
-    if served_elsewhere() {
-        return NV_ERR_NOT_SUPPORTED;
+    if let Some(served) = remote::served() {
+        if !served.rm_up() {
+            return NV_ERR_NOT_READY;
+        }
+        return match pages {
+            Some(pages) => served.rm_escape_lending(cmd, payload, caller, pages),
+            None => served.rm_escape(cmd, payload, caller),
+        };
     }
     if !rm_up() {
         return NV_ERR_NOT_READY;

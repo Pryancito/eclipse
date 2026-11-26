@@ -1,10 +1,14 @@
 use super::super::{
-    alloc_os_event, cards, map_unrecorded, release, rm_escape, rm_map_memory, rm_up,
+    alloc_os_event, cards, map_unrecorded, release, rm_escape, rm_escape_lending, rm_map_memory,
+    rm_up,
 };
 use super::*;
 use alloc::vec;
 use core::sync::atomic::{AtomicUsize, Ordering};
-use nvidia_rm_sys::types::{NV_ERR_INVALID_STATE, NV_ERR_NOT_READY, NV_ERR_NOT_SUPPORTED, NV_OK};
+use nvidia_rm_sys::types::{
+    NV_ERR_INSUFFICIENT_RESOURCES, NV_ERR_INVALID_STATE, NV_ERR_NOT_READY, NV_ERR_NOT_SUPPORTED,
+    NV_OK,
+};
 
 fn card(minor: u32, instance: Option<u32>) -> ServedCard {
     ServedCard {
@@ -97,6 +101,11 @@ struct Mirror {
     /// What `map_memory` grants, and the last `why` it was told.
     grants: lock::Mutex<Option<MmapContext>>,
     unrecorded: AtomicUsize,
+    /// The pages it was last lent, as it took them, while it keeps them;
+    /// and whether it keeps the next ones.
+    kept: lock::Mutex<Option<UserPages>>,
+    keeps: core::sync::atomic::AtomicBool,
+    lent: lock::Mutex<Option<(usize, Vec<u64>, bool)>>,
 }
 
 impl Rm for Mirror {
@@ -108,6 +117,21 @@ impl Rm for Mirror {
 
     fn release(&self, os_info: usize) {
         self.released.store(os_info, Ordering::SeqCst);
+    }
+
+    fn escape_lending(
+        &self,
+        cmd: u32,
+        payload: &mut [u8],
+        _caller: &Caller,
+        pages: UserPages,
+    ) -> NV_STATUS {
+        *self.lent.lock() = Some((pages.va, pages.phys.clone(), pages.writable));
+        payload.reverse();
+        if self.keeps.load(Ordering::SeqCst) {
+            *self.kept.lock() = Some(pages);
+        }
+        cmd + 2
     }
 
     fn map_memory(&self, payload: &mut [u8], _caller: &Caller) -> (NV_STATUS, Option<MmapContext>) {
@@ -158,8 +182,35 @@ fn the_server_answers_an_escape_and_a_release() {
 }
 
 /// What the loader would say: pins at 0x1000_0000.., a BAR at
-/// 0xe000_0000...
-fn owns() -> Owns {
+/// 0xe000_0000..; pages lent as they are, counted in [`LENT`], those given
+/// back in [`GIVEN`].
+fn server() -> Server {
+    Server {
+        owns: owns_of(),
+        lend: Arc::new(|pages| {
+            if pages.phys.contains(&0) {
+                return None;
+            }
+            LENT.fetch_add(1, Ordering::SeqCst);
+            Some(Box::new(Counted))
+        }),
+        id: SERVER,
+    }
+}
+
+const SERVER: u64 = 0x5e;
+static LENT: AtomicUsize = AtomicUsize::new(0);
+static GIVEN: AtomicUsize = AtomicUsize::new(0);
+
+struct Counted;
+
+impl Loan for Counted {
+    fn give_back(self: Box<Self>) {
+        GIVEN.fetch_add(1, Ordering::SeqCst);
+    }
+}
+
+fn owns_of() -> Owns {
     Arc::new(|start, size| {
         let end = start + size;
         if start >= 0x1000_0000 && end <= 0x1010_0000 {
@@ -200,7 +251,7 @@ fn a_served_rm_is_the_one_the_device_files_reach() {
     let link: Arc<dyn Link> = direct.clone();
     let served = vec![card(0, Some(0)), card(1, Some(3))];
     assert_eq!(
-        serve(link.clone(), &hello_of(true, &served), owns()),
+        serve(link.clone(), &hello_of(true, &served), server()),
         Ok(served.clone())
     );
     assert!(rm_up());
@@ -219,7 +270,7 @@ fn a_served_rm_is_the_one_the_device_files_reach() {
 
     let other: Arc<dyn Link> = Arc::new(Direct(Mirror::default(), AtomicUsize::new(0)));
     assert_eq!(
-        serve(other.clone(), &hello_of(true, &[]), owns()),
+        serve(other.clone(), &hello_of(true, &[]), server()),
         Err(Refused::Taken)
     );
     gone(&other);
@@ -239,7 +290,7 @@ fn a_served_rm_that_is_down_takes_no_escape() {
     let _g = crate::test_globals::LOCK.lock();
     let direct = Arc::new(Direct(Mirror::default(), AtomicUsize::new(0)));
     let link: Arc<dyn Link> = direct.clone();
-    assert!(serve(link.clone(), &hello_of(false, &[card(0, None)]), owns()).is_ok());
+    assert!(serve(link.clone(), &hello_of(false, &[card(0, None)]), server()).is_ok());
     assert!(!rm_up());
     let mut payload = [1u8, 2];
     assert_eq!(rm_escape(0x2a, &mut payload, &a_caller()), NV_ERR_NOT_READY);
@@ -247,7 +298,7 @@ fn a_served_rm_that_is_down_takes_no_escape() {
     assert_eq!(cards().len(), 1);
     assert_eq!(cards()[0].gpu_id(), u32::MAX);
     gone(&link);
-    assert_eq!(serve(link.clone(), b"no", owns()), Err(Refused::Invalid));
+    assert_eq!(serve(link.clone(), b"no", server()), Err(Refused::Invalid));
 }
 
 /// A mapping the process's RM grants is the kernel's only if it is the
@@ -258,7 +309,7 @@ fn a_served_rm_maps_only_its_process_s_memory() {
     let _g = crate::test_globals::LOCK.lock();
     let direct = Arc::new(Direct(Mirror::default(), AtomicUsize::new(0)));
     let link: Arc<dyn Link> = direct.clone();
-    serve(link.clone(), &hello_of(true, &[card(0, Some(0))]), owns()).unwrap();
+    serve(link.clone(), &hello_of(true, &[card(0, Some(0))]), server()).unwrap();
     let grant = |m: Option<MmapContext>| *direct.0.grants.lock() = m;
 
     let mut payload = [0u8; 56];
@@ -309,4 +360,131 @@ fn a_mapping_goes_whole() {
         Some(m)
     );
     assert_eq!(decode_mapping(&encode_mapping(None)).valid, 0);
+}
+
+/// The kernel's pinned pages, with a count of their unpinning.
+fn pinned(va: usize, phys: Vec<u64>) -> UserPages {
+    struct Unpinned;
+    impl Drop for Unpinned {
+        fn drop(&mut self) {
+            UNPINNED.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+    UserPages {
+        va,
+        phys,
+        writable: true,
+        keep: Box::new(Unpinned),
+    }
+}
+
+static UNPINNED: AtomicUsize = AtomicUsize::new(0);
+
+/// The process gives a loan back as the gateway call would.
+fn give_back_as_server(loan: u64) {
+    let _ = give_back(SERVER, loan);
+}
+
+/// Pages lent with an escape reach the process's RM with their addresses;
+/// they go back (granted, then unpinned) when its RM drops them, whether at
+/// once or later, and are not given back for a process that is gone.
+#[test]
+fn pages_lent_to_a_served_rm_come_back_when_it_lets_them_go() {
+    let _g = crate::test_globals::LOCK.lock();
+    set_give_back(give_back_as_server);
+    let counts = || {
+        (
+            LENT.load(Ordering::SeqCst),
+            GIVEN.load(Ordering::SeqCst),
+            UNPINNED.load(Ordering::SeqCst),
+        )
+    };
+    let start = counts();
+    let at = |d: (usize, usize, usize)| (start.0 + d.0, start.1 + d.1, start.2 + d.2);
+    let direct = Arc::new(Direct(Mirror::default(), AtomicUsize::new(0)));
+    let link: Arc<dyn Link> = direct.clone();
+    serve(link.clone(), &hello_of(true, &[card(0, Some(0))]), server()).unwrap();
+
+    // Untaken: back by the end of the call.
+    let mut payload = [1u8, 2, 3];
+    let pages = pinned(0x7000_0000, vec![0x1234_5000, 0x2000_0000]);
+    assert_eq!(
+        rm_escape_lending(0x2a, &mut payload, &a_caller(), Some(pages)),
+        0x2c
+    );
+    assert_eq!(payload, [3, 2, 1]);
+    assert_eq!(
+        *direct.0.lent.lock(),
+        Some((0x7000_0000, vec![0x1234_5000, 0x2000_0000], true))
+    );
+    assert_eq!(counts(), at((1, 1, 1)));
+
+    // Taken, and let go later.
+    direct.0.keeps.store(true, Ordering::SeqCst);
+    let pages = pinned(0x7100_0000, vec![0x3000]);
+    assert_eq!(
+        rm_escape_lending(0x2a, &mut payload, &a_caller(), Some(pages)),
+        0x2c
+    );
+    assert_eq!(counts(), at((2, 1, 1)), "still the process's");
+    assert!(!give_back(SERVER + 1, 2), "only the server gives back");
+    drop(direct.0.kept.lock().take());
+    assert_eq!(counts(), at((2, 2, 2)));
+    assert!(!give_back(SERVER, 2), "once");
+
+    // None lent: a plain escape.
+    assert_eq!(
+        rm_escape_lending(0x2a, &mut payload, &a_caller(), None),
+        0x2b
+    );
+    // Pages the GPUs cannot be granted, and more than a message holds.
+    let refused = [vec![0x3000, 0], vec![0x3000; MESSAGE_MAX / 8]];
+    for phys in refused {
+        let pages = pinned(0x7200_0000, phys);
+        assert_eq!(
+            rm_escape_lending(0x2a, &mut payload, &a_caller(), Some(pages)),
+            NV_ERR_INSUFFICIENT_RESOURCES
+        );
+    }
+    assert_eq!(counts(), at((2, 2, 4)));
+
+    // Kept when the process goes: unpinned by the kernel, never given back.
+    let pages = pinned(0x7300_0000, vec![0x4000]);
+    rm_escape_lending(0x2a, &mut payload, &a_caller(), Some(pages));
+    gone(&link);
+    assert_eq!(counts(), at((3, 2, 5)));
+    let kept = direct.0.kept.lock().take();
+    drop(kept);
+    assert_eq!(counts(), at((3, 2, 5)), "nobody to give it back to");
+}
+
+/// A loan on the link goes whole, and one that is not is refused.
+#[test]
+fn a_loan_goes_whole() {
+    let rm = Mirror::default();
+    let pages = pinned(0x7000_0000, vec![0x1000, 0x5000]);
+    let mut msg = encode_caller(&a_caller()).to_vec();
+    msg.extend_from_slice(&encode_loan(9, &pages));
+    for p in &pages.phys {
+        msg.extend_from_slice(&p.to_le_bytes());
+    }
+    msg.extend_from_slice(&[7, 8]);
+    let mut out = Vec::new();
+    assert_eq!(answer(&rm, op::RM_ESCAPE_LENDING, 1, &msg, &mut out), Ok(3));
+    assert_eq!(out, [8, 7]);
+    assert_eq!(
+        *rm.lent.lock(),
+        Some((0x7000_0000, vec![0x1000, 0x5000], true))
+    );
+    let short = &msg[..CALLER_LEN + LOAN_LEN + 8];
+    assert_eq!(
+        answer(&rm, op::RM_ESCAPE_LENDING, 1, short, &mut out),
+        Err(EINVAL)
+    );
+    let mut reserved = msg.clone();
+    reserved[CALLER_LEN + 24] = 1;
+    assert_eq!(
+        answer(&rm, op::RM_ESCAPE_LENDING, 1, &reserved, &mut out),
+        Err(EINVAL)
+    );
 }
