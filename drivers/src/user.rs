@@ -462,6 +462,40 @@ impl UserDevice {
         }
     }
 
+    /// Reset an NVIDIA GPU left to userspace (PCIe FLR) before a warm
+    /// reboot: its process may have brought its GSP-RM up, and a warm reset
+    /// leaves that running, with WPR2 locked, for the firmware's POST to
+    /// stall on. The kernel resets the GPUs its own driver brought up
+    /// (`quiesce_for_reboot`); it cannot know whether a process did, and a
+    /// reset of one it did not is only a GPU the POST starts from cold, as
+    /// it would anyway. `false` for any other device, or a GPU that cannot.
+    pub fn gpu_reset_for_reboot(&self) -> bool {
+        let Some(place) = self.pci.filter(|_| self.kind == NVIDIA) else {
+            return false;
+        };
+        #[cfg(target_arch = "x86_64")]
+        {
+            use crate::bus::pci::{PortOpsImpl, PCI_ACCESS};
+            let loc = pci::Location {
+                bus: place.bus,
+                device: place.device,
+                function: place.function,
+            };
+            // SAFETY: the configuration space of a function the bus found;
+            // the machine resets right after, so nothing uses it again.
+            unsafe {
+                crate::bus::pci::flr::flr(&PortOpsImpl, PCI_ACCESS, loc, || {
+                    crate::bus::drivers_timer_now_as_micros()
+                })
+            }
+        }
+        #[cfg(not(target_arch = "x86_64"))]
+        {
+            let _ = place;
+            false
+        }
+    }
+
     /// Stop the device: write zero to its status register, which is how a
     /// virtio device is reset (spec 1.1 §2.1.1), and wait for it to read
     /// back zero. From then on it touches none of the memory its queues
@@ -1277,6 +1311,15 @@ pub fn shutdown_for_reboot() -> usize {
         return 0;
     };
     reserved.iter().filter(|d| d.nvme_shutdown()).count()
+}
+
+/// Reset the NVIDIA GPUs left to userspace before a warm reboot
+/// ([`UserDevice::gpu_reset_for_reboot`]). How many were.
+pub fn reset_gpus_for_reboot() -> usize {
+    let Some(reserved) = RESERVED.try_lock().map(|r| r.clone()) else {
+        return 0;
+    };
+    reserved.iter().filter(|d| d.gpu_reset_for_reboot()).count()
 }
 
 /// The devices left to userspace, as `udriver=` would name each

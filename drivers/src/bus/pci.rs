@@ -32,6 +32,7 @@ const PCI_CAP_ID_MSI: u8 = 0x05;
 const PCI_MAX_CAP_TRAVERSAL: usize = 64;
 
 pub mod cfgwrite;
+pub mod flr;
 pub mod host;
 pub mod msix;
 
