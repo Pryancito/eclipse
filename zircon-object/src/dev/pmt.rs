@@ -19,12 +19,24 @@ pub struct PinnedMemoryToken {
     offset: usize,
     size: usize,
     mapped_addrs: Vec<DevVAddr>,
+    /// What the IOMMU granted for this pin, run by run as it answered, and
+    /// the IOMMU that granted it: it outlives the initiator, so the grant can
+    /// be taken back whenever the token goes.
+    grants: Vec<(DevVAddr, usize)>,
+    iommu: Arc<Iommu>,
 }
 
 impl_kobject!(PinnedMemoryToken);
 
 impl Drop for PinnedMemoryToken {
     fn drop(&mut self) {
+        // The device loses the pages before they are unpinned: once unpinned
+        // they may be decommitted and handed to someone else, and a device
+        // that could still write them would write that someone's memory.
+        // This is what makes `zx_pmt_unpin` safe while the device is live.
+        for &(addr, len) in &self.grants {
+            self.iommu.unmap(addr, len);
+        }
         if self.vmo.is_paged() {
             // Closing a handle has nobody to report to. What used to reach this
             // was a `zx_vmo_op_range` decommit of the pinned range, which the
@@ -70,7 +82,8 @@ impl PinnedMemoryToken {
         // IOMMU refuses (no permissions, a window it cannot commit) has to
         // give the pages back here. It used to leave them pinned for the
         // life of the object: no decommit or resize ever succeeded again.
-        let mapped_addrs = Self::map_into_iommu(&bti.iommu(), vmo.clone(), offset, size, perms)
+        let iommu = bti.iommu();
+        let (mapped_addrs, grants) = Self::map_into_iommu(&iommu, vmo.clone(), offset, size, perms)
             .inspect_err(|_| {
                 if vmo.is_paged() {
                     vmo.unpin(offset, size).ok();
@@ -83,28 +96,43 @@ impl PinnedMemoryToken {
             offset,
             size,
             mapped_addrs,
+            grants,
+            iommu,
         }))
     }
 
-    /// Used during initialization to set up the IOMMU state for this PMT.
+    /// Used during initialization to set up the IOMMU state for this PMT:
+    /// the addresses to hand on, and the runs granted, to take back when the
+    /// token goes. A run the IOMMU refuses takes back the ones before it.
+    #[allow(clippy::type_complexity)]
     fn map_into_iommu(
         iommu: &Arc<Iommu>,
         vmo: Arc<VmObject>,
         offset: usize,
         size: usize,
         perms: IommuPerms,
-    ) -> ZxResult<Vec<DevVAddr>> {
+    ) -> ZxResult<(Vec<DevVAddr>, Vec<(DevVAddr, usize)>)> {
         if vmo.is_contiguous() {
-            let (vaddr, _mapped_len) = iommu.map_contiguous(vmo, offset, size, perms)?;
-            Ok(vec![vaddr])
+            let (vaddr, mapped_len) = iommu.map_contiguous(vmo, offset, size, perms)?;
+            Ok((vec![vaddr], vec![(vaddr, mapped_len)]))
         } else {
             assert_eq!(size % iommu.minimum_contiguity(), 0);
             let mut mapped_addrs: Vec<DevVAddr> = Vec::new();
+            let mut grants: Vec<(DevVAddr, usize)> = Vec::new();
             let mut remaining = size;
             let mut cur_offset = offset;
             while remaining > 0 {
                 let (mut vaddr, mapped_len) =
-                    iommu.map(vmo.clone(), cur_offset, remaining, perms)?;
+                    match iommu.map(vmo.clone(), cur_offset, remaining, perms) {
+                        Ok(granted) => granted,
+                        Err(err) => {
+                            for &(addr, len) in &grants {
+                                iommu.unmap(addr, len);
+                            }
+                            return Err(err);
+                        }
+                    };
+                grants.push((vaddr, mapped_len));
                 assert_eq!(mapped_len % iommu.minimum_contiguity(), 0);
                 for _ in 0..mapped_len / iommu.minimum_contiguity() {
                     mapped_addrs.push(vaddr);
@@ -113,7 +141,7 @@ impl PinnedMemoryToken {
                 remaining -= mapped_len;
                 cur_offset += mapped_len;
             }
-            Ok(mapped_addrs)
+            Ok((mapped_addrs, grants))
         }
     }
 
@@ -594,5 +622,168 @@ mod tests {
             pmt.unpin();
         }
         vmo.decommit(0, PAGE_SIZE).unwrap();
+    }
+}
+
+/// A pin through an IOMMU that translates: what the device can reach is
+/// exactly what is pinned, from the pin until the token goes.
+#[cfg(test)]
+mod domain_tests {
+    use super::*;
+    use crate::dev::{BusTransactionInitiator, Iommu, IommuPerms};
+    use alloc::collections::BTreeMap;
+    use kernel_hal::{iommu::DmaDomain, HalError, HalResult, MMUFlags};
+    use lock::Mutex;
+
+    /// A domain that records each page the device may reach, and refuses
+    /// maps once `refuse_after` pages are in it.
+    #[derive(Default)]
+    struct Recorder {
+        pages: Mutex<BTreeMap<PhysAddr, MMUFlags>>,
+        refuse_after: Option<usize>,
+    }
+
+    impl DmaDomain for Recorder {
+        fn map(&self, paddr: PhysAddr, len: usize, flags: MMUFlags) -> HalResult {
+            let mut pages = self.pages.lock();
+            for page in (paddr..paddr + len).step_by(PAGE_SIZE) {
+                if self.refuse_after.is_some_and(|n| pages.len() >= n) {
+                    return Err(HalError);
+                }
+                pages.insert(page, flags);
+            }
+            Ok(())
+        }
+
+        fn unmap(&self, paddr: PhysAddr, len: usize) {
+            let mut pages = self.pages.lock();
+            for page in (paddr..paddr + len).step_by(PAGE_SIZE) {
+                assert!(
+                    pages.remove(&page).is_some(),
+                    "unmap of {:#x}, never mapped",
+                    page
+                );
+            }
+        }
+    }
+
+    fn translated(domain: &Arc<Recorder>) -> Arc<BusTransactionInitiator> {
+        BusTransactionInitiator::create(Iommu::with_domain(domain.clone()), 0)
+    }
+
+    fn reachable(domain: &Recorder) -> Vec<PhysAddr> {
+        domain.pages.lock().keys().copied().collect()
+    }
+
+    /// The device reaches the pinned pages and, once the token goes, none.
+    #[test]
+    fn a_pin_puts_its_pages_in_the_domain_and_the_unpin_takes_them_out() {
+        let domain = Arc::new(Recorder::default());
+        let bti = translated(&domain);
+        let vmo = VmObject::new_paged(3);
+        let pmt = bti
+            .pin(vmo.clone(), 0, 3 * PAGE_SIZE, IommuPerms::PERM_WRITE)
+            .unwrap();
+        let addrs = pmt.encode_addrs(false, false).unwrap();
+        assert_eq!(reachable(&domain), {
+            let mut a = addrs.clone();
+            a.sort();
+            a
+        });
+        assert!(bti.iommu().is_translating());
+        pmt.unpin();
+        drop(pmt);
+        assert!(reachable(&domain).is_empty(), "nothing left once unpinned");
+        assert_eq!(bti.iommu().granted_pages(), 0);
+    }
+
+    /// A contiguous buffer, the kind every Rust driver pins, is one run.
+    #[test]
+    fn a_contiguous_pin_is_granted_and_taken_back_whole() {
+        let domain = Arc::new(Recorder::default());
+        let bti = translated(&domain);
+        let vmo = VmObject::new_contiguous(4, crate::vm::PAGE_SIZE_LOG2).unwrap();
+        let pmt = bti
+            .pin(
+                vmo,
+                0,
+                4 * PAGE_SIZE,
+                IommuPerms::PERM_READ | IommuPerms::PERM_WRITE,
+            )
+            .unwrap();
+        let base = pmt.encode_addrs(false, true).unwrap()[0];
+        assert_eq!(
+            reachable(&domain),
+            (0..4).map(|i| base + i * PAGE_SIZE).collect::<Vec<_>>()
+        );
+        assert!(domain
+            .pages
+            .lock()
+            .values()
+            .all(|f| *f == MMUFlags::READ | MMUFlags::WRITE));
+        pmt.unpin();
+        drop(pmt);
+        assert!(reachable(&domain).is_empty());
+    }
+
+    /// The map is an identity, so two pins of one page are one page in the
+    /// domain: the first unpin must leave it to the second.
+    #[test]
+    fn a_page_pinned_twice_stays_reachable_until_the_second_unpin() {
+        let domain = Arc::new(Recorder::default());
+        let bti = translated(&domain);
+        let vmo = VmObject::new_paged(2);
+        let first = bti
+            .pin(vmo.clone(), 0, 2 * PAGE_SIZE, IommuPerms::PERM_READ)
+            .unwrap();
+        let second = bti
+            .pin(vmo.clone(), PAGE_SIZE, PAGE_SIZE, IommuPerms::PERM_WRITE)
+            .unwrap();
+        let shared = second.encode_addrs(false, false).unwrap()[0];
+        assert_eq!(
+            domain.pages.lock().get(&shared),
+            Some(&(MMUFlags::READ | MMUFlags::WRITE)),
+            "the second pin widened the page it shares"
+        );
+        first.unpin();
+        drop(first);
+        assert_eq!(reachable(&domain), [shared]);
+        second.unpin();
+        drop(second);
+        assert!(reachable(&domain).is_empty());
+    }
+
+    /// A domain that cannot take the whole pin leaves nothing of it behind:
+    /// no page reachable, none pinned (the buffer can be decommitted).
+    #[test]
+    fn a_pin_the_domain_refuses_leaves_nothing_mapped_or_pinned() {
+        let domain = Arc::new(Recorder {
+            refuse_after: Some(2),
+            ..Default::default()
+        });
+        let bti = translated(&domain);
+        let vmo = VmObject::new_paged(4);
+        assert_eq!(
+            bti.pin(vmo.clone(), 0, 4 * PAGE_SIZE, IommuPerms::PERM_WRITE)
+                .err(),
+            Some(ZxError::NO_RESOURCES)
+        );
+        assert!(reachable(&domain).is_empty());
+        assert_eq!(bti.iommu().granted_pages(), 0);
+        vmo.decommit(0, 4 * PAGE_SIZE)
+            .expect("nothing is left pinned");
+    }
+
+    /// A token whose handle is gone but which the initiator still holds is
+    /// quarantined: still pinned, so still reachable, until released.
+    #[test]
+    fn a_quarantined_pin_stays_reachable_until_the_quarantine_is_released() {
+        let domain = Arc::new(Recorder::default());
+        let bti = translated(&domain);
+        let vmo = VmObject::new_paged(1);
+        drop(bti.pin(vmo, 0, PAGE_SIZE, IommuPerms::PERM_WRITE).unwrap());
+        assert_eq!(reachable(&domain).len(), 1);
+        bti.release_quarantine();
+        assert!(reachable(&domain).is_empty());
     }
 }

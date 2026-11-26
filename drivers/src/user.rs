@@ -364,7 +364,47 @@ const XHCI_CMD_RESET: u32 = 1 << 1;
 const XHCI_CMD_INTE: u32 = 1 << 2;
 const XHCI_STS_HALTED: u32 = 1;
 
+/// Every PCI function the bus found, with its memory BARs: what tells the
+/// IOMMU which requester a reserved device is, whichever bus driver
+/// reserved it (most record only a window, not where the function sits).
+static PCI_FUNCTIONS: Mutex<Vec<PciPlace>> = Mutex::new(Vec::new());
+
+/// The bus found `place`. Called for every function, before any driver
+/// looks at it.
+pub fn record_pci_function(place: PciPlace) {
+    let mut all = PCI_FUNCTIONS.lock();
+    if !all.contains(&place) {
+        all.push(place);
+    }
+}
+
+/// The function among `functions` with a memory BAR holding `paddr`.
+fn function_with_bar(functions: &[PciPlace], paddr: usize) -> Option<PciPlace> {
+    functions.iter().copied().find(|place| {
+        place
+            .bars
+            .iter()
+            .any(|&(base, len)| len > 0 && paddr >= base && paddr - base < len)
+    })
+}
+
 impl UserDevice {
+    /// Where the device sits on the PCI bus, for the IOMMU: the place its
+    /// claim carries, or else the function whose BAR holds its window.
+    /// `None` for a device that is not PCI (virtio-mmio, the i8042), which
+    /// no IOMMU here covers.
+    pub fn pci_place(&self) -> Option<PciPlace> {
+        if let Some(place) = self.pci {
+            return Some(place);
+        }
+        match self.transport {
+            Transport::Pci | Transport::VirtioPci { .. } => {
+                function_with_bar(&PCI_FUNCTIONS.lock(), self.paddr)
+            }
+            Transport::VirtioMmio | Transport::Ports => None,
+        }
+    }
+
     /// Take the device. Only one caller gets `true` until it is
     /// [released](Self::release): the device has one driver at a time.
     pub fn claim(&self) -> bool {
@@ -1195,6 +1235,56 @@ pub fn find(kind: &str, index: usize) -> Option<Arc<UserDevice>> {
 
 #[cfg(test)]
 mod tests {
+
+    /// A reserved device is found on the bus by its window: the IOMMU gives
+    /// a domain by requester, and a window in the wrong function's BAR
+    /// would put one device's pins in another's domain.
+    #[test]
+    fn a_window_names_the_function_whose_bar_holds_it() {
+        use super::{function_with_bar, PciPlace};
+        let place = |device, bars: [(usize, usize); 6]| PciPlace {
+            bus: 0,
+            device,
+            function: 0,
+            bars,
+        };
+        let nic = place(
+            2,
+            [
+                (0xfebc_0000, 0x2_0000),
+                (0, 0),
+                (0, 0),
+                (0, 0),
+                (0, 0),
+                (0, 0),
+            ],
+        );
+        let nvme = place(
+            4,
+            [
+                (0, 0),
+                (0, 0),
+                (0, 0),
+                (0, 0),
+                (0xfe00_0000, 0x4000),
+                (0, 0),
+            ],
+        );
+        let all = [nic, nvme];
+        assert_eq!(function_with_bar(&all, 0xfebc_0000), Some(nic));
+        assert_eq!(function_with_bar(&all, 0xfebd_fff0), Some(nic));
+        assert_eq!(
+            function_with_bar(&all, 0xfebe_0000),
+            None,
+            "one past the BAR"
+        );
+        assert_eq!(function_with_bar(&all, 0xfe00_1000), Some(nvme));
+        assert_eq!(
+            function_with_bar(&all, 0),
+            None,
+            "an empty BAR holds nothing"
+        );
+    }
 
     #[test]
     fn a_driver_writes_the_command_register_and_the_capabilities_never_the_bars() {

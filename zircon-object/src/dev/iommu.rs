@@ -1,10 +1,39 @@
-use {crate::object::*, crate::vm::*, alloc::sync::Arc, bitflags::bitflags};
+use {
+    crate::object::*,
+    crate::vm::*,
+    alloc::{collections::BTreeMap, sync::Arc, vec::Vec},
+    bitflags::bitflags,
+    kernel_hal::{iommu::DmaDomain, sync::Mutex},
+};
 
-/// Iommu refers to DummyIommu in zircon.
+/// What a device behind a bus transaction initiator may reach.
 ///
-/// A dummy implementation, do not take it serious.
+/// Without a domain this is Zircon's dummy IOMMU: a device address is the
+/// physical one and nothing is enforced, which is all a machine with no
+/// IOMMU (or a boot with `iommu=off`) can do. With one, every range this
+/// maps is written into the device's [`DmaDomain`] first and taken out of it
+/// when the pin goes ([`Iommu::unmap`]), and nothing else is in there. The
+/// addresses are the same either way: a domain is a sparse identity map.
 pub struct Iommu {
     base: KObjectBase,
+    domain: Option<Arc<dyn DmaDomain>>,
+    /// Each page in the domain: how many grants name it, and the accesses
+    /// they add up to. The map is an identity, so two pins of one page are
+    /// one entry in the hardware, and the first unpin must not take the
+    /// page from under the second.
+    granted: Mutex<BTreeMap<PhysAddr, (usize, MMUFlags)>>,
+}
+
+/// Consecutive pages that want the same thing done, as one call.
+fn runs(pages: impl Iterator<Item = (PhysAddr, MMUFlags)>) -> Vec<(PhysAddr, usize, MMUFlags)> {
+    let mut runs: Vec<(PhysAddr, usize, MMUFlags)> = Vec::new();
+    for (page, flags) in pages {
+        match runs.last_mut() {
+            Some((start, len, f)) if *start + *len == page && *f == flags => *len += PAGE_SIZE,
+            _ => runs.push((page, PAGE_SIZE, flags)),
+        }
+    }
+    runs
 }
 
 impl_kobject!(Iommu);
@@ -40,11 +69,100 @@ fn check_window(vmo: &VmObject, offset: usize, size: usize) -> ZxResult {
 }
 
 impl Iommu {
-    /// Create a new `IOMMU`.
+    /// Create a new `IOMMU` that enforces nothing: the device stays in
+    /// passthrough.
     pub fn create() -> Arc<Self> {
         Arc::new(Iommu {
             base: KObjectBase::new(),
+            domain: None,
+            granted: Mutex::new(BTreeMap::new()),
         })
+    }
+
+    /// An `IOMMU` that grants through `domain`: the device reaches what its
+    /// pins map and nothing else.
+    pub fn with_domain(domain: Arc<dyn DmaDomain>) -> Arc<Self> {
+        Arc::new(Iommu {
+            base: KObjectBase::new(),
+            domain: Some(domain),
+            granted: Mutex::new(BTreeMap::new()),
+        })
+    }
+
+    /// Whether the hardware enforces what this grants.
+    pub fn is_translating(&self) -> bool {
+        self.domain.is_some()
+    }
+
+    /// Put `len` bytes at device address `addr` in the domain, answering
+    /// the address and length the caller asked to hand on.
+    fn grant(&self, addr: DevVAddr, len: usize, perms: IommuPerms) -> ZxResult<(DevVAddr, usize)> {
+        let Some(domain) = &self.domain else {
+            return Ok((addr, len));
+        };
+        let flags = commit_flags(perms);
+        let mut granted = self.granted.lock();
+        // What the hardware has to be told: pages new to the domain, and
+        // pages already there that this grant lets the device do more to.
+        let wanted =
+            (addr..addr + len)
+                .step_by(PAGE_SIZE)
+                .filter_map(|page| match granted.get(&page) {
+                    Some(&(_, had)) if had.contains(flags) => None,
+                    Some(&(_, had)) => Some((page, had | flags)),
+                    None => Some((page, flags)),
+                });
+        let wanted = runs(wanted);
+        for (i, &(start, run, run_flags)) in wanted.iter().enumerate() {
+            if domain.map(start, run, run_flags).is_err() {
+                // Take back what this grant put in, and only that: a page
+                // somebody else holds stays, with the accesses it had.
+                for &(start, run, _) in &wanted[..i] {
+                    for page in (start..start + run).step_by(PAGE_SIZE) {
+                        if !granted.contains_key(&page) {
+                            domain.unmap(page, PAGE_SIZE);
+                        }
+                    }
+                }
+                return Err(ZxError::NO_RESOURCES);
+            }
+        }
+        for page in (addr..addr + len).step_by(PAGE_SIZE) {
+            let entry = granted.entry(page).or_insert((0, MMUFlags::empty()));
+            entry.0 += 1;
+            entry.1 |= flags;
+        }
+        Ok((addr, len))
+    }
+
+    /// Take back what [`map`](Self::map) or
+    /// [`map_contiguous`](Self::map_contiguous) granted: `len` bytes at
+    /// `addr`, exactly as answered. When this returns the device can no
+    /// longer reach them, so the pages may be unpinned.
+    pub(super) fn unmap(&self, addr: DevVAddr, len: usize) {
+        let Some(domain) = &self.domain else {
+            return;
+        };
+        let mut granted = self.granted.lock();
+        let mut gone = Vec::new();
+        for page in (addr..addr + len).step_by(PAGE_SIZE) {
+            match granted.get_mut(&page) {
+                Some(entry) if entry.0 > 1 => entry.0 -= 1,
+                Some(_) => {
+                    granted.remove(&page);
+                    gone.push((page, MMUFlags::empty()));
+                }
+                None => warn!("iommu: unmap of {page:#x}, which no grant names"),
+            }
+        }
+        for (start, run, _) in runs(gone.into_iter()) {
+            domain.unmap(start, run);
+        }
+    }
+
+    /// How many pages are in the domain now (0 without one).
+    pub fn granted_pages(&self) -> usize {
+        self.granted.lock().len()
     }
 
     /// Check if a `bus_txn_id` is valid for this IOMMU.
@@ -81,9 +199,9 @@ impl Iommu {
         check_window(&vmo, offset, size)?;
         let p_addr = vmo.commit_page(offset / PAGE_SIZE, commit_flags(perms))?;
         if vmo.is_paged() {
-            Ok((p_addr, PAGE_SIZE))
+            self.grant(p_addr, PAGE_SIZE, perms)
         } else {
-            Ok((p_addr, pages(size) * PAGE_SIZE))
+            self.grant(p_addr, pages(size) * PAGE_SIZE, perms)
         }
     }
 
@@ -108,7 +226,7 @@ impl Iommu {
         }
         check_window(&vmo, offset, size)?;
         let p_addr = vmo.commit_page(offset / PAGE_SIZE, commit_flags(perms))?;
-        Ok((p_addr, pages(size) * PAGE_SIZE))
+        self.grant(p_addr, pages(size) * PAGE_SIZE, perms)
     }
 }
 

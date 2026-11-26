@@ -25,6 +25,7 @@ pub mod fault_slots;
 pub mod getcpu;
 pub mod guard_band;
 pub mod hart_walk;
+pub mod iommu;
 pub mod ipi;
 pub mod kaddr;
 pub mod kstats;
