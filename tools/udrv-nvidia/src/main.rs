@@ -20,7 +20,8 @@
 //!   RM that only checks the way there (`nvidia.nvidiactl` on the kernel's
 //!   cmdline, and a PCI function claimed as for `check`, for its BAR and
 //!   DMA memory): an escape's parameters reached through its pointer, the
-//!   GPU node, mappings of its memory and its BAR, the close.
+//!   GPU node, mappings of its memory and its BAR, pages of the caller's
+//!   lent to it and given back, the close.
 mod drm;
 mod gem;
 mod gpu;
@@ -337,6 +338,7 @@ fn nvctl_check(vendor: u16, device: u16) {
         "...and the RM told so",
         rm.unrecorded.load(Ordering::Relaxed) != 0,
     );
+    lent_pages_check(rm, &map, &ok);
     drop(ctl);
     let start = Instant::now();
     while rm.released.load(Ordering::Relaxed) == 0 && start.elapsed() < Duration::from_secs(2) {
@@ -350,6 +352,99 @@ fn nvctl_check(vendor: u16, device: u16) {
         "{NAME}: nvctl-check ok ({} escapes)",
         rm.escapes.load(Ordering::Relaxed)
     );
+}
+
+/// `nvctl-check`'s OS descriptors: an `RM_ALLOC_MEMORY` of the caller's
+/// own pages lends them to the RM, which the process's devices are granted
+/// (so the kernel takes a mapping of them as the process's), until
+/// `RM_FREE` gives them back; refused, they come back at once.
+fn lent_pages_check(
+    rm: &nvctl::check::CheckRm,
+    map: &dyn Fn(u32, &std::fs::File) -> i32,
+    ok: &dyn Fn(&str, bool),
+) {
+    use std::os::fd::AsRawFd;
+    use std::sync::atomic::Ordering;
+    use udrivers::served::Node;
+    const PAGES: usize = 3;
+    // SAFETY: a new private mapping of this process's.
+    let buf = unsafe {
+        libc::mmap(
+            core::ptr::null_mut(),
+            PAGES * 4096,
+            libc::PROT_READ | libc::PROT_WRITE,
+            libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
+            -1,
+            0,
+        )
+    };
+    if buf == libc::MAP_FAILED {
+        fail("mmap of the client's buffer".into());
+    }
+    let gpu = open_rw("/dev/nvidia0").unwrap_or_else(|| fail("open /dev/nvidia0".into()));
+    // `_IOWR('F', NV_ESC_RM_ALLOC_MEMORY, NVOS02_PARAMETERS)` and
+    // `_IOWR('F', NV_ESC_RM_FREE, NVOS00_PARAMETERS)`.
+    const ALLOC_MEMORY: u64 = 0xc038_4627;
+    const FREE: u64 = 0xc010_4629;
+    let alloc = |h: u32| {
+        let mut p = [0u8; 56];
+        p[8..12].copy_from_slice(&h.to_le_bytes());
+        // NV01_MEMORY_SYSTEM_OS_DESCRIPTOR, its address and its limit.
+        p[12..16].copy_from_slice(&0x71u32.to_le_bytes());
+        p[24..32].copy_from_slice(&(buf as u64).to_le_bytes());
+        p[32..40].copy_from_slice(&((PAGES * 4096 - 1) as u64).to_le_bytes());
+        // SAFETY: `p` is the 56 bytes of NVOS02_PARAMETERS.
+        let ret = unsafe { libc::ioctl(gpu.as_raw_fd(), ALLOC_MEMORY as _, p.as_mut_ptr()) };
+        (ret, u32::from_le_bytes(p[40..44].try_into().unwrap()))
+    };
+    let free = |h: u32| {
+        let mut p = [0u8; 16];
+        p[8..12].copy_from_slice(&h.to_le_bytes());
+        // SAFETY: `p` is the 16 bytes of NVOS00_PARAMETERS.
+        let ret = unsafe { libc::ioctl(gpu.as_raw_fd(), FREE as _, p.as_mut_ptr()) };
+        (ret, u32::from_le_bytes(p[12..16].try_into().unwrap()))
+    };
+    let on = open_rw("/dev/nvidiactl").unwrap_or_else(|| fail("open /dev/nvidiactl".into()));
+    let before = nvctl::GIVEN_BACK.load(Ordering::Relaxed);
+    ok(
+        "an OS descriptor's pages are lent to the RM",
+        alloc(0x700) == (0, 0),
+    );
+    let first = rm.lent.load(Ordering::Relaxed);
+    ok(
+        "...all of them, by their physical addresses",
+        rm.lent_pages.load(Ordering::Relaxed) == PAGES && first != 0 && first.is_multiple_of(4096),
+    );
+    ok(
+        "...kept while the RM holds them",
+        nvctl::GIVEN_BACK.load(Ordering::Relaxed) == before,
+    );
+    ok(
+        "...granted to its devices (a mapping of them is its process's)",
+        map(nvctl::check::grant::LENT, &on) == 0,
+    );
+    ok("...and freed", free(0x700) == (0, 0));
+    let given = nvctl::GIVEN_BACK.load(Ordering::Relaxed);
+    ok("...given back to the kernel", given != before);
+    ok(
+        "...and no longer its devices'",
+        map(nvctl::check::grant::LENT, &on) != 0,
+    );
+    ok(
+        "a loan goes back once",
+        Node::give_back_nvctl(given).is_err(),
+    );
+    let (ret, status) = alloc(nvctl::check::REFUSED);
+    ok(
+        "pages the RM does not take come back at once",
+        ret == 0 && status != 0 && nvctl::GIVEN_BACK.load(Ordering::Relaxed) > given,
+    );
+    ok(
+        "...and the kernel took every one",
+        nvctl::GIVE_BACK_REFUSED.load(Ordering::Relaxed) == 0,
+    );
+    // SAFETY: the mapping made above, no longer used.
+    unsafe { libc::munmap(buf, PAGES * 4096) };
 }
 
 /// `DRM_IOCTL_MODE_GETRESOURCES`, `_IOWR('d', 0xA0, struct drm_mode_card_res)`.

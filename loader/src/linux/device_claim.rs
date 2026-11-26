@@ -290,6 +290,79 @@ pub(super) fn pinned_slice(proc: &Arc<Process>, phys: u64, len: usize) -> Option
     vmo.create_slice(offset, len).ok()
 }
 
+/// Pages the kernel pinned, as runs of `(object, offset, length)` whose
+/// pages are at `phys` in order, made reachable to every device `proc`
+/// holds: each run pinned through each of their initiators, which is the
+/// IOMMU's grant. What [`GpuLoan::give_back`] takes back; a driver that
+/// dies first leaves them in its initiators, quarantined until its devices
+/// are reset. `None` for a process that holds no device, or a grant at
+/// another address than the page's own (the device would reach other
+/// memory than the RM was told).
+#[cfg(target_arch = "x86_64")]
+pub(super) fn lend_to_devices(
+    proc: &Arc<Process>,
+    runs: &[(Arc<VmObject>, usize, usize)],
+    phys: &[u64],
+    writable: bool,
+) -> Option<GpuLoan> {
+    use zircon_object::dev::IommuPerms;
+    let id = proc.id();
+    let btis: Vec<_> = PINS
+        .lock()
+        .iter()
+        .filter(|(holder, _)| *holder == id)
+        .filter_map(|(_, bti)| bti.upgrade())
+        .collect();
+    if btis.is_empty() {
+        return None;
+    }
+    let mut perms = IommuPerms::PERM_READ;
+    if writable {
+        perms |= IommuPerms::PERM_WRITE;
+    }
+    let mut loan = GpuLoan(Vec::new());
+    let mut grant = |bti: &Arc<BusTransactionInitiator>| -> Option<()> {
+        let mut at = 0usize;
+        for (vmo, offset, len) in runs {
+            let pmt = bti.pin(vmo.clone(), *offset, *len, perms).ok()?;
+            let addrs = pmt.encode_addrs(false, false);
+            loan.0.push(pmt);
+            let pages = len / PAGE_SIZE;
+            let expected = phys.get(at..at.checked_add(pages)?)?;
+            let same = addrs.is_ok_and(|addrs| {
+                addrs.len() == pages && addrs.iter().zip(expected).all(|(&a, &p)| a as u64 == p)
+            });
+            if !same {
+                warn!("udriver: pages lent to a device were granted at other addresses");
+                return None;
+            }
+            at += pages;
+        }
+        (at == phys.len()).then_some(())
+    };
+    if btis.iter().all(|bti| grant(bti).is_some()) {
+        Some(loan)
+    } else {
+        loan.give_back_now();
+        None
+    }
+}
+
+/// What [`lend_to_devices`] pinned. Dropped without being given back (its
+/// driver is gone), the pins stay in their initiators.
+#[cfg(target_arch = "x86_64")]
+pub(super) struct GpuLoan(Vec<Arc<zircon_object::dev::PinnedMemoryToken>>);
+
+#[cfg(target_arch = "x86_64")]
+impl GpuLoan {
+    /// The devices lose the pages, and the pins go.
+    pub(super) fn give_back_now(&mut self) {
+        for pmt in self.0.drain(..) {
+            pmt.unpin();
+        }
+    }
+}
+
 /// The device of `kind` that `proc` holds, by its place among the reserved
 /// ones of that kind. What a driver serves to the kernel is known by this:
 /// the next driver of the same device is the same disk's.

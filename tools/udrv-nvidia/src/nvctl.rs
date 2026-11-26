@@ -3,7 +3,9 @@
 //! pass to the RM is a request here, answered by
 //! `nvctl::remote::answer` on the driver's RM, which does not know the
 //! difference. What the RM reads and writes of the caller's memory, the
-//! kernel copies for it while the request waits.
+//! kernel copies for it while the request waits; pages of the caller's it
+//! is lent (an OS descriptor) go back to the kernel when it lets them go.
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::Mutex;
 
 use udrivers::served::{caller_read, caller_write, Msg, Node, SLOT_LEN};
@@ -18,6 +20,7 @@ const NO_REPLY: u32 = u32::MAX;
 /// the kernel's status.
 pub fn serve(rm: &dyn Rm, hello: &[u8]) -> Result<String, (Status, String)> {
     nvidia_rm_sys::frontend::set_user_copy(copy);
+    remote::set_give_back(give_back);
     let node = Node::serve_nvctl(hello)?;
     let why = node.run_with(&Mutex::new(()), |_, node, req| {
         let answer = reply(rm, node, req);
@@ -37,6 +40,22 @@ pub fn copy(to_user: bool, user: usize, ours: *mut u8, len: usize) -> bool {
         caller_read(user as u64, ours)
     };
     done == Ok(len)
+}
+
+/// The last loan given back, and how many the kernel refused.
+pub static GIVEN_BACK: AtomicU64 = AtomicU64::new(0);
+pub static GIVE_BACK_REFUSED: AtomicU32 = AtomicU32::new(0);
+
+/// The RM is done with the pages of `loan` (it unlocked them, or never
+/// took them): they are the kernel's again.
+fn give_back(loan: u64) {
+    match Node::give_back_nvctl(loan) {
+        Ok(()) => GIVEN_BACK.store(loan, Ordering::Relaxed),
+        Err(e) => {
+            GIVE_BACK_REFUSED.fetch_add(1, Ordering::Relaxed);
+            eprintln!("udrv-nvidia: the kernel took no loan {loan} back: {e}");
+        }
+    }
 }
 
 /// The answer to one request, its bytes put in its slot.
@@ -68,15 +87,25 @@ fn reply(rm: &dyn Rm, node: &Node, req: &Msg) -> Msg {
 /// An RM with nothing behind it, for `udrv-nvidia nvctl-check`: an
 /// `RM_CONTROL` adds one to each word of its parameters, read and written
 /// back where the caller's pointer says, as the RM follows one; an
-/// `RM_MAP_MEMORY` grants the mapping its `hMemory` names ([`Grant`]).
+/// `RM_MAP_MEMORY` grants the mapping its `hMemory` names ([`grant`]); an
+/// `RM_ALLOC_MEMORY` of an OS descriptor keeps the pages it is lent until
+/// `RM_FREE` of its handle or the close, or refuses them for handle
+/// [`REFUSED`].
 pub mod check {
     use std::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering};
+    use std::sync::Mutex;
     use zcore_drivers::display::nvctl::remote::{hello_of, Rm, ServedCard};
-    use zcore_drivers::display::nvctl::{Caller, Card, MmapContext, RawMmapContext};
+    use zcore_drivers::display::nvctl::{Caller, Card, MmapContext, RawMmapContext, UserPages};
 
     /// `NV_ESC_RM_CONTROL`, and `NVOS54_PARAMETERS`' size.
     pub const RM_CONTROL: u32 = 0x2a;
     pub const NVOS54_LEN: usize = 32;
+    /// `NV_ESC_RM_ALLOC_MEMORY` (`NVOS02_PARAMETERS`, 56 bytes) and
+    /// `NV_ESC_RM_FREE` (`NVOS00_PARAMETERS`, 16).
+    pub const RM_ALLOC_MEMORY: u32 = 0x27;
+    pub const RM_FREE: u32 = 0x29;
+    /// The `hObjectNew` whose pages it refuses.
+    pub const REFUSED: u32 = 0xbad;
     /// `NV_OK`, and the status of an escape it does not know.
     const NV_OK: u32 = 0;
     const NV_ERR_NOT_SUPPORTED: u32 = 0x56;
@@ -91,6 +120,8 @@ pub mod check {
         pub const APERTURE: u32 = 2;
         /// A page of system memory this process never pinned.
         pub const NOT_OURS: u32 = 3;
+        /// The first page it was last lent, at [`super::CheckRm::lent`].
+        pub const LENT: u32 = 4;
     }
 
     #[derive(Default)]
@@ -101,6 +132,11 @@ pub mod check {
         pub system: AtomicU64,
         pub bar: AtomicU64,
         pub unrecorded: AtomicU32,
+        /// The first page it was last lent, and how many.
+        pub lent: AtomicU64,
+        pub lent_pages: AtomicUsize,
+        /// What it keeps, by handle.
+        pub kept: Mutex<Vec<(u32, UserPages)>>,
     }
 
     fn mapping(ctl: bool, memory_type: u32, caching: u32, start: u64) -> Option<MmapContext> {
@@ -143,6 +179,16 @@ pub mod check {
     impl Rm for CheckRm {
         fn escape(&self, cmd: u32, payload: &mut [u8], _caller: &Caller) -> u32 {
             self.escapes.fetch_add(1, Ordering::Relaxed);
+            if cmd == RM_FREE && payload.len() == 16 {
+                let h = u32::from_le_bytes(payload[8..12].try_into().unwrap());
+                let mut kept = self.kept.lock().unwrap();
+                let before = kept.len();
+                // Freed: its pages go back as they are dropped.
+                kept.retain(|(of, _)| *of != h);
+                let status = if kept.len() < before { NV_OK } else { 0x57 };
+                payload[12..16].copy_from_slice(&status.to_le_bytes());
+                return NV_OK;
+            }
             if cmd != RM_CONTROL || payload.len() != NVOS54_LEN {
                 return NV_ERR_NOT_SUPPORTED;
             }
@@ -170,6 +216,32 @@ pub mod check {
 
         fn release(&self, os_info: usize) {
             self.released.store(os_info, Ordering::Relaxed);
+            self.kept.lock().unwrap().clear();
+        }
+
+        fn escape_lending(
+            &self,
+            cmd: u32,
+            payload: &mut [u8],
+            _caller: &Caller,
+            pages: UserPages,
+        ) -> u32 {
+            self.escapes.fetch_add(1, Ordering::Relaxed);
+            if cmd != RM_ALLOC_MEMORY || payload.len() != 56 {
+                return NV_ERR_NOT_SUPPORTED;
+            }
+            let h = u32::from_le_bytes(payload[8..12].try_into().unwrap());
+            self.lent
+                .store(pages.phys.first().copied().unwrap_or(0), Ordering::Relaxed);
+            self.lent_pages.store(pages.phys.len(), Ordering::Relaxed);
+            let status = if h == REFUSED {
+                0x1d // NV_ERR_INVALID_ADDRESS, the pages dropped untaken
+            } else {
+                self.kept.lock().unwrap().push((h, pages));
+                NV_OK
+            };
+            payload[40..44].copy_from_slice(&status.to_le_bytes());
+            NV_OK
         }
 
         fn map_memory(&self, payload: &mut [u8], _caller: &Caller) -> (u32, Option<MmapContext>) {
@@ -183,6 +255,7 @@ pub mod check {
                 grant::SYSTEM => mapping(true, 0, 0, self.system.load(Ordering::Relaxed)),
                 grant::APERTURE => mapping(false, 2, 6, self.bar.load(Ordering::Relaxed)),
                 grant::NOT_OURS => mapping(true, 0, 0, 0x1000),
+                grant::LENT => mapping(true, 0, 0, self.lent.load(Ordering::Relaxed)),
                 _ => None,
             };
             payload[40..44].copy_from_slice(&NV_OK.to_le_bytes());

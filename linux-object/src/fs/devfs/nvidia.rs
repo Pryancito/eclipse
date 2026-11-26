@@ -1610,7 +1610,7 @@ fn card_roster_line(card: &nvctl::Card) -> alloc::string::String {
 }
 
 mod pin;
-pub use pin::pin_user_pages;
+pub use pin::{pin_user_pages, runs_of};
 
 #[cfg(test)]
 mod tests;
