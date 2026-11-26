@@ -863,7 +863,11 @@ pub(crate) fn frame_alloc_contiguous_flushing(
             who,
             pages,
             flushed,
-            if got.is_some() { "found them" } else { "found nothing either" },
+            if got.is_some() {
+                "found them"
+            } else {
+                "found nothing either"
+            },
             n
         );
     }

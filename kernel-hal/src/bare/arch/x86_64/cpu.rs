@@ -302,10 +302,17 @@ fn tsc_hz_from_cpuid() -> Option<u64> {
 /// otherwise stall firmware POST; NVMe wants CC.SHN so DRAM-less SSDs persist
 /// their FTL maps.
 fn quiesce_devices() {
-    for d in crate::drivers::all_drm().as_vec().iter() {
+    // Each list is copied and its lock let go before anything is asked of
+    // a device: a disk a process serves answers when that process runs, and
+    // a task that wanted the list meanwhile (a driver that died takes its
+    // disk off it) would spin on the lock with its CPU, for as long as the
+    // flush takes or for good.
+    let cards = crate::drivers::all_drm().as_vec().clone();
+    for d in cards.iter() {
         let _ = d.quiesce_for_reboot();
     }
-    for d in crate::drivers::all_block().as_vec().iter() {
+    let disks = crate::drivers::all_block().as_vec().clone();
+    for d in disks.iter() {
         d.quiesce_for_reboot();
     }
     // The NVMe controllers a process drives: flushed above through their
