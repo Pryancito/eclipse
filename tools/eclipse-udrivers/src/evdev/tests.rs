@@ -432,3 +432,31 @@ fn an_absinfo_is_set_only_for_an_axis_the_device_has() {
         Err(EINVAL)
     );
 }
+
+/// The size in an ioctl's number is the program's to write: one too small
+/// for what the request answers is EINVAL, as on Linux, and not a slice
+/// past the end of what the kernel sent (which ended the driver).
+#[test]
+fn a_fixed_size_request_with_a_short_buffer_is_refused() {
+    let mut dev = tablet();
+    let (fh, _) = dev.open();
+    for (nr, len) in [(0x01u32, 4usize), (0x02, 8), (0x03, 8)] {
+        for size in 0..len {
+            let mut data = vec![0u8; size];
+            assert_eq!(
+                dev.ioctl(fh, ioc(IOC_READ, nr, size as u32), 0, &mut data),
+                Err(EINVAL),
+                "request {nr:#x} with {size} bytes"
+            );
+        }
+        let mut data = vec![0u8; len];
+        assert_eq!(
+            dev.ioctl(fh, ioc(IOC_READ, nr, len as u32), 0, &mut data),
+            Ok((0, len))
+        );
+    }
+    // The ones that are cut to the buffer answer nothing into nothing.
+    for nr in [0x06u32, 0x18, 0x20, 0x40] {
+        let _ = dev.ioctl(fh, ioc(IOC_READ, nr, 0), 0, &mut []);
+    }
+}
