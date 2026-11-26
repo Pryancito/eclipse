@@ -238,3 +238,15 @@ fn gpus_left_to_udrv_nvidia_are_waited_for_until_served() {
         ]
     );
 }
+
+/// The console bring-up's scanout pause outlasts a served card's patience,
+/// so it never lifts while the process is still bringing the card up; with
+/// no served GPU it is the kernel's own.
+#[test]
+fn the_bringup_pause_outlasts_a_served_cards_patience() {
+    use crate::fs::devfs::drm::SCANOUT_PAUSE_MAX;
+    assert_eq!(pause_for(0), SCANOUT_PAUSE_MAX);
+    let served = pause_for(2);
+    assert!(served > core::time::Duration::from_millis(BRINGUP_PATIENCE_MS));
+    assert!(served >= SCANOUT_PAUSE_MAX);
+}
