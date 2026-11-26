@@ -66,9 +66,72 @@ pub mod op {
     /// physical address in the bytes (u64).
     pub const IMPORT_BUFFER: u32 = 88;
     pub const FREE_BUFFER: u32 = 89;
+    /// `exec_cpu_waits` of the EXEC in the bytes (an [`ioctl`](super::ioctl)
+    /// message of it) by `a`: 1 and the waits (a list of handles, then a
+    /// u64 point for each), or 0 for none.
+    pub const EXEC_CPU_WAITS: u32 = 90;
+    /// `cpu_prep_fences` of handle `a` for `b`: a [fence list](super::fences_out).
+    pub const CPU_PREP_FENCES: u32 = 91;
+    /// `render_fence_for_scanout` of handle `a` for `b`: a fence list of
+    /// one, or none.
+    pub const RENDER_FENCE: u32 = 92;
+    /// `queued_fences` of handle `a`: a fence list.
+    pub const QUEUED_FENCES: u32 = 93;
 }
 
 pub mod ioctl;
+
+/// A driver's fence as it travels: its landing zone by the physical
+/// address under the driver's mapping of it (the kernel's is another), the
+/// semaphore's GPU VA, the payload and the driver's channel.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Fence {
+    pub phys: u64,
+    pub gpu_va: u64,
+    pub payload: u32,
+    pub ctx: u32,
+}
+
+/// A fence list: a count, then 24 bytes for each [`Fence`].
+fn fences_out(o: &mut Out, fences: &[Fence]) {
+    o.u32(fences.len() as u32);
+    for f in fences {
+        o.u64(f.phys).u64(f.gpu_va).u32(f.payload).u32(f.ctx);
+    }
+}
+
+fn fences_in(i: &mut In) -> Option<Vec<Fence>> {
+    let n = i.u32()? as usize;
+    if n > i.0.len() / 24 {
+        return None;
+    }
+    (0..n)
+        .map(|_| {
+            Some(Fence {
+                phys: i.u64()?,
+                gpu_va: i.u64()?,
+                payload: i.u32()?,
+                ctx: i.u32()?,
+            })
+        })
+        .collect()
+}
+
+/// The driver's fence at its own mapping `va`, as it travels.
+fn fence_of(va: usize, gpu_va: u64, payload: u32, ctx: u32) -> Fence {
+    // Only a driver in a process answers for real; a kernel built without
+    // one (its tests) has no mapping to undo, and the address is the one.
+    #[cfg(feature = "process")]
+    let phys = crate::bus::virt_to_phys(va) as u64;
+    #[cfg(not(feature = "process"))]
+    let phys = va as u64;
+    Fence {
+        phys,
+        gpu_va,
+        payload,
+        ctx,
+    }
+}
 
 /// The `errno` of a call the other end does not know, or whose answer did
 /// not parse.
@@ -145,6 +208,10 @@ impl Out<'_> {
         self.0.extend_from_slice(v);
         self
     }
+    fn u64(&mut self, v: u64) -> &mut Self {
+        self.0.extend_from_slice(&v.to_le_bytes());
+        self
+    }
 }
 
 struct In<'a>(&'a [u8]);
@@ -167,6 +234,11 @@ impl In<'_> {
             return None;
         }
         (0..n).map(|_| self.u32()).collect()
+    }
+    fn u64(&mut self) -> Option<u64> {
+        let (head, rest) = self.0.split_first_chunk::<8>()?;
+        self.0 = rest;
+        Some(u64::from_le_bytes(*head))
     }
     fn bytes(&mut self) -> Option<&[u8]> {
         let n = self.u32()? as usize;
@@ -380,6 +452,47 @@ pub fn answer(
                 Ok(0)
             }
         }
+        op::EXEC_CPU_WAITS => {
+            let (waits, _) =
+                ioctl::unpacked(ioctl::exec_cmd(), data, |at, _| gpu.exec_cpu_waits(at, a))?;
+            match waits {
+                Some((handles, points)) => {
+                    o.list(&handles);
+                    for p in points {
+                        o.u64(p);
+                    }
+                    Ok(1)
+                }
+                None => Ok(0),
+            }
+        }
+        op::CPU_PREP_FENCES => {
+            let fences: Vec<Fence> = gpu
+                .cpu_prep_fences(a as u32, b)
+                .into_iter()
+                .map(|(va, payload)| fence_of(va, 0, payload, 0))
+                .collect();
+            fences_out(&mut o, &fences);
+            Ok(0)
+        }
+        op::RENDER_FENCE => {
+            let fences: Vec<Fence> = gpu
+                .render_fence_for_scanout(a as u32, b)
+                .map(|(va, payload)| fence_of(va, 0, payload, 0))
+                .into_iter()
+                .collect();
+            fences_out(&mut o, &fences);
+            Ok(0)
+        }
+        op::QUEUED_FENCES => {
+            let fences: Vec<Fence> = gpu
+                .queued_fences(a as u32)
+                .into_iter()
+                .map(|f| fence_of(f.fence_va, f.fence_gpu_va, f.payload, f.ctx_idx))
+                .collect();
+            fences_out(&mut o, &fences);
+            Ok(0)
+        }
         _ => Err(EINVAL),
     }
 }
@@ -419,6 +532,14 @@ pub trait Transport: Send + Sync {
     /// Write `bytes` into the caller's memory at `addr`, or `EFAULT`.
     fn write_user(&self, _addr: usize, _bytes: &[u8]) -> Result<(), i32> {
         Err(ioctl::EFAULT)
+    }
+
+    /// The kernel's mapping of the driver's fence `f`, and the ctx the
+    /// kernel's syncobj table knows its channel by: `None` when its landing
+    /// zone is not memory the driver may name, and a fence the kernel
+    /// cannot read is not waited for. Default: none.
+    fn fence(&self, _f: &Fence) -> Option<(usize, u32)> {
+        None
     }
 }
 
@@ -492,6 +613,32 @@ impl<T: Transport> Remote<T> {
 
     fn yes(&self, op: u32, a: u64, b: u64, data: &[u8]) -> bool {
         self.word(op, a, b, data) == Some(1)
+    }
+
+    /// The fences op `op` names for handle `a` and `b`, each with the
+    /// kernel's mapping and ctx of it ([`Transport::fence`]); one the
+    /// kernel cannot read is left out, and said so.
+    fn fences(&self, op: u32, a: u32, b: u64) -> Vec<(usize, u32, Fence)> {
+        let Ok((_, back)) = self.call(op, a as u64, b, &[]) else {
+            return Vec::new();
+        };
+        let Some(fences) = fences_in(&mut In(&back)) else {
+            return Vec::new();
+        };
+        fences
+            .into_iter()
+            .filter_map(|f| match self.to.fence(&f) {
+                Some((va, ctx)) => Some((va, ctx, f)),
+                None => {
+                    log::warn!(
+                        "[drm-remote] {}: a fence at {:#x} that is not the driver's",
+                        self.name,
+                        f.phys
+                    );
+                    None
+                }
+            })
+            .collect()
     }
 
     fn flag(&self, bit: u64) -> bool {
@@ -609,6 +756,46 @@ impl<T: Transport> DrmScheme for Remote<T> {
     fn free_buffer(&self, handle: GemHandle) {
         let phys = handle.phys_addr.to_le_bytes();
         let _ = self.call(op::FREE_BUFFER, handle.id as u64, handle.size as u64, &phys);
+    }
+
+    fn exec_cpu_waits(&self, arg: usize, owner_pid: u64) -> Option<(Vec<u32>, Vec<u64>)> {
+        let (msg, _) = ioctl::message(&self.to, ioctl::exec_cmd(), arg, 0).ok()?;
+        let (w, back) = self.call(op::EXEC_CPU_WAITS, owner_pid, 0, &msg).ok()?;
+        if w != 1 {
+            return None;
+        }
+        let mut i = In(&back);
+        let handles = i.list()?;
+        let points = (0..handles.len())
+            .map(|_| i.u64())
+            .collect::<Option<Vec<u64>>>()?;
+        Some((handles, points))
+    }
+
+    fn cpu_prep_fences(&self, gem_handle: u32, owner_pid: u64) -> Vec<(usize, u32)> {
+        self.fences(op::CPU_PREP_FENCES, gem_handle, owner_pid)
+            .into_iter()
+            .map(|(va, _, f)| (va, f.payload))
+            .collect()
+    }
+
+    fn render_fence_for_scanout(&self, gem_handle: u32, owner_pid: u64) -> Option<(usize, u32)> {
+        self.fences(op::RENDER_FENCE, gem_handle, owner_pid)
+            .into_iter()
+            .next()
+            .map(|(va, _, f)| (va, f.payload))
+    }
+
+    fn queued_fences(&self, gem_handle: u32) -> Vec<crate::scheme::syncobj::HwFence> {
+        self.fences(op::QUEUED_FENCES, gem_handle, 0)
+            .into_iter()
+            .map(|(va, ctx, f)| crate::scheme::syncobj::HwFence {
+                fence_va: va,
+                fence_gpu_va: f.gpu_va,
+                payload: f.payload,
+                ctx_idx: ctx,
+            })
+            .collect()
     }
 
     fn nouveau_file_closed(&self, file: usize) {

@@ -88,6 +88,8 @@ pub mod check {
         /// Buffers the kernel made and told it of, and then freed.
         pub imported: AtomicU32,
         pub freed: AtomicU32,
+        /// The kernel asked which of an EXEC's waits are the CPU's.
+        pub waits_asked: AtomicU32,
     }
 
     impl Scheme for Card {
@@ -119,6 +121,21 @@ pub mod check {
         }
         fn free_buffer(&self, _h: zcore_drivers::scheme::drm::GemHandle) {
             self.freed.fetch_add(1, Ordering::Relaxed);
+        }
+        /// Every wait of an `EXEC` is the CPU's, read from its array as
+        /// the real driver reads it.
+        fn exec_cpu_waits(&self, arg: usize, _pid: u64) -> Option<(Vec<u32>, Vec<u64>)> {
+            self.waits_asked.fetch_add(1, Ordering::Relaxed);
+            // SAFETY: what the kernel's end copied: the struct, and
+            // `wait_count` waits where `wait_ptr` says.
+            let e = unsafe { &*(arg as *const Exec) };
+            if e.wait_count == 0 {
+                return None;
+            }
+            let waits = unsafe {
+                core::slice::from_raw_parts(e.wait_ptr as *const [u32; 4], e.wait_count as usize)
+            };
+            Some((waits.iter().map(|w| w[1]).collect(), vec![1; waits.len()]))
         }
         fn page_flip(&self, _fb: u32) -> bool {
             self.flips.fetch_add(1, Ordering::Relaxed);

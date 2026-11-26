@@ -105,6 +105,20 @@ pub(super) fn driver_gone(id: KoID) -> usize {
     n
 }
 
+/// The kernel's mapping of a fence of the driver in `proc` at `phys`, and
+/// the ctx the table knows its channel `ctx` by: what a fence the card it
+/// serves names (`DrmScheme::queued_fences` and the like) is to the kernel.
+/// `None` for memory that is not its own.
+pub(super) fn served_fence(proc: &Arc<Process>, phys: u64, ctx: u32) -> Option<(usize, u32)> {
+    let va = zone(proc, phys).ok()?;
+    if ctx > CTX_MASK {
+        return None;
+    }
+    let tag = tag_for(proc.id())?;
+    syncobj::set_fence_timeout_hook(timed_out);
+    Some((va, SERVED | tag << TAG_SHIFT | ctx))
+}
+
 /// [`ECLIPSE_SYNCOBJ`].
 pub(super) fn syncobj_call(proc: &Arc<Process>, args: &[usize; 6]) -> isize {
     match op(proc, args) {

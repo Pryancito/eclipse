@@ -117,7 +117,7 @@ fn served() -> Served {
     let link = Arc::new(Link::new(ours, window.clone()).unwrap());
     let card = Arc::new(Card::default());
     let hello = drm_remote::hello(&*card);
-    let remote = Remote::with_hello(OverLink::new(link), &hello).unwrap();
+    let remote = Remote::with_hello(OverLink::new(link, None), &hello).unwrap();
     let (gpu, server) = (card.clone(), theirs);
     let answering = thread::spawn(move || loop {
         let mut m = [0u8; MSG];
@@ -215,5 +215,5 @@ fn a_hello_that_does_not_parse_makes_no_card() {
     let (ours, _theirs) = Fifo::create(SLOTS * 2, MSG);
     let window = VmObject::new_paged((SLOTS * SLOT_LEN).div_ceil(4096));
     let link = Arc::new(Link::new(ours, window).unwrap());
-    assert!(Remote::with_hello(OverLink::new(link), &[1, 2, 3]).is_err());
+    assert!(Remote::with_hello(OverLink::new(link, None), &[1, 2, 3]).is_err());
 }
