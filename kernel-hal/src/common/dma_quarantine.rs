@@ -135,6 +135,22 @@ impl Quarantine {
     }
 }
 
+impl Quarantine {
+    /// Give up every held block, oldest first, into `evicted`, for a caller
+    /// that needs the memory back now (a contiguous allocation that found no
+    /// free run). Their poison is the caller's to check, as for an eviction.
+    pub fn drain(&mut self, evicted: &mut alloc::vec::Vec<(usize, usize)>) {
+        while self.len > 0 {
+            let h = self.head;
+            evicted.push(self.ring[h]);
+            self.ring[h] = (0, 0);
+            self.head = (h + 1) % MAX_BLOCKS;
+            self.len -= 1;
+        }
+        self.held_pages = 0;
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -421,5 +437,18 @@ mod tests {
         // ...and freeing it again is the ordinary free it is, not a double
         // free.
         assert_eq!(push(&mut q, at(1), MAX_BLOCK_PAGES).0, Verdict::Held);
+    }
+
+    #[test]
+    fn a_drain_gives_back_every_block_oldest_first_and_empties_it() {
+        let mut q = Quarantine::new();
+        push(&mut q, at(1), 4);
+        push(&mut q, at(2), 8);
+        let mut ev = Vec::new();
+        q.drain(&mut ev);
+        assert_eq!(ev, alloc::vec![(at(1), 4), (at(2), 8)]);
+        assert_eq!(q.depth(), (0, 0));
+        // And it takes blocks again as before.
+        assert_eq!(push(&mut q, at(1), 4).0, Verdict::Held);
     }
 }
