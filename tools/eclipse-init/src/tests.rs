@@ -2073,6 +2073,7 @@ fn gtk_finds_its_pixbuf_loaders_from_init_started_children() {
     for var in [
         "GDK_PIXBUF_MODULE_FILE=/root/.cache/pixbuf-loaders.cache",
         "GSETTINGS_BACKEND=memory",
+        "GLYCIN_DISABLE_SANDBOX=i-know-the-risks",
     ] {
         assert!(CHILD_ENV.contains(&var), "{var} must be in CHILD_ENV");
         for cmdline in ["LOG=warn", "renderer=gl", "renderer=gl-sw"] {
