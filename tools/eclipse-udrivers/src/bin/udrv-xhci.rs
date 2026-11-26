@@ -155,7 +155,15 @@ fn describe(shared: &'static Shared, x: &Xhci, hid: usize, out: &mut Vec<Added>)
 /// controller is let go before a node's is taken, since writing LEDs takes
 /// them the other way round. Whether events wait still, set aside while a
 /// device was enumerated.
+///
+/// Several threads come here (the interrupt's, the LEDs', each disk's
+/// after its turn). [`IN_ORDER`] is held from the taking to the giving, so
+/// that reports reach a node in the order the controller gave them: without
+/// it a key's release could overtake its press, and the key stayed down.
+/// Nothing that holds another lock takes it.
 fn service(shared: &'static Shared) -> bool {
+    static IN_ORDER: Mutex<()> = Mutex::new(());
+    let _in_order = lock(&IN_ORDER);
     let mut frames: Vec<Frame> = Vec::new();
     let mut added = Vec::new();
     let pending;

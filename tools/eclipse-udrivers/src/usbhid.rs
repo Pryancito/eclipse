@@ -281,8 +281,10 @@ impl Field {
     /// Its value in report `r` (after the ID), signed when its minimum is
     /// below 0.
     fn read(&self, r: &[u8]) -> Option<i32> {
-        if self.size == 0 || self.size > 32 || (self.at + self.size).div_ceil(8) as usize > r.len()
-        {
+        // Both are the device's numbers: a sum that wrapped would pass for
+        // a field at the report's start.
+        let end = self.at.checked_add(self.size)?;
+        if self.size == 0 || self.size > 32 || end.div_ceil(8) as usize > r.len() {
             return None;
         }
         let mut v: u64 = 0;
@@ -312,6 +314,13 @@ pub struct Pointer {
     pub hwheel: Option<Field>,
 }
 
+/// The bits of the longest report a descriptor may describe: 64 KiB, the
+/// most a transfer carries.
+const REPORT_BITS_MAX: u32 = 8 * 65536;
+/// The values a descriptor may name in all. Values of no bits fit any
+/// report, so their number has a bound of its own.
+const VALUES_MAX: usize = 4096;
+
 /// One input item's values: the usage of each, and where it is.
 fn usages_of(
     local: &[u32],
@@ -319,7 +328,7 @@ fn usages_of(
     count: u32,
 ) -> impl Iterator<Item = Option<u32>> + '_ {
     (0..count).map(move |i| match range {
-        Some((lo, hi)) => Some((lo + i).min(hi)),
+        Some((lo, hi)) => Some(lo.saturating_add(i).min(hi)),
         None => local.get(i as usize).or(local.last()).copied(),
     })
 }
@@ -371,7 +380,15 @@ pub fn parse_pointer(desc: &[u8]) -> Option<Pointer> {
         match (b >> 2 & 3, b >> 4) {
             // Main: Input.
             (0, 0x8) => {
+                // The descriptor is the device's to write: a count or a
+                // report beyond what a report can hold is no pointer's,
+                // and is not walked value by value.
+                let wide = g.size.checked_mul(g.count)?;
+                if g.count as usize > VALUES_MAX && v & 1 == 0 && g.size == 0 {
+                    return None;
+                }
                 let bits = at.entry(g.id).or_insert(0);
+                let end = bits.checked_add(wide).filter(|&e| e <= REPORT_BITS_MAX)?;
                 if v & 1 == 0 {
                     for (k, u) in usages_of(&local, lo.zip(hi), g.count).enumerate() {
                         if let Some(u) = u {
@@ -382,11 +399,14 @@ pub fn parse_pointer(desc: &[u8]) -> Option<Pointer> {
                                 max: g.max,
                                 abs: v & 4 == 0,
                             };
+                            if values.len() == VALUES_MAX {
+                                return None;
+                            }
                             values.push((g.id, u, field));
                         }
                     }
                 }
-                *bits += g.size * g.count;
+                *bits = end;
                 local.clear();
                 (lo, hi) = (None, None);
             }

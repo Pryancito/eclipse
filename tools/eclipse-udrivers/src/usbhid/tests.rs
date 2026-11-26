@@ -141,3 +141,48 @@ fn a_descriptor_with_no_x_is_no_pointer() {
     assert_eq!(parse_pointer(&desc), None);
     assert_eq!(parse_pointer(&[0x05]), None, "cut short");
 }
+
+/// A descriptor is what the device says it is: counts and sizes no report
+/// holds are refused, not walked (which took the driver, and the disks it
+/// serves, with it).
+#[test]
+fn a_descriptor_with_absurd_counts_is_no_pointer() {
+    // Usage Page (Desktop), Usage (X), Report Size (s), Report Count (c),
+    // Input (Data, Var, Rel).
+    let desc = |size: u32, count: u32| {
+        let mut d = vec![0x05, 0x01, 0x09, 0x30, 0x77];
+        d.extend(size.to_le_bytes());
+        d.push(0x97);
+        d.extend(count.to_le_bytes());
+        d.extend([0x81, 0x06]);
+        d
+    };
+    assert_eq!(
+        parse_pointer(&desc(8, u32::MAX)),
+        None,
+        "a product that wraps"
+    );
+    assert_eq!(parse_pointer(&desc(0, u32::MAX)), None, "values of no bits");
+    assert_eq!(
+        parse_pointer(&desc(1, 8 * 65536 + 1)),
+        None,
+        "past a report"
+    );
+    assert_eq!(parse_pointer(&desc(u32::MAX, 1)), None);
+    // Two items whose bits, added, wrap: the second would land on bit 0.
+    let mut two = desc(1 << 31, 1);
+    two.extend(desc(1 << 31, 1));
+    assert_eq!(parse_pointer(&two), None);
+}
+
+#[test]
+fn a_field_past_the_end_of_what_a_number_holds_reads_nothing() {
+    let f = Field {
+        at: u32::MAX - 3,
+        size: 8,
+        min: 0,
+        max: 255,
+        abs: true,
+    };
+    assert_eq!(f.read(&[0xff; 8]), None);
+}
