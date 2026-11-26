@@ -486,3 +486,45 @@ fn a_box_with_no_bring_up_is_never_late() {
     assert!(!super::bringup_declared_too_late(false, true));
     assert!(!super::bringup_declared_too_late(false, false));
 }
+
+/// A card a process drives (`udrv-nvidia`'s), as `served::card` keeps one:
+/// in the DRM core's list and among the served ones, never in the kernel's
+/// device list. Out of both on drop.
+struct ServedGpu(Arc<dyn DrmScheme>);
+
+impl ServedGpu {
+    fn serve(gpu: EmuGpu) -> Self {
+        let card: Arc<dyn DrmScheme> = Arc::new(gpu);
+        crate::fs::devfs::served::card::note_served(&card);
+        register_driver(card.clone());
+        Self(card)
+    }
+}
+
+impl Drop for ServedGpu {
+    fn drop(&mut self) {
+        crate::fs::devfs::served::card::forget_served(&self.0);
+        unregister_driver(&self.0);
+    }
+}
+
+/// Two GPUs one udrv-nvidia drives: each gets its pair, the one with the
+/// monitor is `card0` whichever the process served first, and the other is
+/// the compute card, as with the kernel's driver. The kernel's device list
+/// has neither, which once left the second with no node at all.
+#[test]
+fn two_gpus_a_process_drives_get_a_pair_each_and_the_console_one_is_card0() {
+    let _screen = kms_emu::attach(64, 16);
+    let _table = NodeTable;
+    let _compute = ServedGpu::serve(EmuGpu::new("served-compute").compute_at(0x65, 0x00));
+    let _console = ServedGpu::serve(EmuGpu::hardware_kms("served-console").console_at(0x01, 0x00));
+    let headless = get_compute_driver().expect("the headless served GPU computes");
+    assert_eq!(headless.pci_bdf(), Some((0, 0x65, 0x00, 0)));
+
+    let nodes = built();
+    assert_eq!(
+        nodes,
+        vec![(0, Some((0, 0x01, 0x00, 0))), (1, Some((0, 0x65, 0x00, 0)))],
+        "card0 the console GPU, card1 the other"
+    );
+}

@@ -247,8 +247,7 @@ mod monitor_pin_tests;
 /// the card that scans out, so a box that asks for nothing gets exactly the
 /// node map it got before.
 pub fn get_compute_driver() -> Option<Arc<dyn DrmScheme>> {
-    let drivers = kernel_hal::drivers::all_drm();
-    let list = drivers.as_vec();
+    let list = every_card();
     if let Some((bus, dev, func)) = parse_nvidia_compute_bdf() {
         match resolve_bdf_pin(list.iter().map(|d| d.pci_bdf()), (bus, dev, func)) {
             Some(i) => {
@@ -299,4 +298,19 @@ where
 {
     let (bus, dev, func) = pin;
     cards.position(|bdf| matches!(bdf, Some((_, b, dv, f)) if b == bus && dv == dev && f == func))
+}
+
+/// Every card there is: the kernel's drivers', in the kernel's order, and
+/// then those processes drive (`udrv-nvidia`'s GPUs), which the kernel's
+/// device list does not have. Asked by whatever must name or pick among
+/// every card, so a second served GPU gets a node and can be the compute
+/// one, as it would with the kernel's driver.
+pub fn every_card() -> Vec<Arc<dyn DrmScheme>> {
+    let mut cards = kernel_hal::drivers::all_drm().as_vec().clone();
+    for card in crate::fs::devfs::served::card::served_cards() {
+        if !cards.iter().any(|c| Arc::ptr_eq(c, &card)) {
+            cards.push(card);
+        }
+    }
+    cards
 }

@@ -2538,8 +2538,7 @@ pub fn build_gpu_nodes() {
     // one card on a two-card box. A role is a reason to label a node (index 1
     // and up answer `eclipse-compute`, see `node_driver_id`), never a reason to
     // leave a card unnameable.
-    let drivers = kernel_hal::drivers::all_drm();
-    let list = drivers.as_vec();
+    let list = every_card();
     let mut rest: Vec<Arc<dyn DrmScheme>> = list
         .iter()
         .filter(|d| !nodes.iter().any(|n| Arc::ptr_eq(&n.driver, d)))
