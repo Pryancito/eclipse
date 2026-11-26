@@ -49,12 +49,21 @@ pub const RESV_FORGET: u32 = 14;
 pub const WORDS_MAX: usize = 4096;
 /// "No such": the answer of [`WITHOUT_FENCE`] and [`FIRST_UNUSABLE`] when
 /// every handle is fine.
-pub const NONE: u64 = u64::MAX;
+///
+/// An answer is the value of a system call, and a value from -4095 to -1
+/// is an `errno` to the C library: `u64::MAX` here was -1, so "every
+/// handle is fine" reached the driver as a refusal (`EINVAL`), and it took
+/// the first handle of every EXEC for one that is not the caller's
+/// (`ENOENT`): no NVK device could be made on a served card. Every answer
+/// stays at or below `i64::MAX` ([`ANSWER_MAX`]).
+pub const NONE: u64 = ANSWER_MAX;
+/// The largest answer a call gives: one that never reads as negative.
+pub const ANSWER_MAX: u64 = i64::MAX as u64;
 /// The ctx of a fence another driver attached.
 pub const NOT_MINE: u32 = u32::MAX;
 /// The bit of [`POLL_PENDING`]'s answer that says there are timeouts to ask
 /// for.
-pub const TIMED_OUT: u64 = 1 << 63;
+pub const TIMED_OUT: u64 = 1 << 62;
 
 /// The words of a wait list: `[n, has_points, handles(n), points(n)?]`.
 pub fn waits(handles: &[u32], points: Option<&[u64]>) -> Vec<u64> {
@@ -138,6 +147,29 @@ pub fn bytes_of_words(words: &[u64], len: usize) -> Vec<u8> {
 mod tests {
     use super::*;
     use alloc::vec;
+
+    /// What the C library does with a system call's value: -4095 to -1 is
+    /// an error.
+    fn reads_as_errno(w: u64) -> bool {
+        (-4095..=-1).contains(&(w as i64))
+    }
+
+    #[test]
+    fn no_answer_reads_as_an_errno_or_as_negative() {
+        for w in [
+            NONE,
+            TIMED_OUT,
+            TIMED_OUT | WORDS_MAX as u64,
+            TIMED_OUT | u32::MAX as u64,
+            ready_word(Some(Ok(u32::MAX))),
+        ] {
+            assert!(!reads_as_errno(w), "{:#x}", w);
+            assert!(w <= ANSWER_MAX, "{:#x}", w);
+        }
+        // `NONE` is no index and no handle.
+        assert!(NONE > u32::MAX as u64);
+        assert_eq!(TIMED_OUT & (u32::MAX as u64), 0);
+    }
 
     #[test]
     fn a_wait_list_comes_back_as_it_went() {
