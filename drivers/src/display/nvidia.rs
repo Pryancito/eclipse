@@ -723,9 +723,10 @@ pub fn nvidia_hda_is_monitor_gpu(bus: u8, device: u8) -> bool {
     sibling_bar1_holds_boot_fb(bus, device)
 }
 
-/// Function 0 of `bus:dev` is the GPU; BAR1 (config 0x18, 64-bit) is the
-/// framebuffer aperture. The GOP scanout physical address sits inside that
-/// window on the console GPU only.
+/// Function 0 of `bus:dev` is the GPU, and its framebuffer aperture is its
+/// second memory BAR ([`fb_bar_of`]). The GOP scanout physical address sits
+/// inside that window on the console GPU only. Asked for a GPU this driver
+/// does not hold: one a process drives (`udrv-nvidia`).
 fn sibling_bar1_holds_boot_fb(bus: u8, device: u8) -> bool {
     let Some(fb) = boot_fb_phys() else {
         return false;
@@ -738,18 +739,47 @@ fn sibling_bar1_holds_boot_fb(bus: u8, device: u8) -> bool {
         device,
         function: 0,
     };
-    let bar1 = unsafe {
-        crate::bus::pci::read_bar_addr(
-            &crate::bus::pci::PortOpsImpl,
-            crate::bus::pci::PCI_ACCESS,
-            loc,
-            0x18,
-        )
+    let read32 = |offset: u16| unsafe {
+        crate::bus::pci::PCI_ACCESS.read32(&crate::bus::pci::PortOpsImpl, loc, offset)
     };
+    let bar1 = fb_bar_of(read32);
     if bar1 == 0 {
         return false;
     }
     fb >= bar1 && fb.saturating_sub(bar1) < (512 << 20)
+}
+
+/// The address of the second memory BAR in a function's header (`read32`
+/// reads its configuration space), as the probe takes the framebuffer
+/// aperture: memory BARs in order, a 64-bit one taking its own register and
+/// the next. On a GeForce that is BAR1 at 0x14, 64-bit, behind the 32-bit
+/// BAR0 at 0x10: 0x18 is BAR1's upper half, not a BAR. 0 when there is no
+/// second memory BAR.
+fn fb_bar_of(read32: impl Fn(u16) -> u32) -> u64 {
+    let mut reg = 0x10u16;
+    let mut memory_bars = 0;
+    while reg <= 0x24 {
+        let lo = read32(reg);
+        if lo & 0x1 != 0 {
+            // An I/O BAR.
+            reg += 4;
+            continue;
+        }
+        let wide = lo & 0x6 == 0x4;
+        let addr = if wide && reg + 4 <= 0x24 {
+            ((read32(reg + 4) as u64) << 32) | (lo & !0xF) as u64
+        } else {
+            (lo & !0xF) as u64
+        };
+        if addr != 0 {
+            memory_bars += 1;
+            if memory_bars == 2 {
+                return addr;
+            }
+        }
+        reg += if wide { 8 } else { 4 };
+    }
+    0
 }
 
 mod eld;
