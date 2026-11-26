@@ -32,7 +32,7 @@ pub use nvidia_rm_sys::frontend::{
     LAYOUT, NV_ERR_STATE_IN_USE, VERSION_CMD_QUERY, VERSION_REPLY_RECOGNIZED,
     VERSION_STRING_LENGTH,
 };
-use nvidia_rm_sys::types::{NV_ERR_NOT_READY, NV_ERR_NOT_SUPPORTED, NV_OK, NV_STATUS};
+use nvidia_rm_sys::types::{NV_ERR_NOT_READY, NV_OK, NV_STATUS};
 
 static ENABLED: AtomicBool = AtomicBool::new(false);
 
@@ -72,13 +72,6 @@ pub fn rm_up() -> bool {
 /// Whether this address space's own RM core is constructed.
 fn local_rm_up() -> bool {
     *RM_CORE_INIT_STATUS.lock() == Some(NV_OK)
-}
-
-/// Whether the RM is a process's ([`remote`]), whose answers to what it
-/// does not carry yet are `NV_ERR_NOT_SUPPORTED`: this address space's RM
-/// is never entered then, as it is never built.
-fn served_elsewhere() -> bool {
-    remote::served().is_some()
 }
 
 /// `nvidia_rm_sys::frontend::events::alloc_os_event`, of the RM a
@@ -206,8 +199,11 @@ pub fn uvm_va_space_device(
     h_va_space: u32,
     gpu_instance: u32,
 ) -> Result<u32, NV_STATUS> {
-    if served_elsewhere() {
-        return Err(NV_ERR_NOT_SUPPORTED);
+    if let Some(served) = remote::served() {
+        if !served.rm_up() {
+            return Err(NV_ERR_NOT_READY);
+        }
+        return served.uvm_va_space_device(caller, h_client, h_va_space, gpu_instance);
     }
     if !rm_up() {
         return Err(NV_ERR_NOT_READY);
@@ -218,8 +214,11 @@ pub fn uvm_va_space_device(
 /// `nvidia_rm_sys::frontend::uvm::map_external`, refused with
 /// `NV_ERR_NOT_READY` while there is no RM core to map in.
 pub fn uvm_map_external(caller: &Caller, m: &ExternalMapping) -> Result<u32, NV_STATUS> {
-    if served_elsewhere() {
-        return Err(NV_ERR_NOT_SUPPORTED);
+    if let Some(served) = remote::served() {
+        if !served.rm_up() {
+            return Err(NV_ERR_NOT_READY);
+        }
+        return served.uvm_map_external(caller, m);
     }
     if !rm_up() {
         return Err(NV_ERR_NOT_READY);
@@ -236,8 +235,11 @@ pub fn uvm_pages(
     pages: &Pages,
     gpu_cached: bool,
 ) -> Result<u32, NV_STATUS> {
-    if served_elsewhere() {
-        return Err(NV_ERR_NOT_SUPPORTED);
+    if let Some(served) = remote::served() {
+        if !served.rm_up() {
+            return Err(NV_ERR_NOT_READY);
+        }
+        return served.uvm_pages(caller, h_client, h_device, pages, gpu_cached);
     }
     if !rm_up() {
         return Err(NV_ERR_NOT_READY);
@@ -255,8 +257,11 @@ pub fn uvm_user_pages(
     pages: UserPages,
     gpu_cached: bool,
 ) -> Result<u32, NV_STATUS> {
-    if served_elsewhere() {
-        return Err(NV_ERR_NOT_SUPPORTED);
+    if let Some(served) = remote::served() {
+        if !served.rm_up() {
+            return Err(NV_ERR_NOT_READY);
+        }
+        return served.uvm_user_pages(caller, h_client, h_device, pages, gpu_cached);
     }
     if !rm_up() {
         return Err(NV_ERR_NOT_READY);
@@ -267,8 +272,11 @@ pub fn uvm_user_pages(
 /// `nvidia_rm_sys::frontend::uvm::p2p_caps` between RM GPU instances `a`
 /// and `b`, refused with `NV_ERR_NOT_READY` while there is no RM core.
 pub fn uvm_p2p_caps(a: u32, b: u32) -> Result<P2pCaps, NV_STATUS> {
-    if served_elsewhere() {
-        return Err(NV_ERR_NOT_SUPPORTED);
+    if let Some(served) = remote::served() {
+        if !served.rm_up() {
+            return Err(NV_ERR_NOT_READY);
+        }
+        return served.uvm_p2p_caps(a, b);
     }
     if !rm_up() {
         return Err(NV_ERR_NOT_READY);
@@ -279,8 +287,11 @@ pub fn uvm_p2p_caps(a: u32, b: u32) -> Result<P2pCaps, NV_STATUS> {
 /// `nvidia_rm_sys::frontend::uvm::sked_reflected`, refused with
 /// `NV_ERR_NOT_READY` while there is no RM core to map in.
 pub fn uvm_sked_reflected(caller: &Caller, r: &SkedRange) -> Result<(u32, u32), NV_STATUS> {
-    if served_elsewhere() {
-        return Err(NV_ERR_NOT_SUPPORTED);
+    if let Some(served) = remote::served() {
+        if !served.rm_up() {
+            return Err(NV_ERR_NOT_READY);
+        }
+        return served.uvm_sked_reflected(caller, r);
     }
     if !rm_up() {
         return Err(NV_ERR_NOT_READY);
@@ -291,8 +302,11 @@ pub fn uvm_sked_reflected(caller: &Caller, r: &SkedRange) -> Result<(u32, u32), 
 /// `nvidia_rm_sys::frontend::uvm::free`. With no RM core nothing was ever
 /// mapped, and the RM must not be entered to find that out.
 pub fn uvm_free(caller: &Caller, h_client: u32, h_object: u32) -> NV_STATUS {
-    if served_elsewhere() {
-        return NV_ERR_NOT_SUPPORTED;
+    if let Some(served) = remote::served() {
+        if !served.rm_up() {
+            return NV_ERR_NOT_READY;
+        }
+        return served.uvm_free(caller, h_client, h_object);
     }
     if !rm_up() {
         return NV_ERR_NOT_READY;

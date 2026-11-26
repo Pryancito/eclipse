@@ -35,23 +35,29 @@
 //! RM's posts are. The nonstall poll that wakes a sleeping CUDA wait asks
 //! the process to look ([`op::SERVICE_NONSTALL`]).
 //!
-//! This carries the plain escapes, the lent pages, the mappings, OS events
-//! and `release`. UVM is refused with `NV_ERR_NOT_SUPPORTED` until it is
-//! carried too.
+//! What `/dev/nvidia-uvm` asks of the RM goes over the link too (the ops
+//! from [`op::UVM_VA_SPACE_DEVICE`]): a managed range's pages are lent as an
+//! OS descriptor's are, and a semaphore pool's (the kernel's own,
+//! [`KernelPages`]) the same way, held by the process's RM for as long as
+//! it has memory made of them.
+//!
+//! Everything the device files ask of the RM is carried.
 
 use super::{
-    Caller, Card, MmapContext, MmapMemory, NonstallPoll, RawMmapContext, UserPages,
-    CALLER_NAME_LEN, GPU_UUID_LEN,
+    Caller, Card, ExternalMapping, MmapContext, MmapMemory, NonstallPoll, P2pCaps, Pages,
+    RawMmapContext, SkedRange, UserPages, CALLER_NAME_LEN, GPU_UUID_LEN,
 };
 use alloc::boxed::Box;
 use alloc::collections::BTreeMap;
 use alloc::sync::Arc;
 use alloc::vec::Vec;
+use core::any::Any;
 use core::convert::TryFrom;
 use core::sync::atomic::{AtomicU64, Ordering};
 use lock::Mutex;
 use nvidia_rm_sys::types::{
-    NV_ERR_INSUFFICIENT_RESOURCES, NV_ERR_INVALID_STATE, NV_ERR_OPERATING_SYSTEM, NV_STATUS,
+    NV_ERR_INSUFFICIENT_RESOURCES, NV_ERR_INVALID_STATE, NV_ERR_NOT_SUPPORTED,
+    NV_ERR_OPERATING_SYSTEM, NV_STATUS,
 };
 
 /// The link's operations, numbered apart from a served node's (`1..=16`)
@@ -83,6 +89,28 @@ pub mod op {
     /// Look at the nonstall interrupts pending: no message, and the answer's
     /// `a` is what was found ([`super::encode_nonstall`]).
     pub const SERVICE_NONSTALL: u32 = 135;
+    /// UVM's calls, each with the [`Caller`] first. `UVM_VA_SPACE_DEVICE`:
+    /// then the client, the VA space and the GPU instance (`u32` each, and
+    /// 4 bytes at zero); the answer's `a` is a result
+    /// ([`super::encode_result`]), the device's handle.
+    pub const UVM_VA_SPACE_DEVICE: u32 = 136;
+    /// Then the mapping ([`super::EXTERNAL_LEN`] bytes); a result, the
+    /// virtual object's handle.
+    pub const UVM_MAP_EXTERNAL: u32 = 137;
+    /// Then the client and the object (`u32` each); `a` the status.
+    pub const UVM_FREE: u32 = 138;
+    /// Then the range ([`super::SKED_LEN`] bytes); `a` the status, the
+    /// answer's bytes the memory's and the virtual object's handles.
+    pub const UVM_SKED_REFLECTED: u32 = 139;
+    /// No caller and no message: `a` = the two GPU instances, the first in
+    /// the high half. `a` the status, the bytes the caps ([`super::CAPS_LEN`]).
+    pub const UVM_P2P_CAPS: u32 = 140;
+    /// A semaphore pool's pages, lent: as [`RM_ESCAPE_LENDING`], with the
+    /// client, the device, whether the GPU caches them (`u32` each, and 4
+    /// bytes at zero) as the payload; a result, the memory's handle.
+    pub const UVM_PAGES: u32 = 141;
+    /// A managed range's pages, lent: as [`UVM_PAGES`].
+    pub const UVM_USER_PAGES: u32 = 142;
 }
 
 /// The most bytes a message carries: a slot of the link.
@@ -305,28 +333,7 @@ impl Served {
         caller: &Caller,
         pages: UserPages,
     ) -> NV_STATUS {
-        let len = CALLER_LEN + LOAN_LEN + pages.phys.len() * 8 + payload.len();
-        if len > MESSAGE_MAX {
-            warn!(
-                "[nvidiactl] escape {cmd:#x}: {} pages are more than the RM's process can be lent at once",
-                pages.phys.len()
-            );
-            return NV_ERR_INSUFFICIENT_RESOURCES;
-        }
-        let Some(loan) = (self.server.lend)(&pages) else {
-            warn!("[nvidiactl] escape {cmd:#x}: the pages could not be lent to the RM's GPUs");
-            return NV_ERR_INSUFFICIENT_RESOURCES;
-        };
-        let id = self.next_loan.fetch_add(1, Ordering::Relaxed);
-        let mut msg = Vec::with_capacity(len);
-        msg.extend_from_slice(&encode_caller(caller));
-        msg.extend_from_slice(&encode_loan(id, &pages));
-        for phys in &pages.phys {
-            msg.extend_from_slice(&phys.to_le_bytes());
-        }
-        msg.extend_from_slice(payload);
-        self.loans.lock().insert(id, (pages, loan));
-        match self.link.call(op::RM_ESCAPE_LENDING, cmd as u64, &msg) {
+        match self.lend(op::RM_ESCAPE_LENDING, cmd as u64, caller, pages, payload) {
             Ok((status, back)) if back.len() == payload.len() => {
                 payload.copy_from_slice(&back);
                 status as NV_STATUS
@@ -335,21 +342,169 @@ impl Served {
                 warn!("[nvidiactl] escape {cmd:#x}: the RM's process answered another size");
                 NV_ERR_OPERATING_SYSTEM
             }
-            Err(errno) => {
-                warn!("[nvidiactl] escape {cmd:#x}: the RM's process did not answer ({errno})");
-                // A message it refused it never made pages of, and gives
-                // nothing back: the loan is undone here. One it may have
-                // been in the middle of (it is gone) stays, as all of a
-                // gone process's do.
-                if errno != ENODEV {
-                    if let Some((pages, loan)) = self.loans.lock().remove(&id) {
-                        loan.give_back();
-                        drop(pages);
-                    }
-                }
-                NV_ERR_OPERATING_SYSTEM
-            }
+            Err(status) => status,
         }
+    }
+
+    /// Ask `op` with `a`, `pages` lent to the process for it: the caller,
+    /// the loan, and `tail` after it. `Err` is the status the call fails
+    /// with.
+    fn lend(
+        &self,
+        op: u32,
+        a: u64,
+        caller: &Caller,
+        pages: UserPages,
+        tail: &[u8],
+    ) -> Result<(u64, Vec<u8>), NV_STATUS> {
+        let len = CALLER_LEN + LOAN_LEN + pages.phys.len() * 8 + tail.len();
+        if len > MESSAGE_MAX {
+            warn!(
+                "[nvidiactl] op {op}: {} pages are more than the RM's process can be lent at once",
+                pages.phys.len()
+            );
+            return Err(NV_ERR_INSUFFICIENT_RESOURCES);
+        }
+        let Some(loan) = (self.server.lend)(&pages) else {
+            warn!("[nvidiactl] op {op}: the pages could not be lent to the RM's GPUs");
+            return Err(NV_ERR_INSUFFICIENT_RESOURCES);
+        };
+        let id = self.next_loan.fetch_add(1, Ordering::Relaxed);
+        let mut msg = Vec::with_capacity(len);
+        msg.extend_from_slice(&encode_caller(caller));
+        msg.extend_from_slice(&encode_loan(id, &pages));
+        for phys in &pages.phys {
+            msg.extend_from_slice(&phys.to_le_bytes());
+        }
+        msg.extend_from_slice(tail);
+        self.loans.lock().insert(id, (pages, loan));
+        self.link.call(op, a, &msg).map_err(|errno| {
+            warn!("[nvidiactl] op {op}: the RM's process did not answer ({errno})");
+            // A message it refused it never made pages of, and gives
+            // nothing back: the loan is undone here. One it may have been
+            // in the middle of (it is gone) stays, as all of a gone
+            // process's do.
+            if errno != ENODEV {
+                if let Some((pages, loan)) = self.loans.lock().remove(&id) {
+                    loan.give_back();
+                    drop(pages);
+                }
+            }
+            NV_ERR_OPERATING_SYSTEM
+        })
+    }
+
+    /// Ask UVM's `op` with `msg` after the caller: the answer's `a` and
+    /// bytes, or the status the call fails with.
+    fn uvm_call(
+        &self,
+        op: u32,
+        a: u64,
+        caller: Option<&Caller>,
+        msg: &[u8],
+    ) -> Result<(u64, Vec<u8>), NV_STATUS> {
+        let msg = match caller {
+            Some(caller) => with_caller(caller, msg),
+            None => msg.to_vec(),
+        };
+        self.link.call(op, a, &msg).map_err(|errno| {
+            warn!("[nvidiactl] UVM op {op}: the RM's process did not answer ({errno})");
+            NV_ERR_OPERATING_SYSTEM
+        })
+    }
+
+    /// A call whose answer's `a` is a result, and no bytes.
+    fn uvm_result(&self, op: u32, caller: &Caller, msg: &[u8]) -> Result<u32, NV_STATUS> {
+        let (word, _) = self.uvm_call(op, 0, Some(caller), msg)?;
+        decode_result(word).unwrap_or(Err(NV_ERR_OPERATING_SYSTEM))
+    }
+
+    pub(super) fn uvm_va_space_device(
+        &self,
+        caller: &Caller,
+        h_client: u32,
+        h_va_space: u32,
+        gpu_instance: u32,
+    ) -> Result<u32, NV_STATUS> {
+        let msg = words(&[h_client, h_va_space, gpu_instance, 0]);
+        self.uvm_result(op::UVM_VA_SPACE_DEVICE, caller, &msg)
+    }
+
+    pub(super) fn uvm_map_external(
+        &self,
+        caller: &Caller,
+        m: &ExternalMapping,
+    ) -> Result<u32, NV_STATUS> {
+        self.uvm_result(op::UVM_MAP_EXTERNAL, caller, &encode_external(m))
+    }
+
+    pub(super) fn uvm_free(&self, caller: &Caller, h_client: u32, h_object: u32) -> NV_STATUS {
+        match self.uvm_call(op::UVM_FREE, 0, Some(caller), &words(&[h_client, h_object])) {
+            Ok((status, _)) => status as NV_STATUS,
+            Err(status) => status,
+        }
+    }
+
+    pub(super) fn uvm_sked_reflected(
+        &self,
+        caller: &Caller,
+        r: &SkedRange,
+    ) -> Result<(u32, u32), NV_STATUS> {
+        let (status, back) =
+            self.uvm_call(op::UVM_SKED_REFLECTED, 0, Some(caller), &encode_sked(r))?;
+        match (status as NV_STATUS, back.len()) {
+            (0, 8) => Ok((u32_at(&back, 0), u32_at(&back, 4))),
+            (0, _) => Err(NV_ERR_OPERATING_SYSTEM),
+            (status, _) => Err(status),
+        }
+    }
+
+    pub(super) fn uvm_p2p_caps(&self, a: u32, b: u32) -> Result<P2pCaps, NV_STATUS> {
+        let pair = u64::from(a) << 32 | u64::from(b);
+        let (status, back) = self.uvm_call(op::UVM_P2P_CAPS, pair, None, &[])?;
+        match (status as NV_STATUS, back.len()) {
+            (0, CAPS_LEN) => Ok(decode_caps(&back)),
+            (0, _) => Err(NV_ERR_OPERATING_SYSTEM),
+            (status, _) => Err(status),
+        }
+    }
+
+    pub(super) fn uvm_pages(
+        &self,
+        caller: &Caller,
+        h_client: u32,
+        h_device: u32,
+        pages: &Pages,
+        gpu_cached: bool,
+    ) -> Result<u32, NV_STATUS> {
+        if pages.size == 0 || !pages.size.is_multiple_of(4096) || !pages.phys.is_multiple_of(4096) {
+            return Err(nvidia_rm_sys::types::NV_ERR_INVALID_ARGUMENT);
+        }
+        let phys = (0..pages.size / 4096)
+            .map(|i| pages.phys + i * 4096)
+            .collect();
+        let lent = UserPages {
+            va: 0,
+            phys,
+            writable: true,
+            keep: Box::new(KernelPages(pages.keep.clone())),
+        };
+        let tail = words(&[h_client, h_device, gpu_cached as u32, 0]);
+        let (word, _) = self.lend(op::UVM_PAGES, 0, caller, lent, &tail)?;
+        decode_result(word).unwrap_or(Err(NV_ERR_OPERATING_SYSTEM))
+    }
+
+    pub(super) fn uvm_user_pages(
+        &self,
+        caller: &Caller,
+        h_client: u32,
+        h_device: u32,
+        pages: UserPages,
+        gpu_cached: bool,
+    ) -> Result<u32, NV_STATUS> {
+        let tail = words(&[h_client, h_device, gpu_cached as u32, 0]);
+        let (word, _) = self.lend(op::UVM_USER_PAGES, 0, caller, pages, &tail)?;
+        decode_result(word).unwrap_or(Err(NV_ERR_OPERATING_SYSTEM))
     }
 
     pub(super) fn rm_map_memory(
@@ -414,6 +569,123 @@ fn with_caller(caller: &Caller, payload: &[u8]) -> Vec<u8> {
     msg.extend_from_slice(&encode_caller(caller));
     msg.extend_from_slice(payload);
     msg
+}
+
+/// A semaphore pool's pages, as they are lent to the process: what keeps
+/// them allocated (the kernel's `nvctl::Pages::keep`), for the loader to
+/// find the memory they are.
+pub struct KernelPages(pub Arc<dyn Any + Send + Sync>);
+
+fn words(w: &[u32]) -> Vec<u8> {
+    w.iter().flat_map(|w| w.to_le_bytes()).collect()
+}
+
+/// A UVM call's result as a word: the handle, or the status in the low
+/// half with 1 in the high.
+pub fn encode_result(r: Result<u32, NV_STATUS>) -> u64 {
+    match r {
+        Ok(handle) => u64::from(handle),
+        Err(status) => 1 << 32 | u64::from(status),
+    }
+}
+
+pub fn decode_result(word: u64) -> Option<Result<u32, NV_STATUS>> {
+    match word >> 32 {
+        0 => Some(Ok(word as u32)),
+        1 => Some(Err(word as u32)),
+        _ => None,
+    }
+}
+
+/// An `ExternalMapping` on the link: the four handles, offset, base,
+/// length, then `read_only` (`u32`) and 4 bytes at zero.
+pub const EXTERNAL_LEN: usize = 48;
+
+fn encode_external(m: &ExternalMapping) -> Vec<u8> {
+    let mut b = words(&[m.h_client, m.h_device, m.h_va_space, m.h_memory]);
+    for w in [m.offset, m.base, m.length] {
+        b.extend_from_slice(&w.to_le_bytes());
+    }
+    b.extend_from_slice(&words(&[m.read_only as u32, 0]));
+    b
+}
+
+fn decode_external(b: &[u8]) -> Option<ExternalMapping> {
+    if b.len() != EXTERNAL_LEN || u32_at(b, 44) != 0 {
+        return None;
+    }
+    Some(ExternalMapping {
+        h_client: u32_at(b, 0),
+        h_device: u32_at(b, 4),
+        h_va_space: u32_at(b, 8),
+        h_memory: u32_at(b, 12),
+        offset: u64_at(b, 16),
+        base: u64_at(b, 24),
+        length: u64_at(b, 32),
+        read_only: flag(u32_at(b, 40))?,
+    })
+}
+
+/// A `SkedRange` on the link: the three handles, 4 bytes at zero, base
+/// and length.
+pub const SKED_LEN: usize = 32;
+
+fn encode_sked(r: &SkedRange) -> Vec<u8> {
+    let mut b = words(&[r.h_client, r.h_device, r.h_va_space, 0]);
+    b.extend_from_slice(&r.base.to_le_bytes());
+    b.extend_from_slice(&r.length.to_le_bytes());
+    b
+}
+
+fn decode_sked(b: &[u8]) -> Option<SkedRange> {
+    if b.len() != SKED_LEN || u32_at(b, 12) != 0 {
+        return None;
+    }
+    Some(SkedRange {
+        h_client: u32_at(b, 0),
+        h_device: u32_at(b, 4),
+        h_va_space: u32_at(b, 8),
+        base: u64_at(b, 16),
+        length: u64_at(b, 24),
+    })
+}
+
+/// `P2pCaps` on the link: read, write, atomics, a byte at zero, then the
+/// connectivity.
+pub const CAPS_LEN: usize = 8;
+
+fn encode_caps(c: &P2pCaps) -> [u8; CAPS_LEN] {
+    let mut b = [0u8; CAPS_LEN];
+    b[0] = c.read;
+    b[1] = c.write;
+    b[2] = c.atomics;
+    b[4..8].copy_from_slice(&c.connectivity.to_le_bytes());
+    b
+}
+
+fn decode_caps(b: &[u8]) -> P2pCaps {
+    P2pCaps {
+        read: b[0],
+        write: b[1],
+        atomics: b[2],
+        connectivity: u32_at(b, 4),
+    }
+}
+
+fn flag(w: u32) -> Option<bool> {
+    match w {
+        0 => Some(false),
+        1 => Some(true),
+        _ => None,
+    }
+}
+
+/// The client, the device and whether the GPU caches them, after a loan.
+fn decode_pages_tail(b: &[u8]) -> Option<(u32, u32, bool)> {
+    if b.len() != 16 || u32_at(b, 12) != 0 {
+        return None;
+    }
+    Some((u32_at(b, 0), u32_at(b, 4), flag(u32_at(b, 8))?))
 }
 
 /// An OS event's message: the client, 4 bytes at zero, the open.
@@ -572,6 +844,53 @@ pub trait Rm {
     fn alloc_os_event(&self, client: u32, os_info: usize, fd: u32) -> NV_STATUS;
     fn free_os_event(&self, client: u32, fd: u32) -> NV_STATUS;
     fn service_nonstall(&self) -> NonstallPoll;
+
+    // UVM's calls, refused unless an RM takes them.
+    fn uvm_va_space_device(
+        &self,
+        _caller: &Caller,
+        _h_client: u32,
+        _h_va_space: u32,
+        _gpu_instance: u32,
+    ) -> Result<u32, NV_STATUS> {
+        Err(NV_ERR_NOT_SUPPORTED)
+    }
+    fn uvm_map_external(&self, _caller: &Caller, _m: &ExternalMapping) -> Result<u32, NV_STATUS> {
+        Err(NV_ERR_NOT_SUPPORTED)
+    }
+    fn uvm_free(&self, _caller: &Caller, _h_client: u32, _h_object: u32) -> NV_STATUS {
+        NV_ERR_NOT_SUPPORTED
+    }
+    fn uvm_sked_reflected(
+        &self,
+        _caller: &Caller,
+        _r: &SkedRange,
+    ) -> Result<(u32, u32), NV_STATUS> {
+        Err(NV_ERR_NOT_SUPPORTED)
+    }
+    fn uvm_p2p_caps(&self, _a: u32, _b: u32) -> Result<P2pCaps, NV_STATUS> {
+        Err(NV_ERR_NOT_SUPPORTED)
+    }
+    fn uvm_pages(
+        &self,
+        _caller: &Caller,
+        _h_client: u32,
+        _h_device: u32,
+        _pages: &Pages,
+        _gpu_cached: bool,
+    ) -> Result<u32, NV_STATUS> {
+        Err(NV_ERR_NOT_SUPPORTED)
+    }
+    fn uvm_user_pages(
+        &self,
+        _caller: &Caller,
+        _h_client: u32,
+        _h_device: u32,
+        _pages: UserPages,
+        _gpu_cached: bool,
+    ) -> Result<u32, NV_STATUS> {
+        Err(NV_ERR_NOT_SUPPORTED)
+    }
 }
 
 /// This address space's RM: the driver's own.
@@ -614,6 +933,54 @@ impl Rm for ThisRm {
 
     fn service_nonstall(&self) -> NonstallPoll {
         super::service_nonstall()
+    }
+
+    fn uvm_va_space_device(
+        &self,
+        caller: &Caller,
+        h_client: u32,
+        h_va_space: u32,
+        gpu_instance: u32,
+    ) -> Result<u32, NV_STATUS> {
+        super::uvm_va_space_device(caller, h_client, h_va_space, gpu_instance)
+    }
+
+    fn uvm_map_external(&self, caller: &Caller, m: &ExternalMapping) -> Result<u32, NV_STATUS> {
+        super::uvm_map_external(caller, m)
+    }
+
+    fn uvm_free(&self, caller: &Caller, h_client: u32, h_object: u32) -> NV_STATUS {
+        super::uvm_free(caller, h_client, h_object)
+    }
+
+    fn uvm_sked_reflected(&self, caller: &Caller, r: &SkedRange) -> Result<(u32, u32), NV_STATUS> {
+        super::uvm_sked_reflected(caller, r)
+    }
+
+    fn uvm_p2p_caps(&self, a: u32, b: u32) -> Result<P2pCaps, NV_STATUS> {
+        super::uvm_p2p_caps(a, b)
+    }
+
+    fn uvm_pages(
+        &self,
+        caller: &Caller,
+        h_client: u32,
+        h_device: u32,
+        pages: &Pages,
+        gpu_cached: bool,
+    ) -> Result<u32, NV_STATUS> {
+        super::uvm_pages(caller, h_client, h_device, pages, gpu_cached)
+    }
+
+    fn uvm_user_pages(
+        &self,
+        caller: &Caller,
+        h_client: u32,
+        h_device: u32,
+        pages: UserPages,
+        gpu_cached: bool,
+    ) -> Result<u32, NV_STATUS> {
+        super::uvm_user_pages(caller, h_client, h_device, pages, gpu_cached)
     }
 }
 
@@ -677,7 +1044,102 @@ pub fn answer(rm: &dyn Rm, op: u32, a: u64, data: &[u8], out: &mut Vec<u8>) -> R
             out.clear();
             Ok(encode_nonstall(rm.service_nonstall()))
         }
+        op::UVM_P2P_CAPS => {
+            out.clear();
+            match rm.uvm_p2p_caps((a >> 32) as u32, a as u32) {
+                Ok(caps) => {
+                    out.extend_from_slice(&encode_caps(&caps));
+                    Ok(0)
+                }
+                Err(status) => Ok(status as u64),
+            }
+        }
+        op::UVM_VA_SPACE_DEVICE
+        | op::UVM_MAP_EXTERNAL
+        | op::UVM_FREE
+        | op::UVM_SKED_REFLECTED
+        | op::UVM_PAGES
+        | op::UVM_USER_PAGES => {
+            let caller = data
+                .get(..CALLER_LEN)
+                .and_then(decode_caller)
+                .ok_or(EINVAL)?;
+            out.clear();
+            answer_uvm(rm, op, &caller, &data[CALLER_LEN..], out)
+        }
         _ => Err(ENOSYS),
+    }
+}
+
+/// [`answer`] to a UVM call of `caller`'s, its message after the caller
+/// in `msg`.
+fn answer_uvm(
+    rm: &dyn Rm,
+    op: u32,
+    caller: &Caller,
+    msg: &[u8],
+    out: &mut Vec<u8>,
+) -> Result<u64, i32> {
+    match op {
+        op::UVM_VA_SPACE_DEVICE => {
+            if msg.len() != 16 || u32_at(msg, 12) != 0 {
+                return Err(EINVAL);
+            }
+            let r = rm.uvm_va_space_device(caller, u32_at(msg, 0), u32_at(msg, 4), u32_at(msg, 8));
+            Ok(encode_result(r))
+        }
+        op::UVM_MAP_EXTERNAL => {
+            let m = decode_external(msg).ok_or(EINVAL)?;
+            Ok(encode_result(rm.uvm_map_external(caller, &m)))
+        }
+        op::UVM_FREE => {
+            if msg.len() != 8 {
+                return Err(EINVAL);
+            }
+            Ok(rm.uvm_free(caller, u32_at(msg, 0), u32_at(msg, 4)) as u64)
+        }
+        op::UVM_SKED_REFLECTED => {
+            let r = decode_sked(msg).ok_or(EINVAL)?;
+            match rm.uvm_sked_reflected(caller, &r) {
+                Ok((memory, virt)) => {
+                    out.extend_from_slice(&words(&[memory, virt]));
+                    Ok(0)
+                }
+                Err(status) => Ok(status as u64),
+            }
+        }
+        _ => {
+            let (pages, tail) = decode_loan(msg).ok_or(EINVAL)?;
+            let (h_client, h_device, cached) = decode_pages_tail(tail).ok_or(EINVAL)?;
+            if op == op::UVM_USER_PAGES {
+                let r = rm.uvm_user_pages(caller, h_client, h_device, pages, cached);
+                return Ok(encode_result(r));
+            }
+            // The kernel's pages: one block, held for as long as the RM
+            // has memory made of them, given back when it lets them go.
+            let first = pages.phys.first().copied().ok_or(EINVAL)?;
+            let contiguous = pages
+                .phys
+                .iter()
+                .enumerate()
+                .all(|(i, &p)| p == first + i as u64 * 4096);
+            if !contiguous {
+                return Err(EINVAL);
+            }
+            let size = pages.phys.len() as u64 * 4096;
+            let keep: Arc<dyn Any + Send + Sync> = match pages.keep.downcast::<Lent>() {
+                Ok(lent) => Arc::new(*lent),
+                Err(_) => return Err(EINVAL),
+            };
+            let block = Pages {
+                phys: first,
+                size,
+                keep: &keep,
+            };
+            Ok(encode_result(
+                rm.uvm_pages(caller, h_client, h_device, &block, cached),
+            ))
+        }
     }
 }
 

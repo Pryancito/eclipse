@@ -58,6 +58,7 @@ fn pinned_pages_stay_until_the_rm_lets_them_go() {
     assert_eq!(vmo.decommit(0, 3 * PAGE_SIZE), Err(ZxError::BAD_STATE));
 
     let runs = runs_of(&pages).unwrap();
+    let runs = runs.as_slice();
     assert_eq!(runs.len(), 1, "one run for consecutive pages of one object");
     assert!(Arc::ptr_eq(&runs[0].0, &vmo));
     assert_eq!((runs[0].1, runs[0].2), (0, 3 * PAGE_SIZE));
@@ -68,6 +69,25 @@ fn pinned_pages_stay_until_the_rm_lets_them_go() {
         keep: Box::new(()),
     };
     assert!(runs_of(&other).is_none(), "pages pinned otherwise");
+    // A semaphore pool's: its object, whole.
+    let pool = VmObject::new_paged(2);
+    let keep: Arc<dyn core::any::Any + Send + Sync> = Arc::new(pool.clone());
+    let lent = nvctl::UserPages {
+        va: 0,
+        phys: alloc::vec![0x1000, 0x2000],
+        writable: true,
+        keep: Box::new(nvctl::remote::KernelPages(keep.clone())),
+    };
+    let runs = runs_of(&lent).unwrap();
+    assert!(Arc::ptr_eq(&runs[0].0, &pool));
+    assert_eq!((runs.len(), runs[0].1, runs[0].2), (1, 0, 2 * PAGE_SIZE));
+    let short = nvctl::UserPages {
+        va: 0,
+        phys: alloc::vec![0x1000],
+        writable: true,
+        keep: Box::new(nvctl::remote::KernelPages(keep)),
+    };
+    assert!(runs_of(&short).is_none(), "the whole object or nothing");
 
     drop(pages);
     vmo.decommit(0, 3 * PAGE_SIZE).unwrap();

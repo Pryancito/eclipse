@@ -533,10 +533,11 @@ struct SemaphorePool {
 }
 
 impl SemaphorePool {
-    /// `uvm_mem_mapped_on_cpu_user`: whether anything holds the pages but
-    /// the pool and what it keeps them with, which is a CPU mapping of them.
+    /// `uvm_mem_mapped_on_cpu_user`: whether the pages are mapped in an
+    /// address space. Not who else holds the object: a served RM's GPUs are
+    /// granted it too, for as long as the RM has memory of it.
     fn mapped_on_cpu(&self) -> bool {
-        Arc::strong_count(&self.memory) > 2
+        self.memory.share_count() > 0
     }
 }
 
