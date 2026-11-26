@@ -558,6 +558,7 @@ pub(super) fn init() -> DeviceResult {
     // The IOMMU, with every device the kernel drives already found and left
     // in passthrough; only a device a process claims later gets a domain.
     super::vtd::init();
+    super::amdvi::init();
 
     // Re-assert write-combining on the boot framebuffer AFTER the PCI scan.
     // The early retype in `primary_init` runs before PCI bring-up: on real

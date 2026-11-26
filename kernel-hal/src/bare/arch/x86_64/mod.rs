@@ -1,3 +1,4 @@
+mod amdvi;
 mod drivers;
 #[cfg(feature = "graphic")]
 pub(crate) mod early_fb_console;

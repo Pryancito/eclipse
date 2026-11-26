@@ -15,9 +15,15 @@
 // not decommit), so on a machine with no IOMMU the stray write lands on
 // nothing but this test.
 //
-//   zx-iommu-probe [N] [expect]   N: the controller's place among those
+//   zx-iommu-probe [N] [expect] [ro]
+//                                 N: the controller's place among those
 //                                 left to userspace (default 2);
-//                                 expect: "blocked" or "reached"
+//                                 expect: "blocked" or "reached";
+//                                 ro: the second page stays pinned, but
+//                                 for the device to read only, so the
+//                                 write is a permission fault rather than
+//                                 a missing page (QEMU's AMD IOMMU logs
+//                                 only the first kind)
 //
 // Exit status: 0 when what happened is what was expected (or, with no
 // expectation, when the pinned transfer worked), 1 otherwise, 2 when the
@@ -89,14 +95,15 @@ static void *map_handle(zx_handle_t h, size_t len) {
 
 // `pages` of contiguous memory pinned through `bti`: its device address in
 // `*daddr`, its pin token in `*pmt`, mapped here.
-static volatile uint8_t *dma(zx_handle_t bti, size_t pages, uint64_t *daddr, zx_handle_t *pmt) {
+static volatile uint8_t *dma(zx_handle_t bti, size_t pages, uint64_t *daddr, zx_handle_t *pmt,
+                             uint32_t perms) {
     zx_handle_t vmo;
     long r = zx_status(zx(ZX_SYS_vmo_create_contiguous, bti, pages * PAGE, 0, (long)&vmo));
     if (r != 0) {
         printf("zx-iommu-probe: vmo_create_contiguous: %ld\n", r);
         exit(1);
     }
-    long pin[8] = {bti, ZX_BTI_PERM_READ | ZX_BTI_PERM_WRITE | ZX_BTI_CONTIGUOUS,
+    long pin[8] = {bti, perms | ZX_BTI_CONTIGUOUS,
                    vmo, 0, pages * PAGE, (long)daddr, 1, (long)pmt};
     r = zx_status(zx8(ZX_SYS_bti_pin, pin));
     if (r != 0) {
@@ -170,6 +177,8 @@ int main(int argc, char **argv) {
     setvbuf(stdout, NULL, _IONBF, 0);
     long index = argc > 1 ? atol(argv[1]) : 2;
     const char *expect = argc > 2 ? argv[2] : NULL;
+    int read_only = argc > 3 && strcmp(argv[3], "ro") == 0;
+    const uint32_t rw = ZX_BTI_PERM_READ | ZX_BTI_PERM_WRITE;
     struct claim c;
     long r = zx_status(zx(ECLIPSE_SYS_device_claim, ECLIPSE_DEVICE_NVME, index, (long)&c, 0));
     if (r == -ENOSYS) {
@@ -186,15 +195,18 @@ int main(int argc, char **argv) {
 
     uint64_t queues_d, good_d, stray_d;
     zx_handle_t queues_pmt, good_pmt, stray_pmt;
-    volatile uint8_t *queues = dma(c.bti, 2, &queues_d, &queues_pmt);
-    volatile uint8_t *good = dma(c.bti, 1, &good_d, &good_pmt);
-    volatile uint8_t *stray = dma(c.bti, 1, &stray_d, &stray_pmt);
+    volatile uint8_t *queues = dma(c.bti, 2, &queues_d, &queues_pmt, rw);
+    volatile uint8_t *good = dma(c.bti, 1, &good_d, &good_pmt, rw);
+    volatile uint8_t *stray =
+        dma(c.bti, 1, &stray_d, &stray_pmt, read_only ? ZX_BTI_PERM_READ : rw);
     // The stray page goes back: the device was never told about it, and
     // from here it is memory no pin names.
-    r = zx_status(zx(ZX_SYS_pmt_unpin, stray_pmt, 0, 0, 0));
-    if (r != 0) {
-        printf("zx-iommu-probe: pmt_unpin: %ld\n", r);
-        return 1;
+    if (!read_only) {
+        r = zx_status(zx(ZX_SYS_pmt_unpin, stray_pmt, 0, 0, 0));
+        if (r != 0) {
+            printf("zx-iommu-probe: pmt_unpin: %ld\n", r);
+            return 1;
+        }
     }
     sq = (volatile uint32_t *)queues;
     cq = (volatile uint32_t *)(queues + PAGE);
@@ -219,13 +231,13 @@ int main(int argc, char **argv) {
            (unsigned long long)good_d, ok, vid);
     int stray_status = identify(2, stray_d);
     int written = !all_zero(stray, PAGE);
-    printf("zx-iommu-probe: identify into the unpinned page %#llx: status %#x, page %s\n",
-           (unsigned long long)stray_d, stray_status, written ? "WRITTEN" : "untouched");
+    printf("zx-iommu-probe: identify into the %s page %#llx: status %#x, page %s\n",
+           read_only ? "read-only" : "unpinned", (unsigned long long)stray_d, stray_status, written ? "WRITTEN" : "untouched");
     w32(NVME_CC, 0);
     wait_ready(0);
 
     const char *what = written ? "reached" : "blocked";
-    printf("zx-iommu-probe: RESULT pinned=%s unpinned=%s\n", ok == 0 && vid ? "ok" : "FAILED",
+    printf("zx-iommu-probe: RESULT pinned=%s stray=%s\n", ok == 0 && vid ? "ok" : "FAILED",
            what);
     if (ok != 0 || !vid)
         return 1;

@@ -501,8 +501,11 @@ qemu_opts += -no-reboot
 # devices. The kernel only uses it with `KOPTS=iommu=on`; without that the
 # devices are as without one. It has to come before every other device.
 # virtio devices bypass it unless they are given `iommu_platform=on`.
+# IOMMU=amd: the AMD one (QEMU `amd-iommu`, interrupt remapping off).
 ifeq ($(IOMMU),intel)
   qemu_opts := -device intel-iommu $(qemu_opts)
+else ifeq ($(IOMMU),amd)
+  qemu_opts := -device amd-iommu,intremap=off $(qemu_opts)
 endif
 
 # Capture packets to dump.pcap only when explicitly requested (PCAP=on).

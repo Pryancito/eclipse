@@ -45,30 +45,31 @@ fn cfg_read(bus: u8, dev: u8, func: u8, off: u16) -> u8 {
     (word >> ((off & 3) * 8)) as u8
 }
 
-/// The unit's register page, mapped uncached.
-fn map_registers(paddr: PhysAddr) -> Option<VirtAddr> {
+/// `size` bytes of a unit's registers, mapped uncached: the pages that are
+/// not in the kernel's map already.
+pub(super) fn map_registers(paddr: PhysAddr, size: usize) -> Option<VirtAddr> {
     use crate::vm::{GenericPageTable, PageTable};
     use crate::CachePolicy;
-    let vaddr = phys_to_virt(paddr);
-    let mut pt = PageTable::from_current();
-    if let Ok((mapped, _, _)) = pt.query(vaddr) {
-        if mapped == paddr {
-            core::mem::forget(pt);
-            return Some(vaddr);
-        }
-    }
     let flags = MMUFlags::READ
         | MMUFlags::WRITE
         | MMUFlags::DEVICE
         | MMUFlags::from_bits_truncate(CachePolicy::UncachedDevice as usize);
-    let ok = pt.map_cont(vaddr, PAGE_SIZE, paddr, flags).is_ok();
+    let mut pt = PageTable::from_current();
+    let mut ok = true;
+    for page in (paddr..paddr + size).step_by(PAGE_SIZE) {
+        let vaddr = phys_to_virt(page);
+        match pt.query(vaddr) {
+            Ok((mapped, _, _)) if mapped == page => {}
+            _ => ok &= pt.map_cont(vaddr, PAGE_SIZE, page, flags).is_ok(),
+        }
+    }
     core::mem::forget(pt);
-    ok.then_some(vaddr)
+    ok.then(|| phys_to_virt(paddr))
 }
 
 /// Write back the cache lines of `len` bytes at `paddr`, for a unit whose
 /// page walks do not snoop.
-fn flush_lines(paddr: PhysAddr, len: usize) {
+pub(super) fn flush_lines(paddr: PhysAddr, len: usize) {
     let va = phys_to_virt(paddr);
     let mut line = va & !63;
     while line < va + len {
@@ -435,7 +436,8 @@ impl IommuUnit for VtD {
 /// Take over one unit: turn it off if the firmware left it on, program
 /// every context in pass-through, and turn translation on.
 fn bring_up(index: usize, base: u64) -> Result<Unit, &'static str> {
-    let regs = map_registers(base as PhysAddr).ok_or("its registers could not be mapped")?;
+    let regs =
+        map_registers(base as PhysAddr, PAGE_SIZE).ok_or("its registers could not be mapped")?;
     // SAFETY: just mapped.
     let caps = unsafe {
         Caps {
@@ -528,7 +530,7 @@ pub(super) fn init() {
         return;
     }
     let Some(dmar) = super::drivers::acpi_table(Signature::DMAR).and_then(vtd::parse_dmar) else {
-        crate::klog_info!("iommu: no DMAR table: no Intel IOMMU, devices keep full DMA");
+        // Not an Intel machine, or one without VT-d: AMD-Vi looks next.
         return;
     };
     if dmar.units.is_empty() {
