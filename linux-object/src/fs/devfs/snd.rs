@@ -1491,8 +1491,8 @@ impl PcmDev {
         if chunk < BYTES_PER_FRAME as usize {
             return Ok(0);
         }
-        let buf = unsafe { core::slice::from_raw_parts(src.add(done), chunk) };
-        let n = self.audio.write(buf).map_err(|_| FsError::DeviceError)?;
+        let buf = user_pcm(src as usize + done, chunk)?;
+        let n = self.audio.write(&buf).map_err(|_| FsError::DeviceError)?;
         if n > 0 {
             self.commit_write_progress(n);
         }
@@ -1541,8 +1541,8 @@ impl PcmDev {
             if chunk < frame {
                 return self.no_room(total_bytes);
             }
-            let buf = unsafe { core::slice::from_raw_parts(src, chunk) };
-            let n = self.audio.write(buf).map_err(|_| FsError::DeviceError)?;
+            let buf = user_pcm(src as usize, chunk)?;
+            let n = self.audio.write(&buf).map_err(|_| FsError::DeviceError)?;
             if n == 0 {
                 return self.no_room(total_bytes);
             }
@@ -3356,4 +3356,20 @@ impl INode for CtlDev {
     fn as_any_ref(&self) -> &dyn Any {
         self
     }
+}
+
+/// `len` bytes of a client's PCM at `addr`, copied in before the driver sees
+/// them: `EFAULT` for a range the client does not map readable.
+///
+/// The driver reads what it is given under its lock, with interrupts off
+/// (`HdaStream::write`, then the host buffer and the resampler). A slice
+/// straight over the client's pages took any page fault on them right
+/// there, where the oops handler can contain nothing: a buffer the client
+/// had not touched yet, or one paged out under memory pressure (a video
+/// decoding beside it), and the machine stopped on a blue screen instead
+/// of the write answering.
+fn user_pcm(addr: usize, len: usize) -> Result<Vec<u8>> {
+    kernel_hal::user::UserInPtr::<u8>::from(addr)
+        .read_array(len)
+        .map_err(|_| FsError::BadAddress)
 }

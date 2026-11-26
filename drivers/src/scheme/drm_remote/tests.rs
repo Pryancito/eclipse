@@ -523,6 +523,22 @@ fn an_ioctl_reaches_the_driver_with_its_struct_and_arrays_and_comes_back() {
 }
 
 #[test]
+fn an_array_bigger_than_any_message_is_refused_before_it_is_copied() {
+    let (card, remote) = pair();
+    // A count the caller made up: the pointer is real, but nothing is read
+    // from it (the test transport would read past the array if it were).
+    let pushes = [[3u64, 0]];
+    let mut e = exec_of(&pushes, &[]);
+    e.push_count = (ioctl::MESSAGE_MAX / 16 + 1) as u32;
+    assert_eq!(
+        remote.ioctl_file(EXEC, &mut e as *mut Exec as usize, 77, 0xf11e),
+        Err(ioctl::E2BIG)
+    );
+    // The driver was never asked.
+    assert!(card.asked.lock().is_none());
+}
+
+#[test]
 fn what_the_driver_writes_before_an_error_still_reaches_the_caller() {
     let (_, remote) = pair();
     let pushes = [[5u64, 0]];

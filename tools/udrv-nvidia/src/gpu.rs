@@ -4,11 +4,12 @@
 //! is put where `zcore-drivers` looks: its configuration space behind the
 //! emulated ports, its BARs behind the [`BarMapper`], and DMA memory
 //! through the claim's bus transaction initiator.
-use std::sync::Arc;
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
 
 use pci::{Location, PCIDevice};
 use udrivers::claim::{self, Claim, Dma, PciFn, KIND_NVIDIA};
-use udrivers::zx::{self, Status};
+use udrivers::zx::{self, Handle, Status};
 use zcore_drivers::bus::pci::{PortOpsImpl, PCI_ACCESS};
 
 use crate::mapper::{Bar, BarMapper};
@@ -129,17 +130,53 @@ impl Gpu {
     /// exits (the claim's memory has no way back yet).
     pub fn install_dma(&self) -> Result<(), String> {
         let bti = self.claim.bti;
+        // The pin of every buffer handed out, by its device address, so its
+        // free can give it back. The free used to do nothing: every GEM
+        // object the driver ever made stayed pinned, which a video (buffers
+        // made and freed every frame) turns into the whole of RAM within
+        // seconds, and then every contiguous allocation in the system fails.
+        let pins: &'static Mutex<HashMap<usize, Handle>> =
+            Box::leak(Box::new(Mutex::new(HashMap::new())));
         platform::install_dma(
             Box::new(move |pages| {
-                let dma = Dma::new(bti, pages * PAGE, None).ok()?;
+                let dma = match Dma::new(bti, pages * PAGE, None) {
+                    Ok(dma) => dma,
+                    Err(e) => {
+                        dma_refused(pages, &e);
+                        return None;
+                    }
+                };
+                pins.lock().unwrap().insert(dma.daddr as usize, dma.pmt);
                 Some(Range {
                     phys: dma.daddr as usize,
                     virt: dma.ptr as usize,
                     len: dma.len,
                 })
             }),
-            Box::new(|_| {}),
+            Box::new(move |range| {
+                let Some(pmt) = pins.lock().unwrap().remove(&range.phys) else {
+                    eprintln!("udrv-nvidia: DMA free of {:#x}, which was never handed out", range.phys);
+                    return;
+                };
+                if let Err(e) = Dma::release(range.virt as *mut u8, range.len, pmt) {
+                    eprintln!("udrv-nvidia: DMA free of {:#x}: pmt_unpin {e}", range.phys);
+                }
+            }),
         )
         .map_err(|_| "DMA memory already comes from somewhere".to_string())
+    }
+}
+
+/// A DMA allocation the kernel refused: the driver answers `ENOMEM` for it.
+/// The first one and then one in 64 reach the log.
+fn dma_refused(pages: usize, why: &str) {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static REFUSED: AtomicU64 = AtomicU64::new(0);
+    let n = REFUSED.fetch_add(1, Ordering::Relaxed) + 1;
+    if n == 1 || n.is_multiple_of(64) {
+        eprintln!(
+            "udrv-nvidia: no {} KiB of contiguous DMA memory ({why}); ENOMEM for it ({n} refused)",
+            pages * 4
+        );
     }
 }

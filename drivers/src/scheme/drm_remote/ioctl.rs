@@ -31,6 +31,13 @@ pub const EFAULT: i32 = 14;
 /// `errno` for an argument too big for one message.
 pub const E2BIG: i32 = 7;
 
+/// The most an ioctl's message may carry, its arrays included. Far above
+/// what any transport takes in one message (a served card's slot is 64
+/// KiB), and there only so that a count the caller made up (a `VM_BIND`
+/// with four billion ops over a large mapping) is refused before the kernel
+/// copies it in, instead of the kernel heap being asked for the lot.
+pub const MESSAGE_MAX: usize = 1 << 20;
+
 /// An array an ioctl's struct points at: the offsets in the struct of its
 /// count (u32) and its pointer (u64), and the size of one element.
 #[derive(Clone, Copy, Debug)]
@@ -145,6 +152,9 @@ pub fn message<T: Transport>(
         if len > 0 {
             if ptr == 0 {
                 return Err(EFAULT);
+            }
+            if msg.len().saturating_add(len) > MESSAGE_MAX {
+                return Err(E2BIG);
             }
             msg.extend_from_slice(&to.read_user(ptr as usize, len)?);
         }
