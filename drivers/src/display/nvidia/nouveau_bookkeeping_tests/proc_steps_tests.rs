@@ -439,3 +439,31 @@ fn the_fence_timeout_upcall_reaches_the_gpu_whose_slot_issued_the_fence() {
         .collect();
     assert!(said.is_empty(), "no slot 7 anywhere: {:?}", said);
 }
+
+/// Where a GPU nobody here holds keeps its framebuffer aperture: its second
+/// memory BAR, read whole. A GeForce's BAR1 is the 64-bit one at 0x14;
+/// 0x18 is its upper half, which taken for a BAR said the console GPU's
+/// HDMI audio was a headless card's and the HDA driver skipped it.
+#[test]
+fn the_aperture_of_a_gpu_nobody_here_holds_is_its_second_memory_bar() {
+    let header = |bars: [u32; 6]| move |offset: u16| bars[((offset - 0x10) / 4) as usize];
+    // BAR0 32-bit, BAR1 64-bit prefetchable above 4 GiB, BAR3 64-bit, BAR5 I/O.
+    let geforce = [
+        0xf600_0000,
+        0x0000_000c,
+        0x60,
+        0xf000_000c,
+        0x61,
+        0x0000_e001,
+    ];
+    assert_eq!(fb_bar_of(header(geforce)), 0x60_0000_0000);
+    let below_4g = [0xf600_0000, 0xe000_000c, 0, 0xf000_000c, 0, 0xe001];
+    assert_eq!(fb_bar_of(header(below_4g)), 0xe000_0000);
+    // All 32-bit: BAR1 is the second register.
+    let flat = [0xf600_0000, 0xe000_0008, 0xf000_0008, 0, 0, 0];
+    assert_eq!(fb_bar_of(header(flat)), 0xe000_0000);
+    // An I/O BAR first does not count.
+    let io_first = [0xe001, 0xf600_0000, 0xe000_0000, 0, 0, 0];
+    assert_eq!(fb_bar_of(header(io_first)), 0xe000_0000);
+    assert_eq!(fb_bar_of(header([0xf600_0000, 0, 0, 0, 0, 0])), 0);
+}
