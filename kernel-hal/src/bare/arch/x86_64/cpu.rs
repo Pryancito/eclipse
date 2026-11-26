@@ -308,6 +308,12 @@ fn quiesce_devices() {
     for d in crate::drivers::all_block().as_vec().iter() {
         d.quiesce_for_reboot();
     }
+    // The NVMe controllers a process drives: flushed above through their
+    // driver, and shut down here, since the driver is not told of a reboot.
+    let done = zcore_drivers::user::shutdown_for_reboot();
+    if done > 0 {
+        info!("{} NVMe controller(s) of userspace drivers shut down", done);
+    }
 }
 
 hal_fn_impl! {
