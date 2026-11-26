@@ -1385,6 +1385,10 @@ impl LinuxRootfs {
               # labwc environment file and eclipse-init's CHILD_ENV carry the\n\
               # same two; the eclipse-firefox wrapper re-asserts them.\n\
               export GDK_PIXBUF_MODULE_FILE=/root/.cache/pixbuf-loaders.cache\n\
+              # gdk-pixbuf 2.44 decodes every image through glycin, whose\n\
+              # bwrap sandbox fails here (no namespaces on Eclipse), so no\n\
+              # image loads and GTK asserts. glycin wants this exact value.\n\
+              export GLYCIN_DISABLE_SANDBOX=i-know-the-risks\n\
               export GSETTINGS_BACKEND=memory\n\
               # No session bus here: pin the address so libdbus never\n\
               # `autolaunch:`es (dbus-launch + X11 + dbus-daemon behind pipes,\n\

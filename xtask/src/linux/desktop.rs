@@ -2603,6 +2603,9 @@ fn write_labwc_environment(rootfs: &Path) {
           # every session start (the apk trigger that creates the system one\n\
           # may never have run). Harmless if the file does not exist yet.\n\
           GDK_PIXBUF_MODULE_FILE=/root/.cache/pixbuf-loaders.cache\n\
+          # glycin (every gdk-pixbuf 2.44 decode) cannot start its bwrap\n\
+          # sandbox on Eclipse; run its loaders directly instead.\n\
+          GLYCIN_DISABLE_SANDBOX=i-know-the-risks\n\
           # No D-Bus session bus on Eclipse OS: keep GTK's settings out of\n\
           # dconf so apps never try to autolaunch one.\n\
           GSETTINGS_BACKEND=memory\n\

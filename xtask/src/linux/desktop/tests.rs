@@ -392,6 +392,20 @@ fn gtk_finds_its_pixbuf_loaders_from_every_launch_path() {
         "the wrapper must default GDK_PIXBUF_MODULE_FILE to the registry"
     );
     assert!(wrapper.contains("\nexport GSETTINGS_BACKEND=\"${GSETTINGS_BACKEND:-memory}\"\n"));
+    // glycin only honours this exact value; anything else keeps bwrap on.
+    const GLYCIN: &str = "GLYCIN_DISABLE_SANDBOX=i-know-the-risks\n";
+    assert!(
+        profile.contains(&format!("\nexport {GLYCIN}")),
+        "/etc/profile must turn glycin's sandbox off"
+    );
+    assert!(
+        environment.contains(&format!("\n{GLYCIN}")),
+        "labwc's environment file must turn glycin's sandbox off"
+    );
+    assert!(
+        wrapper.contains(&format!("\nexport {GLYCIN}")),
+        "the wrapper must turn glycin's sandbox off"
+    );
     let _ = fs::remove_dir_all(&dir);
 }
 
