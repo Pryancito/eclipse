@@ -4,7 +4,8 @@
 //! `nvctl::remote::answer` on the driver's RM, which does not know the
 //! difference. What the RM reads and writes of the caller's memory, the
 //! kernel copies for it while the request waits; pages of the caller's it
-//! is lent (an OS descriptor) go back to the kernel when it lets them go.
+//! is lent (an OS descriptor) go back to the kernel when it lets them go,
+//! and what it posts to an OS event goes to the kernel's open.
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::Mutex;
 
@@ -21,6 +22,7 @@ const NO_REPLY: u32 = u32::MAX;
 pub fn serve(rm: &dyn Rm, hello: &[u8]) -> Result<String, (Status, String)> {
     nvidia_rm_sys::frontend::set_user_copy(copy);
     remote::set_give_back(give_back);
+    zcore_drivers::display::nvctl::set_event_sink(post_event);
     let node = Node::serve_nvctl(hello)?;
     let why = node.run_with(&Mutex::new(()), |_, node, req| {
         let answer = reply(rm, node, req);
@@ -58,6 +60,25 @@ fn give_back(loan: u64) {
     }
 }
 
+/// How many OS events were posted to the kernel, and how many it refused.
+pub static POSTED: AtomicU32 = AtomicU32::new(0);
+pub static POST_REFUSED: AtomicU32 = AtomicU32::new(0);
+
+/// The RM's registrations post `event` to the open `os_info`
+/// (`nv_post_event`): it is the kernel's to queue there.
+fn post_event(os_info: usize, event: Option<zcore_drivers::display::nvctl::UnixEvent>) {
+    let data = event.map(|e| (e.h_object, e.notify_index, e.info32, e.info16));
+    match Node::post_nvctl_event(os_info, data) {
+        Ok(()) => {
+            POSTED.fetch_add(1, Ordering::Relaxed);
+        }
+        Err(e) => {
+            POST_REFUSED.fetch_add(1, Ordering::Relaxed);
+            eprintln!("udrv-nvidia: the kernel took no OS event for {os_info:#x}: {e}");
+        }
+    }
+}
+
 /// The answer to one request, its bytes put in its slot.
 fn reply(rm: &dyn Rm, node: &Node, req: &Msg) -> Msg {
     let slot = node.slot_of(req);
@@ -90,12 +111,17 @@ fn reply(rm: &dyn Rm, node: &Node, req: &Msg) -> Msg {
 /// `RM_MAP_MEMORY` grants the mapping its `hMemory` names ([`grant`]); an
 /// `RM_ALLOC_MEMORY` of an OS descriptor keeps the pages it is lent until
 /// `RM_FREE` of its handle or the close, or refuses them for handle
-/// [`REFUSED`].
+/// [`REFUSED`]. Its OS events are the RM's own registrations, and its
+/// nonstall interrupt is pending once after each: a look at it posts
+/// [`EVENT`] to the last one registered, as an engine's would.
 pub mod check {
+    use nvidia_rm_sys::frontend::events;
     use std::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering};
     use std::sync::Mutex;
     use zcore_drivers::display::nvctl::remote::{hello_of, Rm, ServedCard};
-    use zcore_drivers::display::nvctl::{Caller, Card, MmapContext, RawMmapContext, UserPages};
+    use zcore_drivers::display::nvctl::{
+        Caller, Card, MmapContext, NonstallPoll, RawMmapContext, UserPages,
+    };
 
     /// `NV_ESC_RM_CONTROL`, and `NVOS54_PARAMETERS`' size.
     pub const RM_CONTROL: u32 = 0x2a;
@@ -106,6 +132,9 @@ pub mod check {
     pub const RM_FREE: u32 = 0x29;
     /// The `hObjectNew` whose pages it refuses.
     pub const REFUSED: u32 = 0xbad;
+    /// What its nonstall interrupt posts: `hObject`, notifier index,
+    /// `info32`, `info16`.
+    pub const EVENT: (u32, u32, u32, u16) = (0xe7e7, 3, 0x1234_5678, 0x9abc);
     /// `NV_OK`, and the status of an escape it does not know.
     const NV_OK: u32 = 0;
     const NV_ERR_NOT_SUPPORTED: u32 = 0x56;
@@ -137,6 +166,10 @@ pub mod check {
         pub lent_pages: AtomicUsize,
         /// What it keeps, by handle.
         pub kept: Mutex<Vec<(u32, UserPages)>>,
+        /// The last OS event registered, as (client, fd), while its
+        /// nonstall interrupt is pending; and how many looks it has had.
+        pub pending: Mutex<Option<(u32, u32)>>,
+        pub looks: AtomicU32,
     }
 
     fn mapping(ctl: bool, memory_type: u32, caching: u32, start: u64) -> Option<MmapContext> {
@@ -264,6 +297,36 @@ pub mod check {
 
         fn map_unrecorded(&self, _payload: &mut [u8], _caller: &Caller, why: u32) {
             self.unrecorded.store(why, Ordering::Relaxed);
+        }
+
+        fn alloc_os_event(&self, client: u32, os_info: usize, fd: u32) -> u32 {
+            let status = events::alloc_os_event(client, os_info, fd);
+            if status == NV_OK {
+                *self.pending.lock().unwrap() = Some((client, fd));
+            }
+            status
+        }
+
+        fn free_os_event(&self, client: u32, fd: u32) -> u32 {
+            events::free_os_event(client, fd)
+        }
+
+        fn service_nonstall(&self) -> NonstallPoll {
+            self.looks.fetch_add(1, Ordering::Relaxed);
+            let Some((client, fd)) = self.pending.lock().unwrap().take() else {
+                return NonstallPoll::Serviced(0);
+            };
+            // As the RM does: the event object holds the registration it
+            // names by fd, and posts to it.
+            let mut event = core::ptr::null_mut();
+            let status = events::osUserHandleToKernelPtr(client, fd as usize as _, &mut event);
+            if status != NV_OK {
+                return NonstallPoll::Failed(status);
+            }
+            let (h, index, info32, info16) = EVENT;
+            events::eclipse_rm_frontend_post_event(event, h, index, info32, info16, 1);
+            events::osDereferenceObjectCount(event);
+            NonstallPoll::Serviced(1)
         }
     }
 }

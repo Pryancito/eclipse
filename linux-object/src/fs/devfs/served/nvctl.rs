@@ -30,6 +30,7 @@ use alloc::vec::Vec;
 use lock::Mutex;
 use zcore_drivers::display::nvctl::remote::{self, Link as RmLink, Refused};
 pub use zcore_drivers::display::nvctl::remote::{Lender, Loan, Owns, Server};
+pub use zcore_drivers::display::nvctl::UnixEvent;
 use zircon_object::ipc::Fifo;
 use zircon_object::object::KernelObject;
 use zircon_object::vm::VmObject;
@@ -159,4 +160,17 @@ pub fn serve_rm(
 /// that does not serve the RM.
 pub fn give_back(server: u64, loan: u64) -> bool {
     remote::give_back(server, loan)
+}
+
+/// `ECLIPSE_NVCTL_EVENT`: the process `server` (its koid) posts `event`
+/// (none for one with no data, `osSetEvent`'s) to the open `os_info`, as
+/// its RM's registrations say: queued there as the kernel's own RM's posts
+/// are, and nothing for an open that has closed. `false` to a process that
+/// does not serve the RM.
+pub fn post_event(server: u64, os_info: usize, event: Option<UnixEvent>) -> bool {
+    if !remote::is_server(server) {
+        return false;
+    }
+    crate::fs::devfs::nvidia::post_event(os_info, event);
+    true
 }
