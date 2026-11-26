@@ -168,12 +168,20 @@ pub(super) fn nvctl_serve(proc: &Arc<Process>, args: &[usize; 6]) -> ZxResult {
     let hello = kernel_hal::user::UserInPtr::<u8>::from(args[2])
         .read_array(args[3])
         .map_err(|_| ZxError::INVALID_ARGS)?;
-    let rm = nvctl::serve_rm(proc.linux(), fifo.clone(), window, &hello).map_err(|e| match e {
-        LxError::EPERM => ZxError::ACCESS_DENIED,
-        LxError::ENODEV => ZxError::NOT_SUPPORTED,
-        LxError::EEXIST => ZxError::ALREADY_EXISTS,
-        _ => ZxError::INVALID_ARGS,
-    })?;
+    let (whose, pinned) = (proc.clone(), proc.clone());
+    let owns: nvctl::Owns =
+        Arc::new(move |start, size| super::device_claim::owns_memory(&whose, start, size));
+    let system: nvctl::SystemVmo =
+        Arc::new(move |start, len| super::device_claim::pinned_slice(&pinned, start, len));
+    let rm =
+        nvctl::serve_rm(proc.linux(), fifo.clone(), window, &hello, owns, system).map_err(|e| {
+            match e {
+                LxError::EPERM => ZxError::ACCESS_DENIED,
+                LxError::ENODEV => ZxError::NOT_SUPPORTED,
+                LxError::EEXIST => ZxError::ALREADY_EXISTS,
+                _ => ZxError::INVALID_ARGS,
+            }
+        })?;
     let pid = proc.id() as usize;
     rm.killed_with(alloc::boxed::Box::new(move || {
         let kill = linux_object::signal::Signal::SIGKILL;

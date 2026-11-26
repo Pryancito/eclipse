@@ -67,11 +67,12 @@ fn reply(rm: &dyn Rm, node: &Node, req: &Msg) -> Msg {
 
 /// An RM with nothing behind it, for `udrv-nvidia nvctl-check`: an
 /// `RM_CONTROL` adds one to each word of its parameters, read and written
-/// back where the caller's pointer says, as the RM follows one.
+/// back where the caller's pointer says, as the RM follows one; an
+/// `RM_MAP_MEMORY` grants the mapping its `hMemory` names ([`Grant`]).
 pub mod check {
-    use std::sync::atomic::{AtomicU32, AtomicUsize, Ordering};
+    use std::sync::atomic::{AtomicU32, AtomicU64, AtomicUsize, Ordering};
     use zcore_drivers::display::nvctl::remote::{hello_of, Rm, ServedCard};
-    use zcore_drivers::display::nvctl::{Caller, Card};
+    use zcore_drivers::display::nvctl::{Caller, Card, MmapContext, RawMmapContext};
 
     /// `NV_ESC_RM_CONTROL`, and `NVOS54_PARAMETERS`' size.
     pub const RM_CONTROL: u32 = 0x2a;
@@ -82,10 +83,37 @@ pub mod check {
     /// The most parameter bytes it takes.
     const PARAMS_MAX: usize = 4096;
 
+    /// What an `RM_MAP_MEMORY`'s `hMemory` asks for.
+    pub mod grant {
+        /// A page of system memory, at [`super::CheckRm::system`].
+        pub const SYSTEM: u32 = 1;
+        /// A page of the framebuffer aperture, at [`super::CheckRm::bar`].
+        pub const APERTURE: u32 = 2;
+        /// A page of system memory this process never pinned.
+        pub const NOT_OURS: u32 = 3;
+    }
+
     #[derive(Default)]
     pub struct CheckRm {
         pub escapes: AtomicU32,
         pub released: AtomicUsize,
+        /// Where its system memory and its aperture are.
+        pub system: AtomicU64,
+        pub bar: AtomicU64,
+        pub unrecorded: AtomicU32,
+    }
+
+    fn mapping(ctl: bool, memory_type: u32, caching: u32, start: u64) -> Option<MmapContext> {
+        MmapContext::from_raw(&RawMmapContext {
+            valid: 1,
+            ctl: ctl as u32,
+            gpu_instance: 0,
+            memory_type,
+            caching,
+            prot: 2,
+            start,
+            size: 4096,
+        })
     }
 
     /// One GPU, up, with an RM id and UUID only this check uses.
@@ -142,6 +170,27 @@ pub mod check {
 
         fn release(&self, os_info: usize) {
             self.released.store(os_info, Ordering::Relaxed);
+        }
+
+        fn map_memory(&self, payload: &mut [u8], _caller: &Caller) -> (u32, Option<MmapContext>) {
+            self.escapes.fetch_add(1, Ordering::Relaxed);
+            if payload.len() != 56 {
+                return (NV_ERR_NOT_SUPPORTED, None);
+            }
+            let h_memory = u32::from_le_bytes(payload[8..12].try_into().unwrap());
+            // `NV_MEMORY_CACHED` and `_DEFAULT`, the framebuffer's.
+            let granted = match h_memory {
+                grant::SYSTEM => mapping(true, 0, 0, self.system.load(Ordering::Relaxed)),
+                grant::APERTURE => mapping(false, 2, 6, self.bar.load(Ordering::Relaxed)),
+                grant::NOT_OURS => mapping(true, 0, 0, 0x1000),
+                _ => None,
+            };
+            payload[40..44].copy_from_slice(&NV_OK.to_le_bytes());
+            (NV_OK, granted)
+        }
+
+        fn map_unrecorded(&self, _payload: &mut [u8], _caller: &Caller, why: u32) {
+            self.unrecorded.store(why, Ordering::Relaxed);
         }
     }
 }

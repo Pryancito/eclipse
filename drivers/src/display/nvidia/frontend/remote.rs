@@ -14,16 +14,21 @@
 //! to read without a call. One RM only: there is no serving while the
 //! kernel's own is up, and no second server.
 //!
-//! This step carries the plain escapes and `release`. The others (lent
-//! pages, mappings, OS events, UVM) are refused with
-//! `NV_ERR_NOT_SUPPORTED` until they are carried too.
+//! A mapping the RM grants (`RM_MAP_MEMORY`) is the kernel's to check
+//! before it is recorded: an aperture has to lie in a BAR of a GPU the
+//! process holds, system memory in what it pinned (the loader says which,
+//! [`Owns`]), or the RM is told it was not recorded.
+//!
+//! This carries the plain escapes, the mappings and `release`. The others
+//! (lent pages, OS events, UVM) are refused with `NV_ERR_NOT_SUPPORTED`
+//! until they are carried too.
 
-use super::{Caller, Card, CALLER_NAME_LEN, GPU_UUID_LEN};
+use super::{Caller, Card, MmapContext, MmapMemory, RawMmapContext, CALLER_NAME_LEN, GPU_UUID_LEN};
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 use core::convert::TryFrom;
 use lock::Mutex;
-use nvidia_rm_sys::types::{NV_ERR_OPERATING_SYSTEM, NV_STATUS};
+use nvidia_rm_sys::types::{NV_ERR_INVALID_STATE, NV_ERR_OPERATING_SYSTEM, NV_STATUS};
 
 /// The link's operations, numbered apart from a served node's (`1..=16`)
 /// and a served DRM card's (`64..`).
@@ -34,6 +39,13 @@ pub mod op {
     pub const RM_ESCAPE: u32 = 128;
     /// `a` = the `os_info` of an open that is gone. Told, not answered.
     pub const RELEASE: u32 = 129;
+    /// `RM_MAP_MEMORY`: as [`RM_ESCAPE`], and the answer's bytes are the
+    /// payload and then the mapping the RM granted
+    /// ([`super::MAPPING_LEN`] bytes, `valid` 0 for none).
+    pub const RM_MAP_MEMORY: u32 = 130;
+    /// The kernel did not record the mapping: `a` = why; the message and
+    /// the answer as [`RM_ESCAPE`]'s.
+    pub const MAP_UNRECORDED: u32 = 131;
 }
 
 /// `EINVAL`, `ENOSYS`: what a message that is not one is answered with.
@@ -57,8 +69,14 @@ pub struct ServedCard {
     pub uuid: Option<[u8; GPU_UUID_LEN]>,
 }
 
+/// Whose `len` bytes of physical memory at `start` are, as the loader
+/// knows of the process: `Some(true)` for a BAR of a device it holds,
+/// `Some(false)` for memory it pinned, `None` for neither.
+pub type Owns = Arc<dyn Fn(u64, u64) -> Option<bool> + Send + Sync>;
+
 pub(super) struct Served {
     link: Arc<dyn Link>,
+    owns: Owns,
     rm_up: bool,
     cards: Vec<ServedCard>,
 }
@@ -82,7 +100,7 @@ pub enum Refused {
 
 /// Take the RM of the process at the other end of `link`, which says what
 /// it has in `hello`. Its GPUs are the cards from then on.
-pub fn serve(link: Arc<dyn Link>, hello: &[u8]) -> Result<Vec<ServedCard>, Refused> {
+pub fn serve(link: Arc<dyn Link>, hello: &[u8], owns: Owns) -> Result<Vec<ServedCard>, Refused> {
     let (rm_up, cards) = parse_hello(hello).ok_or(Refused::Invalid)?;
     if super::local_rm_up() {
         return Err(Refused::Taken);
@@ -93,6 +111,7 @@ pub fn serve(link: Arc<dyn Link>, hello: &[u8]) -> Result<Vec<ServedCard>, Refus
     }
     *served = Some(Arc::new(Served {
         link,
+        owns,
         rm_up,
         cards: cards.clone(),
     }));
@@ -125,9 +144,7 @@ impl Served {
     }
 
     pub(super) fn rm_escape(&self, cmd: u32, payload: &mut [u8], caller: &Caller) -> NV_STATUS {
-        let mut msg = Vec::with_capacity(CALLER_LEN + payload.len());
-        msg.extend_from_slice(&encode_caller(caller));
-        msg.extend_from_slice(payload);
+        let msg = with_caller(caller, payload);
         match self.link.call(op::RM_ESCAPE, cmd as u64, &msg) {
             Ok((status, back)) if back.len() == payload.len() => {
                 payload.copy_from_slice(&back);
@@ -147,12 +164,112 @@ impl Served {
     pub(super) fn release(&self, os_info: usize) {
         self.link.tell(op::RELEASE, os_info as u64);
     }
+
+    pub(super) fn rm_map_memory(
+        &self,
+        payload: &mut [u8],
+        caller: &Caller,
+    ) -> (NV_STATUS, Option<MmapContext>) {
+        let msg = with_caller(caller, payload);
+        let (status, back) = match self.link.call(op::RM_MAP_MEMORY, 0, &msg) {
+            Ok(answer) => answer,
+            Err(errno) => {
+                warn!("[nvidiactl] RM_MAP_MEMORY: the RM's process did not answer ({errno})");
+                return (NV_ERR_OPERATING_SYSTEM, None);
+            }
+        };
+        if back.len() != payload.len() + MAPPING_LEN {
+            warn!("[nvidiactl] RM_MAP_MEMORY: the RM's process answered another size");
+            return (NV_ERR_OPERATING_SYSTEM, None);
+        }
+        payload.copy_from_slice(&back[..payload.len()]);
+        let raw = decode_mapping(&back[payload.len()..]);
+        let mapping = MmapContext::from_raw(&raw);
+        match mapping {
+            None if raw.valid != 0 => {
+                warn!("[nvidiactl] RM_MAP_MEMORY: a mapping that is not one ({raw:x?})");
+                self.map_unrecorded(payload, caller, NV_ERR_INVALID_STATE);
+                (NV_ERR_INVALID_STATE, None)
+            }
+            Some(m) if !self.may_map(&m) => {
+                warn!(
+                    "[nvidiactl] RM_MAP_MEMORY: {:?} {:#x}+{:#x} is not the RM's process's",
+                    m.memory, m.start, m.size
+                );
+                self.map_unrecorded(payload, caller, NV_ERR_INVALID_STATE);
+                (NV_ERR_INVALID_STATE, None)
+            }
+            mapping => (status as NV_STATUS, mapping),
+        }
+    }
+
+    /// An aperture in a BAR of a GPU the process holds, system memory in
+    /// what it pinned.
+    fn may_map(&self, m: &MmapContext) -> bool {
+        let device = m.memory != MmapMemory::System;
+        (self.owns)(m.start, m.size) == Some(device)
+    }
+
+    pub(super) fn map_unrecorded(&self, payload: &mut [u8], caller: &Caller, why: NV_STATUS) {
+        let msg = with_caller(caller, payload);
+        match self.link.call(op::MAP_UNRECORDED, why as u64, &msg) {
+            Ok((_, back)) if back.len() == payload.len() => payload.copy_from_slice(&back),
+            Ok(_) => warn!("[nvidiactl] MAP_UNRECORDED: the RM's process answered another size"),
+            Err(errno) => {
+                warn!("[nvidiactl] MAP_UNRECORDED: the RM's process did not answer ({errno})")
+            }
+        }
+    }
+}
+
+fn with_caller(caller: &Caller, payload: &[u8]) -> Vec<u8> {
+    let mut msg = Vec::with_capacity(CALLER_LEN + payload.len());
+    msg.extend_from_slice(&encode_caller(caller));
+    msg.extend_from_slice(payload);
+    msg
+}
+
+/// A mapping on the link: `RawMmapContext`'s words, in its order.
+pub const MAPPING_LEN: usize = 40;
+
+fn encode_mapping(m: Option<&MmapContext>) -> [u8; MAPPING_LEN] {
+    let raw = m.map(MmapContext::to_raw).unwrap_or_default();
+    let mut b = [0u8; MAPPING_LEN];
+    let words = [
+        raw.valid,
+        raw.ctl,
+        raw.gpu_instance,
+        raw.memory_type,
+        raw.caching,
+        raw.prot,
+    ];
+    for (i, w) in words.iter().enumerate() {
+        b[i * 4..i * 4 + 4].copy_from_slice(&w.to_le_bytes());
+    }
+    b[24..32].copy_from_slice(&raw.start.to_le_bytes());
+    b[32..40].copy_from_slice(&raw.size.to_le_bytes());
+    b
+}
+
+fn decode_mapping(b: &[u8]) -> RawMmapContext {
+    RawMmapContext {
+        valid: u32_at(b, 0),
+        ctl: u32_at(b, 4),
+        gpu_instance: u32_at(b, 8),
+        memory_type: u32_at(b, 12),
+        caching: u32_at(b, 16),
+        prot: u32_at(b, 20),
+        start: u64_at(b, 24),
+        size: u64_at(b, 32),
+    }
 }
 
 /// The RM a process serves, as [`answer`] reaches it.
 pub trait Rm {
     fn escape(&self, cmd: u32, payload: &mut [u8], caller: &Caller) -> NV_STATUS;
     fn release(&self, os_info: usize);
+    fn map_memory(&self, payload: &mut [u8], caller: &Caller) -> (NV_STATUS, Option<MmapContext>);
+    fn map_unrecorded(&self, payload: &mut [u8], caller: &Caller, why: NV_STATUS);
 }
 
 /// This address space's RM: the driver's own.
@@ -166,21 +283,45 @@ impl Rm for ThisRm {
     fn release(&self, os_info: usize) {
         super::release(os_info)
     }
+
+    fn map_memory(&self, payload: &mut [u8], caller: &Caller) -> (NV_STATUS, Option<MmapContext>) {
+        super::rm_map_memory(payload, caller)
+    }
+
+    fn map_unrecorded(&self, payload: &mut [u8], caller: &Caller, why: NV_STATUS) {
+        super::map_unrecorded(payload, caller, why)
+    }
 }
 
 /// The server's end: the answer to message `op` with `a` and `data`, its
 /// bytes in `out`. `Err` is the errno the kernel is told.
 pub fn answer(rm: &dyn Rm, op: u32, a: u64, data: &[u8], out: &mut Vec<u8>) -> Result<u64, i32> {
+    let with_payload = |out: &mut Vec<u8>| -> Result<Caller, i32> {
+        let caller = data
+            .get(..CALLER_LEN)
+            .and_then(decode_caller)
+            .ok_or(EINVAL)?;
+        out.clear();
+        out.extend_from_slice(&data[CALLER_LEN..]);
+        Ok(caller)
+    };
     match op {
         op::RM_ESCAPE => {
             let cmd = u32::try_from(a).map_err(|_| EINVAL)?;
-            let caller = data
-                .get(..CALLER_LEN)
-                .and_then(decode_caller)
-                .ok_or(EINVAL)?;
-            out.clear();
-            out.extend_from_slice(&data[CALLER_LEN..]);
+            let caller = with_payload(out)?;
             Ok(rm.escape(cmd, out, &caller) as u64)
+        }
+        op::RM_MAP_MEMORY => {
+            let caller = with_payload(out)?;
+            let (status, mapping) = rm.map_memory(out, &caller);
+            out.extend_from_slice(&encode_mapping(mapping.as_ref()));
+            Ok(status as u64)
+        }
+        op::MAP_UNRECORDED => {
+            let why = u32::try_from(a).map_err(|_| EINVAL)?;
+            let caller = with_payload(out)?;
+            rm.map_unrecorded(out, &caller, why);
+            Ok(0)
         }
         op::RELEASE => {
             rm.release(a as usize);
