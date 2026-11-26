@@ -35,6 +35,11 @@ pub type FenceCheck = Arc<dyn Fn(&Fence) -> Option<(usize, u32)> + Send + Sync>;
 /// lock without a call (a call waits, and must not wait holding a lock).
 pub struct OverLink(Arc<Link>, AtomicU64, Option<FenceCheck>);
 
+/// How long a console GPU's bring-up may keep its driver silent: the
+/// kernel's own waits up to the scanout pause's 90 s watchdog, and a GSP
+/// boot that never comes back is still a hang past this.
+const BRINGUP_PATIENCE_MS: u64 = 180_000;
+
 /// No answer has carried flags yet.
 const NO_FLAGS: u64 = u64::MAX;
 
@@ -46,6 +51,15 @@ impl OverLink {
 
 impl Transport for OverLink {
     fn call(&self, op: u32, a: u64, b: u64, data: &[u8]) -> Result<(u64, Vec<u8>), i32> {
+        // A console GPU's bring-up boots its GSP firmware, which takes longer
+        // than the link waits before it calls the driver hung: killing the
+        // driver halfway through that boot left the monitor black.
+        if matches!(
+            op,
+            drm_remote::op::CONSOLE_BRINGUP | drm_remote::op::CONSOLE_GR_LADDER
+        ) {
+            self.0.be_patient_for(BRINGUP_PATIENCE_MS);
+        }
         // The message's `len` is the bytes it carries; the answer has the
         // whole slot.
         match self.0.call(op, 0, 0, a, b, data) {

@@ -68,6 +68,9 @@ pub(super) struct Link {
     dead: AtomicBool,
     answered_at: AtomicU64,
     pub hung_after_ms: AtomicU64,
+    /// Until when (`now_ms`) silence is not a hang: a request known to take
+    /// long is waiting ([`Link::be_patient_for`]).
+    patient_until: AtomicU64,
     ready: lock::Mutex<Option<Ready>>,
     kill: lock::Mutex<Option<Kill>>,
     next_id: AtomicU32,
@@ -139,6 +142,7 @@ impl Link {
             dead: AtomicBool::new(false),
             answered_at: AtomicU64::new(0),
             hung_after_ms: AtomicU64::new(HUNG_AFTER_MS),
+            patient_until: AtomicU64::new(0),
             ready: lock::Mutex::new(None),
             kill: lock::Mutex::new(None),
             next_id: AtomicU32::new(0),
@@ -173,8 +177,20 @@ impl Link {
     }
 
     fn silent_since(&self, since: u64) -> bool {
+        let now = now_ms();
+        if now < self.patient_until.load(Ordering::Acquire) {
+            return false;
+        }
         let heard = since.max(self.answered_at.load(Ordering::Acquire));
-        now_ms() > heard + self.hung_after_ms.load(Ordering::Relaxed)
+        now > heard + self.hung_after_ms.load(Ordering::Relaxed)
+    }
+
+    /// The next `ms` of silence are not a hang: a request that takes that
+    /// long (a GPU's firmware boot) is about to be asked, and the server
+    /// answers nothing else on the thread it runs on meanwhile.
+    pub fn be_patient_for(&self, ms: u64) {
+        self.patient_until
+            .fetch_max(now_ms().saturating_add(ms), Ordering::AcqRel);
     }
 
     /// Nothing is asked on this link again. Whether this was the first to
@@ -470,5 +486,25 @@ impl Drop for Forget<'_> {
         if matches!(&*asker, Some((id, _)) if *id == self.1) {
             *asker = None;
         }
+    }
+}
+
+#[cfg(test)]
+mod patience_tests {
+    use super::*;
+
+    #[test]
+    fn a_long_request_keeps_the_silence_from_being_a_hang() {
+        let (ours, _theirs) = Fifo::create(SLOTS * 2, MSG);
+        let window = VmObject::new_paged((SLOTS * SLOT_LEN).div_ceil(4096));
+        let link = Link::new(ours, window).unwrap();
+        link.hung_after_ms.store(0, Ordering::Relaxed);
+        let long_ago = 0;
+        while now_ms() == long_ago {
+            core::hint::spin_loop();
+        }
+        assert!(link.silent_since(long_ago), "past the wait: hung");
+        link.be_patient_for(60_000);
+        assert!(!link.silent_since(long_ago), "a firmware boot is waiting");
     }
 }
