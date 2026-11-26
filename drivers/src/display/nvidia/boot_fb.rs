@@ -30,6 +30,14 @@ pub fn set_boot_fb_info(phys: u64, width: u32, height: u32, pitch: u32) {
     });
 }
 
+/// The boot (UEFI GOP) framebuffer as [`set_boot_fb_info`] was told of it:
+/// `(phys, width, height, pitch)`.
+pub fn boot_fb_info() -> Option<(u64, u32, u32, u32)> {
+    BOOT_FB_INFO
+        .lock()
+        .map(|b| (b.phys, b.width, b.height, b.pitch))
+}
+
 /// Physical address of the boot (UEFI GOP) framebuffer, if known. The GPU whose
 /// BAR1 aperture contains this address is the one driving the console.
 pub(super) fn boot_fb_phys() -> Option<u64> {

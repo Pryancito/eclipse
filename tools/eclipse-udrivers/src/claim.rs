@@ -253,6 +253,21 @@ fn claim_with(kind: usize, index: usize, id: usize, patience: u32) -> Result<Cla
     }
 }
 
+/// What the boot knows of the display (`ECLIPSE_BOOT_DISPLAY`), into
+/// `out`, as `zcore_drivers::display::boot_display` lays it out: for the
+/// driver of a GPU this process holds, which the kernel's is told at boot.
+/// `ACCESS_DENIED` to a process that holds no GPU.
+pub fn boot_display(out: &mut [u8]) -> Result<(), Status> {
+    // SAFETY: the kernel writes at most `out.len()` bytes into `out`.
+    unsafe {
+        zx::call(
+            nr::ECLIPSE_BOOT_DISPLAY,
+            [out.as_mut_ptr() as usize, out.len(), 0, 0, 0, 0],
+        )
+    }
+    .map(|_| ())
+}
+
 /// DMA memory: contiguous, pinned, and mapped here.
 pub struct Dma {
     /// Where this process sees it.

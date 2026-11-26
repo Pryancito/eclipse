@@ -174,3 +174,12 @@ pub fn post_event(server: u64, os_info: usize, event: Option<UnixEvent>) -> bool
     crate::fs::devfs::nvidia::post_event(os_info, event);
     true
 }
+
+/// `ECLIPSE_BOOT_DISPLAY`'s bytes: what the boot knows of the display, as
+/// the kernel's NVIDIA driver was told, for the same driver in a process.
+pub use zcore_drivers::display::boot_display::LEN as BOOT_DISPLAY_LEN;
+
+/// [`BOOT_DISPLAY_LEN`] bytes of what this boot knows of the display.
+pub fn boot_display() -> [u8; BOOT_DISPLAY_LEN] {
+    zcore_drivers::display::boot_display::BootDisplay::this_boot().encode()
+}

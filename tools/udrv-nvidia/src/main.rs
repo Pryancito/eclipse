@@ -12,8 +12,8 @@
 //! - `udrv-nvidia check VVVV DDDD`: check this process's side of it on
 //!   any PCI function (`udriver=pci-VVVV-DDDD@0`), QEMU's standard VGA on
 //!   a machine with no NVIDIA GPU: the probe through the ports, the BARs
-//!   through the mapper, DMA memory through the claim. The driver itself
-//!   is not run.
+//!   through the mapper, what the boot knows of the display, DMA memory
+//!   through the claim. The driver itself is not run.
 //! - `udrv-nvidia irq-check VVVV DDDD OFF=VAL...`: the interrupt path of
 //!   the driver's GSP boot, on any PCI function that raises one when its
 //!   first BAR is written (QEMU's e1000e: `d0=4 c8=4`).
@@ -39,6 +39,7 @@ use std::process::exit;
 
 use zcore_drivers::builder::IoMapper;
 use zcore_drivers::bus::pci_drivers::PciDriver;
+use zcore_drivers::display::boot_display::{self, BootDisplay};
 
 const NAME: &str = "udrv-nvidia";
 
@@ -85,6 +86,17 @@ fn run(only: Option<usize>) {
     // the GPUs whose initiators it is pinned in, which are those there are
     // when it is made.
     gpu::install_dma(&gpus).unwrap_or_else(|e| fail(e));
+    // What the kernel's driver is told at boot, before any GPU comes up:
+    // which of them scans out the console decides how it is brought up.
+    match boot_display() {
+        Ok(display) => {
+            println!("{NAME}: {}", describe(&display));
+            display.install();
+        }
+        Err(e) => {
+            println!("{NAME}: the boot's display is unknown ({e}); no GPU drives the console")
+        }
+    }
     let drv = zcore_drivers::display::NvidiaGpuDriverPci;
     let mut cards = Vec::new();
     for gpu in &gpus {
@@ -134,6 +146,31 @@ fn run(only: Option<usize>) {
     for card in served {
         let _ = card.join();
     }
+}
+
+/// What the boot knows of the display, as the kernel's driver was told.
+fn boot_display() -> Result<BootDisplay, udrivers::zx::Status> {
+    let mut bytes = [0u8; boot_display::LEN];
+    udrivers::claim::boot_display(&mut bytes)?;
+    Ok(BootDisplay::decode(&bytes))
+}
+
+fn describe(display: &BootDisplay) -> String {
+    let fb = match display.fb {
+        Some((phys, w, h, pitch)) => {
+            format!("boot framebuffer {w}x{h} at {phys:#x} (pitch {pitch})")
+        }
+        None => "no boot framebuffer".into(),
+    };
+    let edid = match display.edid {
+        Some((_, len)) => format!("an EDID of {len} bytes"),
+        None => "no EDID".into(),
+    };
+    let asked = match display.requested {
+        Some((w, h)) => format!("{w}x{h} asked for"),
+        None => "no resolution asked for".into(),
+    };
+    format!("{fb}, {edid}, {asked}")
 }
 
 /// The GPU's MSI, for the driver's GSP boot of the GPU that scans out the
@@ -917,6 +954,21 @@ fn check(vendor: u16, device: u16) {
     }
     let gpu = &gpus[0];
     let first = gpu.bars[0];
+    // The firmware's console is on QEMU's first VGA: its framebuffer is
+    // in that function's BAR 0, where the driver looks for it.
+    let display = boot_display().unwrap_or_else(|e| fail(format!("boot display: {e}")));
+    println!("{NAME}: {}", describe(&display));
+    ok(
+        "the boot's framebuffer is told, in the first function's BAR 0",
+        display.fb.is_some_and(|(phys, ..)| {
+            (first.phys..first.phys + first.len).contains(&(phys as usize))
+        }),
+    );
+    display.install();
+    ok(
+        "...and the driver is told it as the kernel's is",
+        zcore_drivers::display::boot_fb_info() == display.fb,
+    );
     gpu::install_dma(&gpus).unwrap_or_else(|e| fail(e));
     extern "C" {
         fn drivers_dma_alloc(pages: usize) -> usize;
