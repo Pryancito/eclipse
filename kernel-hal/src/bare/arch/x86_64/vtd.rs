@@ -345,13 +345,15 @@ impl DmaDomain for Domain {
 
 impl Drop for Domain {
     fn drop(&mut self) {
-        // Back to pass-through before a single table frame goes: the device
-        // must never walk a freed table.
-        self.unit
-            .set_context(self.rid, self.unit.pass_through_entry(), self.did);
+        // Blocked (no context entry: every request faults), not back to
+        // pass-through, before a single table frame goes: the device must
+        // never walk a freed table, and one that had a driver of its own
+        // never reaches every byte again. Its next driver gets a new
+        // domain.
+        self.unit.set_context(self.rid, [0, 0], self.did);
         self.unit.give_did(self.did);
         crate::klog_info!(
-            "iommu: {:02x}:{:02x}.{} back in pass-through",
+            "iommu: {:02x}:{:02x}.{} blocked until its next driver",
             self.rid >> 8,
             (self.rid >> 3) & 0x1f,
             self.rid & 7

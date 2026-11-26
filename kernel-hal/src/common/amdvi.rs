@@ -218,6 +218,13 @@ pub fn dte_pass_through(did: u16) -> [u64; 2] {
     [DTE_V | DTE_TV | DTE_IR | DTE_IW, did as u64]
 }
 
+/// A device table entry that lets the device reach nothing: valid and
+/// translated, with no table and neither read nor write allowed. Where a
+/// device whose driver died is left, so it never gets every byte back.
+pub fn dte_blocked(did: u16) -> [u64; 2] {
+    [DTE_V | DTE_TV, did as u64]
+}
+
 /// A device table entry that translates through the table at `root`.
 pub fn dte_translate(root: PhysAddr, did: u16) -> [u64; 2] {
     [
@@ -439,6 +446,7 @@ mod tests {
         assert_eq!(devtab_register(0x1_2340_0000), 0x1_2340_01ff);
         assert_eq!(ring_register(0x5000, 8), 0x5000 | 8 << 56);
         assert_eq!(dte_pass_through(1), [0b11 | 3 << 61, 1]);
+        assert_eq!(dte_blocked(7), [0b11, 7]);
         let t = dte_translate(0xabc_d000, 7);
         assert_eq!(t[0] >> 9 & 7, 4, "four levels");
         assert_eq!(t[0] & PTE_ADDR, 0xabc_d000);
