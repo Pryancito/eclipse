@@ -29,6 +29,7 @@ pub mod nr {
     pub const HANDLE_DUPLICATE: i64 = 47;
     pub const INTERRUPT_WAIT: i64 = 54;
     pub const OBJECT_WAIT_ONE: i64 = 81;
+    pub const PMT_UNPIN: i64 = 89;
     pub const VMO_CREATE: i64 = 191;
     pub const VMO_CREATE_CHILD: i64 = 192;
     pub const VMO_CREATE_CONTIGUOUS: i64 = 193;

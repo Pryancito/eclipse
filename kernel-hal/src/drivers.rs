@@ -896,12 +896,11 @@ mod virtio_drivers_ffi {
 
     #[unsafe(no_mangle)]
     extern "C" fn virtio_dma_alloc(pages: usize) -> PhysAddr {
-        let paddr = KHANDLER.frame_alloc_contiguous(pages, 0).unwrap_or_else(|| {
-            panic!(
-                "virtio_dma_alloc: no hay {} páginas físicas contiguas (RAM insuficiente o fragmentación)",
-                pages
-            );
-        });
+        // 0, not a panic, as `drivers_dma_alloc`: the virtio queues check it.
+        let Some(paddr) = KHANDLER.frame_alloc_contiguous(pages, 0) else {
+            super::dma_alloc_failed("virtio_dma_alloc", pages);
+            return 0;
+        };
         trace!("alloc DMA: paddr={:#x}, pages={}", paddr, pages);
         paddr
     }
@@ -1015,18 +1014,55 @@ mod drivers_ffi_libos {
     }
 }
 
+/// Contiguous DMA allocations refused since boot (`drivers_dma_alloc`,
+/// `virtio_dma_alloc`), for the log line below.
+static DMA_ALLOC_FAILED: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// A contiguous DMA allocation of `pages` found no free run. The caller
+/// answers 0. The first refusal and then one in 64 reach the log, with the
+/// count, so a video that hits it every frame does not flood it.
+#[cfg(not(feature = "libos"))]
+fn dma_alloc_failed(who: &str, pages: usize) {
+    use core::sync::atomic::Ordering::Relaxed;
+    let n = DMA_ALLOC_FAILED.fetch_add(1, Relaxed) + 1;
+    if n == 1 || n.is_multiple_of(64) {
+        warn!(
+            "{}: no {} contiguous pages ({} KiB) free; the caller gets ENOMEM \
+             instead of a kernel panic ({} refused since boot)",
+            who,
+            pages,
+            pages * 4,
+            n
+        );
+    }
+}
+
+/// Contiguous DMA allocations refused since boot.
+pub fn dma_alloc_failures() -> u64 {
+    DMA_ALLOC_FAILED.load(core::sync::atomic::Ordering::Relaxed)
+}
+
 #[cfg(not(feature = "libos"))]
 mod drivers_ffi {
     use crate::{PhysAddr, VirtAddr, KCONFIG, KHANDLER, PAGE_SIZE};
 
+    /// Contiguous DMA memory, or 0 when there is none of that size.
+    ///
+    /// It used to panic instead. Every caller checks for 0 (the RM's
+    /// `osAllocPagesInternal` answers `NV_ERR_NO_MEMORY`, the NIC, AHCI and
+    /// `dma_provider` paths fail their own allocation), and the RM calls this
+    /// under its gate and its own C locks, where the oops handler cannot
+    /// contain anything: a GPU buffer the size of a video frame that found
+    /// no free run of that order (the buddy rounds every request up to a
+    /// power of two, and freed GEM frames sit in the DMA quarantine for a
+    /// while) took the whole machine down, blue screen and all. Now it is
+    /// `ENOMEM` for the one `GEM_NEW`, which Mesa answers by itself.
     #[unsafe(no_mangle)]
     extern "C" fn drivers_dma_alloc(pages: usize) -> PhysAddr {
-        let paddr = KHANDLER.frame_alloc_contiguous(pages, 0).unwrap_or_else(|| {
-            panic!(
-                "drivers_dma_alloc: no hay {} páginas físicas contiguas (RAM insuficiente o fragmentación)",
-                pages
-            );
-        });
+        let Some(paddr) = KHANDLER.frame_alloc_contiguous(pages, 0) else {
+            super::dma_alloc_failed("drivers_dma_alloc", pages);
+            return 0;
+        };
         trace!("alloc DMA: paddr={:#x}, pages={}", paddr, pages);
         paddr
     }

@@ -7,6 +7,10 @@ use crate::{PhysAddr, KHANDLER, PAGE_SIZE};
 pub struct PhysFrame {
     paddr: PhysAddr,
     allocated: bool,
+    /// One of a contiguous run ([`Self::new_contiguous`]): DMA memory a
+    /// device or a driver in a process may have handed out by its physical
+    /// address. See the `Drop`.
+    contiguous: bool,
 }
 
 impl PhysFrame {
@@ -15,6 +19,7 @@ impl PhysFrame {
         KHANDLER.frame_alloc().map(|paddr| Self {
             paddr,
             allocated: true,
+            contiguous: false,
         })
     }
 
@@ -25,6 +30,7 @@ impl PhysFrame {
         KHANDLER.frame_alloc_user().map(|paddr| Self {
             paddr,
             allocated: true,
+            contiguous: false,
         })
     }
 
@@ -55,6 +61,7 @@ impl PhysFrame {
                 .map(|i| Self {
                     paddr: base + i * PAGE_SIZE,
                     allocated: true,
+                    contiguous: true,
                 })
                 .collect()
         })
@@ -69,6 +76,7 @@ impl PhysFrame {
         Self {
             paddr,
             allocated: false,
+            contiguous: false,
         }
     }
 
@@ -86,6 +94,7 @@ impl PhysFrame {
         Self {
             paddr,
             allocated: true,
+            contiguous: false,
         }
     }
 
@@ -112,9 +121,23 @@ impl PhysFrame {
 
 impl Drop for PhysFrame {
     fn drop(&mut self) {
-        if self.allocated {
-            KHANDLER.frame_dealloc(self.paddr)
+        if !self.allocated {
+            return;
         }
+        // A contiguous frame is DMA memory: a driver in a process
+        // (`udrv-nvidia`) gets its GEM buffers from contiguous VMOs, and the
+        // kernel maps them into clients by physical address (the GEM CPU
+        // mmap, `VmObject::new_physical`, which pins the range in
+        // `dma_pin`). The driver freeing a buffer drops its VMO, but a client
+        // may still map it, exactly as with the kernel's own
+        // `drivers_dma_dealloc`: hold the frame until the last such pin goes,
+        // and the pin's release hands it back to the pool through the DMA
+        // quarantine. Only contiguous frames ask, so ordinary pages pay
+        // nothing.
+        if self.contiguous && crate::imp::stack_guard::dma_hold_if_pinned(self.paddr, 1) {
+            return;
+        }
+        KHANDLER.frame_dealloc(self.paddr)
     }
 }
 

@@ -263,6 +263,8 @@ pub struct Dma {
     /// The window asked for in [`Dma::new`]: a VMO over that part of the
     /// memory and no other, to hand to someone else.
     pub window: Option<Handle>,
+    /// The pin that gives the device its address, for [`Dma::release`].
+    pub pmt: Handle,
 }
 
 impl Dma {
@@ -319,7 +321,27 @@ impl Dma {
             len,
             daddr,
             window,
+            pmt,
         })
+    }
+
+    /// Give the memory back: the device loses it (`zx_pmt_unpin` takes the
+    /// IOMMU grant first), then the mapping, which holds the VMO's last
+    /// reference here, goes. A driver that allocates and frees buffers for
+    /// as long as it runs (a GPU's GEM objects) needs this, or every buffer
+    /// it ever made stays pinned. The kernel keeps any frame a client still
+    /// maps by its physical address until that mapping goes.
+    ///
+    /// Only for memory made without a window: a window is a second VMO
+    /// someone else may hold, and handing the pages back under it is not
+    /// this call's to decide.
+    pub fn release(ptr: *mut u8, len: usize, pmt: Handle) -> Result<(), Status> {
+        // SAFETY: no pointers; `pmt` is consumed.
+        unsafe { zx::call(nr::PMT_UNPIN, [pmt as usize, 0, 0, 0, 0, 0]) }?;
+        // SAFETY: `ptr..ptr+len` is the mapping `new` made, which the caller
+        // no longer uses.
+        unsafe { libc::munmap(ptr as *mut libc::c_void, len) };
+        Ok(())
     }
 }
 

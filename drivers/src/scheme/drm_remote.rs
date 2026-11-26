@@ -701,8 +701,14 @@ impl<T: Transport> DrmScheme for Remote<T> {
         self.flag(Flags::BLOCK_LINEAR)
     }
 
+    /// Never, from a card in a process: `ce_present` and
+    /// `ce_present_2d_pitched` are not forwarded yet, so their defaults
+    /// (false) answered every frame. Saying ready only had the kernel turn CE
+    /// present on and then pay, per frame, the clflush and the repack into
+    /// staging for a copy that never happened, before the CPU blit it falls
+    /// back to anyway. The bit stays in [`Flags`] for when they are.
     fn ce_present_ready(&self) -> bool {
-        self.flag(Flags::CE_PRESENT_READY)
+        false
     }
 
     fn get_connector_edid(&self, id: u32) -> Option<[u8; 128]> {

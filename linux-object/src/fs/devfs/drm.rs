@@ -2961,7 +2961,9 @@ pub fn dmabuf_drop_gem_ref(handle_id: u32) {
     if zcore_drivers::scheme::gem_mmap::lookup(handle_id).is_none() {
         return;
     }
-    match get_primary_driver() {
+    // The card that holds it, which with a driver per GPU is not always
+    // the primary (see `driver_holding_gem`).
+    match prime_import::driver_holding_gem(handle_id).or_else(get_primary_driver) {
         Some(driver) => {
             driver.nouveau_gem_close(handle_id, DMABUF_HOLDER);
         }
@@ -3026,7 +3028,9 @@ fn fb_drop_gem_ref(handle_id: u32) {
         // retired in the same breath -- see `retire_framebuffers_for_handle`).
         return;
     }
-    match get_primary_driver() {
+    // The card that holds it, which with a driver per GPU is not always
+    // the primary (see `driver_holding_gem`).
+    match prime_import::driver_holding_gem(handle_id).or_else(get_primary_driver) {
         Some(driver) => {
             driver.nouveau_gem_close(handle_id, KMS_FB_HOLDER);
         }

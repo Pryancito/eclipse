@@ -117,6 +117,22 @@ pub fn card_index_holding_gem(handle: u32) -> Option<u32> {
         .map(|n| n.index)
 }
 
+/// The driver of the card that holds `handle`, for the kernel's own
+/// references on it (a dma-buf's, a framebuffer's) to be dropped where the
+/// object lives. `None` when no node's card claims it.
+///
+/// With one driver for every GPU (the kernel's) the primary was always the
+/// right one to ask. With a driver per GPU (`udrv-nvidia`, one process per
+/// card) the primary refuses a handle of the other card's slices, the
+/// reference is never dropped and the object, a video frame's buffer
+/// exported to the compositor for instance, is never freed.
+pub fn driver_holding_gem(handle: u32) -> Option<Arc<dyn DrmScheme>> {
+    gpu_nodes()
+        .into_iter()
+        .find(|n| !matches!(n.driver.gem_aperture(handle, 0), GemAperture::Unknown))
+        .map(|n| n.driver)
+}
+
 /// The `/dev/dri` index of the node `minor` belongs to, for the same line.
 pub fn card_index_of_minor(minor: u32) -> Option<u32> {
     gpu_nodes()
