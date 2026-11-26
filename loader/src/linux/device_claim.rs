@@ -592,6 +592,9 @@ pub(super) fn claim_device(proc: &Arc<Process>, args: &[usize; 6]) -> ZxResult {
     };
     let view = dma_view(&device);
     let isolated = view.is_translating();
+    if isolated && device.kind == user::NVIDIA {
+        linux_object::fs::devfs::served::card::note_dma_isolated();
+    }
     let held = Held {
         holder: proc.id(),
         bti: BusTransactionInitiator::create(view, 0),

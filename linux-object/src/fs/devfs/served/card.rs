@@ -100,6 +100,37 @@ pub fn served_cards() -> Vec<Arc<dyn DrmScheme>> {
 /// The most cards [`served_snapshot`] holds.
 pub const SNAPSHOT_MAX: usize = 8;
 
+/// Whether a GPU a process drives reaches memory only through an IOMMU
+/// domain of its own: then a frame the kernel holds is not memory it can
+/// read, and it must not be offered the copy of one
+/// ([`ce_presents_allowed`]).
+static DMA_ISOLATED: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+/// A GPU a process drives was handed over behind an IOMMU domain.
+pub fn note_dma_isolated() {
+    DMA_ISOLATED.store(true, core::sync::atomic::Ordering::Release);
+}
+
+/// Whether the cards processes drive may take the copy of a frame from the
+/// kernel's memory with their copy engines. Not behind an IOMMU: the frame
+/// is not in the GPU's domain, the copy engine reads nothing (the IOMMU
+/// faults it) and the screen goes black while every copy is said done. The
+/// CPU copies those frames until the frame is lent to the GPU's domain.
+pub fn ce_presents_allowed() -> bool {
+    !DMA_ISOLATED.load(core::sync::atomic::Ordering::Acquire)
+}
+
+/// [`served_snapshot`], empty when their copy engines may not take the
+/// kernel's frames ([`ce_presents_allowed`]): what the present path offers
+/// a copy to.
+pub fn ce_snapshot() -> [Option<Arc<dyn DrmScheme>>; SNAPSHOT_MAX] {
+    if ce_presents_allowed() {
+        served_snapshot()
+    } else {
+        Default::default()
+    }
+}
+
 /// The cards processes drive now, without the heap: for the present path,
 /// which runs every frame and must not allocate.
 pub fn served_snapshot() -> [Option<Arc<dyn DrmScheme>>; SNAPSHOT_MAX] {
