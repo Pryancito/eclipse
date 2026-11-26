@@ -8,6 +8,7 @@ pub(super) mod vm;
 pub mod acpi_tables;
 pub mod addr;
 pub mod affinity_walk;
+pub mod amdvi;
 #[cfg(feature = "graphic")]
 pub mod boot_logo;
 pub mod boot_marks;
@@ -41,4 +42,5 @@ pub mod stop_screen;
 pub mod timer_waker;
 pub mod tsc_cal;
 pub mod user;
+pub mod vtd;
 pub mod watchpoint;

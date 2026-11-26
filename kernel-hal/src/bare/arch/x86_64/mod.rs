@@ -1,3 +1,4 @@
+mod amdvi;
 mod drivers;
 #[cfg(feature = "graphic")]
 pub(crate) mod early_fb_console;
@@ -8,6 +9,7 @@ pub(crate) mod power;
 pub(crate) mod pat;
 mod smp;
 mod trap;
+mod vtd;
 
 pub mod config;
 pub mod cpu;
