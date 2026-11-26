@@ -93,10 +93,8 @@ extern "C" fn drivers_klog_emit(priority: u8, msg: *const u8, len: usize) {
     }
     // SAFETY: the caller hands a byte slice it owns for the call.
     let bytes = unsafe { core::slice::from_raw_parts(msg, len) };
-    eprintln!(
-        "udrv-nvidia <{priority}> {}",
-        String::from_utf8_lossy(bytes).trim_end()
-    );
+    // Not written here: the driver makes these inside its timed stretches.
+    crate::stderr_log::klog(priority, &String::from_utf8_lossy(bytes));
 }
 
 #[no_mangle]

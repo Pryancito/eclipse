@@ -95,6 +95,7 @@ fn main() {
             window_check::window_check(hex(1), hex(2), asked)
         }
         Some("drm-check") => drm_check(),
+        Some("log-check") => stderr_log::check(),
         Some("nvkms-check") => nvkms_check::nvkms_check(args.get(1).map(String::as_str)),
         Some("irq-check") => irq_check(&args[1..]),
         Some("nvctl-check") => {
