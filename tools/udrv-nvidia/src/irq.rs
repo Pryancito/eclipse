@@ -6,11 +6,12 @@
 //! the handler the driver registered.
 //!
 //! The driver numbers the vector as the kernel's PCI scan does (`irq +
-//! 32`); this scheme answers that one vector only. Masking stops the
+//! 32`); a GPU's scheme answers its one vector only, and [`Vectors`] puts
+//! every GPU's behind the one scheme the driver is handed. Masking stops the
 //! handler from being run, not the kernel from taking the interrupt: the
 //! line is the kernel's, armed for the whole claim.
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex, Once};
+use std::sync::{Arc, Mutex, Once, OnceLock, RwLock};
 
 use udrivers::zx::Status;
 use zcore_drivers::scheme::{IrqHandler, IrqScheme, Scheme};
@@ -121,11 +122,77 @@ impl IrqScheme for ClaimIrq {
     }
 }
 
-/// Make `irq` the one `zcore_drivers::net` hands the driver, with its
-/// waiter running.
-pub fn install(irq: Arc<ClaimIrq>) {
+/// Every GPU's scheme, one vector each, as the one scheme
+/// `zcore_drivers::net` hands the driver: each call goes to the scheme of
+/// its vector.
+#[derive(Default)]
+pub struct Vectors(RwLock<Vec<Arc<ClaimIrq>>>);
+
+impl Vectors {
+    /// `irq` beside the others. Refused for a vector already there.
+    pub fn add(&self, irq: Arc<ClaimIrq>) -> bool {
+        let mut all = self.0.write().unwrap();
+        if all.iter().any(|i| i.vector == irq.vector) {
+            return false;
+        }
+        all.push(irq);
+        true
+    }
+
+    fn of(&self, vector: usize) -> Result<Arc<ClaimIrq>, DeviceError> {
+        self.0
+            .read()
+            .unwrap()
+            .iter()
+            .find(|i| i.vector == vector)
+            .cloned()
+            .ok_or(DeviceError::InvalidParam)
+    }
+}
+
+impl Scheme for Vectors {
+    fn name(&self) -> &str {
+        "udrv-nvidia-irq"
+    }
+}
+
+impl IrqScheme for Vectors {
+    fn is_valid_irq(&self, vector: usize) -> bool {
+        self.of(vector).is_ok()
+    }
+
+    fn mask(&self, vector: usize) -> DeviceResult {
+        self.of(vector)?.mask(vector)
+    }
+
+    fn unmask(&self, vector: usize) -> DeviceResult {
+        self.of(vector)?.unmask(vector)
+    }
+
+    fn register_handler(&self, vector: usize, handler: IrqHandler) -> DeviceResult {
+        self.of(vector)?.register_handler(vector, handler)
+    }
+
+    fn unregister(&self, vector: usize) -> DeviceResult {
+        self.of(vector)?.unregister(vector)
+    }
+}
+
+static VECTORS: OnceLock<Arc<Vectors>> = OnceLock::new();
+
+/// Add `irq` to the scheme `zcore_drivers::net` hands the driver, with its
+/// waiter running: one per GPU. Refused for a vector already there.
+pub fn install(irq: Arc<ClaimIrq>) -> bool {
+    let vectors = VECTORS.get_or_init(|| {
+        let vectors = Arc::new(Vectors::default());
+        zcore_drivers::net::pci_set_irq_host(vectors.clone());
+        vectors
+    });
+    if !vectors.add(irq.clone()) {
+        return false;
+    }
     irq.start();
-    zcore_drivers::net::pci_set_irq_host(irq);
+    true
 }
 
 #[cfg(test)]
@@ -220,5 +287,50 @@ mod tests {
         assert!(irq.register_handler(42, Arc::new(|| {})).is_err());
         irq.unregister(42).unwrap();
         irq.register_handler(42, Arc::new(|| {})).unwrap();
+    }
+
+    #[test]
+    fn two_gpus_vectors_each_reach_their_own_handler() {
+        let (one, tx1, seen1) = scheme();
+        let (tx2, rx2) = mpsc::channel::<()>();
+        let (seen_tx2, seen2) = mpsc::channel::<()>();
+        let (rx2, seen_tx2) = (Mutex::new(rx2), Mutex::new(seen_tx2));
+        let other = ClaimIrq::new(
+            43,
+            Box::new(move || {
+                let _ = seen_tx2.lock().unwrap().send(());
+                rx2.lock().unwrap().recv().map_err(|_| Status::PEER_CLOSED)
+            }),
+        );
+        other.start();
+        seen2.recv_timeout(Duration::from_secs(5)).unwrap();
+        let vectors = Vectors::default();
+        assert!(vectors.add(one.clone()) && vectors.add(other.clone()));
+        assert!(!vectors.add(one.clone()), "42 is there already");
+        assert!(vectors.is_valid_irq(42) && vectors.is_valid_irq(43) && !vectors.is_valid_irq(44));
+        let counts = [Arc::new(AtomicUsize::new(0)), Arc::new(AtomicUsize::new(0))];
+        for (vector, count) in [42, 43].into_iter().zip(&counts) {
+            let c = count.clone();
+            vectors
+                .register_handler(
+                    vector,
+                    Arc::new(move || {
+                        c.fetch_add(1, Ordering::SeqCst);
+                    }),
+                )
+                .unwrap();
+            vectors.unmask(vector).unwrap();
+        }
+        fire(&tx1, &seen1);
+        fire(&tx2, &seen2);
+        fire(&tx2, &seen2);
+        assert_eq!(counts[0].load(Ordering::SeqCst), 1);
+        assert_eq!(counts[1].load(Ordering::SeqCst), 2);
+        vectors.mask(43).unwrap();
+        fire(&tx2, &seen2);
+        fire(&tx1, &seen1);
+        assert_eq!(counts[0].load(Ordering::SeqCst), 2);
+        assert_eq!(counts[1].load(Ordering::SeqCst), 2);
+        assert!(vectors.unmask(44).is_err());
     }
 }

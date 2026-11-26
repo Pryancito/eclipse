@@ -4,10 +4,11 @@
 //! `platform` and `ports`; the GPU itself comes from the kernel
 //! (`udriver=nvidia@N` leaves it to userspace), claimed in `gpu`.
 //!
-//! - `udrv-nvidia [N]`: claim NVIDIA GPU `N` (0), bring the driver up on
-//!   it and keep it. Serving `/dev/dri` and `/dev/nvidia*` from it comes
-//!   in a later step; until then the kernel's driver is the one a boot
-//!   uses, and this is run by hand.
+//! - `udrv-nvidia [N]`: claim every NVIDIA GPU left to userspace (only
+//!   GPU `N` with `N`), bring the driver up on each and serve them: a
+//!   card per GPU in `/dev/dri`, and `/dev/nvidia*` for all of them, from
+//!   one RM. Until the kernel's driver goes, it is the one a boot uses,
+//!   and this is run by hand.
 //! - `udrv-nvidia check VVVV DDDD`: check this process's side of it on
 //!   any PCI function (`udriver=pci-VVVV-DDDD@0`), QEMU's standard VGA on
 //!   a machine with no NVIDIA GPU: the probe through the ports, the BARs
@@ -67,28 +68,49 @@ fn main() {
             };
             nvctl_check(hex(1), hex(2))
         }
-        n => run(n.and_then(|n| n.parse().ok()).unwrap_or(0)),
+        n => run(n.and_then(|n| n.parse().ok())),
     }
 }
 
-fn run(index: usize) {
-    let gpu = gpu::claim(gpu::Which::Nvidia(index)).unwrap_or_else(|e| fail(e));
-    gpu.install_dma().unwrap_or_else(|e| fail(e));
-    let mapper: std::sync::Arc<dyn IoMapper> = gpu.mapper();
-    let drv = zcore_drivers::display::NvidiaGpuDriverPci;
-    println!(
-        "{NAME}: {:04x}:{:04x} at {:02x}:{:02x}.{}",
-        gpu.dev.id.vendor_id, gpu.dev.id.device_id, gpu.loc.bus, gpu.loc.device, gpu.loc.function
-    );
-    let irq = gpu_irq(&gpu);
-    let card = match drv.init(&gpu.dev, &Some(mapper), irq) {
-        Ok(zcore_drivers::Device::DrmDisplay(card, _)) => card,
-        Ok(_) => fail(format!("{}: not a DRM card", drv.name())),
-        Err(e) => fail(format!("{}: {e:?}", drv.name())),
+/// Claim every NVIDIA GPU left to userspace (`udriver=nvidia@0,nvidia@1`,
+/// ...), or only GPU `only`, bring the driver up on each and serve them:
+/// one RM for all of them, as the kernel's driver is, so a buffer of one
+/// is any GPU's (P2P, UVM across GPUs), and a card per GPU.
+fn run(only: Option<usize>) {
+    let gpus = match only {
+        Some(index) => vec![gpu::claim(gpu::Which::Nvidia(index)).unwrap_or_else(|e| fail(e))],
+        None => gpu::claim_all(gpu::Which::Nvidia).unwrap_or_else(|e| fail(e)),
     };
-    println!("{NAME}: {} up, serving it", drv.name());
+    // Every GPU is claimed before any memory is made: a buffer reaches
+    // the GPUs whose initiators it is pinned in, which are those there are
+    // when it is made.
+    gpu::install_dma(&gpus).unwrap_or_else(|e| fail(e));
+    let drv = zcore_drivers::display::NvidiaGpuDriverPci;
+    let mut cards = Vec::new();
+    for gpu in &gpus {
+        let mapper: std::sync::Arc<dyn IoMapper> = gpu.mapper();
+        println!(
+            "{NAME}: {:04x}:{:04x} at {:02x}:{:02x}.{}",
+            gpu.dev.id.vendor_id,
+            gpu.dev.id.device_id,
+            gpu.loc.bus,
+            gpu.loc.device,
+            gpu.loc.function
+        );
+        let irq = gpu_irq(gpu);
+        match drv.init(&gpu.dev, &Some(mapper), irq) {
+            Ok(zcore_drivers::Device::DrmDisplay(card, _)) => cards.push(card),
+            Ok(_) => fail(format!("{}: not a DRM card", drv.name())),
+            Err(e) => fail(format!("{}: {e:?}", drv.name())),
+        }
+    }
+    println!(
+        "{NAME}: {} up on {} GPU(s), serving them",
+        drv.name(),
+        cards.len()
+    );
     // `/dev/nvidiactl`, on its own thread: its escapes wait in the RM, not
-    // behind the card's calls.
+    // behind the cards' calls. One for every GPU: the RM's.
     std::thread::spawn(|| {
         let rm = zcore_drivers::display::nvctl::remote::ThisRm;
         let hello = zcore_drivers::display::nvctl::remote::hello();
@@ -100,9 +122,17 @@ fn run(index: usize) {
             Err((_, e)) => eprintln!("{NAME}: {e}"),
         }
     });
-    match drm::serve(card) {
-        Ok(why) => fail(format!("the kernel let go of the card: {why}")),
-        Err(e) => fail(e),
+    // A card per GPU, each on its own thread, served in the order the
+    // kernel found them, so the first GPU's is the first card.
+    let mut served = Vec::new();
+    for card in cards {
+        served.push(std::thread::spawn(move || match drm::serve(card) {
+            Ok(why) => fail(format!("the kernel let go of a card: {why}")),
+            Err(e) => fail(e),
+        }));
+    }
+    for card in served {
+        let _ = card.join();
     }
 }
 
@@ -113,10 +143,14 @@ fn run(index: usize) {
 fn gpu_irq(gpu: &gpu::Gpu) -> Option<usize> {
     match (gpu.claim.interrupt, gpu.claim.irq) {
         (Some(interrupt), irq) if irq != u32::MAX => {
-            irq::install(irq::ClaimIrq::new(
+            let installed = irq::install(irq::ClaimIrq::new(
                 irq as usize + 32,
                 Box::new(move || udrivers::claim::interrupt_wait(interrupt)),
             ));
+            if !installed {
+                println!("{NAME}: irq {irq} is another GPU's already; this one's GSP boot runs without MSIs");
+                return None;
+            }
             Some(irq as usize)
         }
         _ => {
@@ -153,7 +187,12 @@ fn irq_check(args: &[String]) {
                 .unwrap_or_else(usage)
         })
         .collect();
-    let gpu = gpu::claim(gpu::Which::Pci { vendor, device }).unwrap_or_else(|e| fail(e));
+    let gpu = gpu::claim(gpu::Which::Pci {
+        vendor,
+        device,
+        index: 0,
+    })
+    .unwrap_or_else(|e| fail(e));
     let irq = gpu_irq(&gpu).unwrap_or_else(|| fail("the claim has no interrupt".into()));
     let count = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let c = count.clone();
@@ -207,8 +246,13 @@ fn nvctl_check(vendor: u16, device: u16) {
     };
     static RM: std::sync::OnceLock<nvctl::check::CheckRm> = std::sync::OnceLock::new();
     let rm = RM.get_or_init(Default::default);
-    let gpu = gpu::claim(gpu::Which::Pci { vendor, device }).unwrap_or_else(|e| fail(e));
-    gpu.install_dma().unwrap_or_else(|e| fail(e));
+    let gpu = gpu::claim(gpu::Which::Pci {
+        vendor,
+        device,
+        index: 0,
+    })
+    .unwrap_or_else(|e| fail(e));
+    gpu::install_dma(std::slice::from_ref(&gpu)).unwrap_or_else(|e| fail(e));
     let mapper = gpu.mapper();
     let bar = gpu
         .bars
@@ -808,58 +852,72 @@ fn check(vendor: u16, device: u16) {
             exit(1);
         }
     };
-    let gpu = gpu::claim(gpu::Which::Pci { vendor, device }).unwrap_or_else(|e| fail(e));
-    let dev = &gpu.dev;
-    ok(
-        "the probe through the ports finds the function",
-        dev.id.vendor_id == vendor && dev.id.device_id == device,
-    );
-    let config = |offset| gpu.pci.config_read(offset, 2).ok();
-    ok(
-        "...with the command register the kernel reads",
-        config(4).map(|c| c as u16) == Some(dev.command.bits()),
-    );
-    for bar in &gpu.bars {
-        let probed = match dev.bars[bar.index] {
-            Some(pci::BAR::Memory(addr, len, _, _)) => Some((addr as usize, len as usize)),
-            _ => None,
-        };
-        println!(
-            "{NAME}: bar {}: {:#x} {:#x} (probe {probed:x?})",
-            bar.index, bar.phys, bar.len
-        );
-        // The probe's length comes out of the `pci` crate 2 short, in the
-        // kernel as here.
-        ok(
-            "the probe sizes a BAR as the kernel did, without touching it",
-            probed
-                .is_some_and(|(addr, len)| addr == bar.phys && len.next_power_of_two() == bar.len),
-        );
-    }
-    let mapper = gpu.mapper();
-    let first = gpu
-        .bars
-        .first()
-        .copied()
-        .unwrap_or_else(|| fail("no BAR".into()));
-    let at = mapper.query_or_map(first.phys + 0x1000, 0x1000);
+    // Every function of that identity the kernel left to userspace, as
+    // `run` claims every GPU: two behind the ports and the DMA memory of
+    // both, with `udriver=pci-VVVV-DDDD@0,pci-VVVV-DDDD@1`.
+    let gpus = gpu::claim_all(|index| gpu::Which::Pci {
+        vendor,
+        device,
+        index,
+    })
+    .unwrap_or_else(|e| fail(e));
+    println!("{NAME}: {} function(s) claimed", gpus.len());
     extern "C" {
         fn drivers_phys_to_virt(paddr: usize) -> usize;
     }
-    // SAFETY: a lookup among the ranges registered.
-    let found = unsafe { drivers_phys_to_virt(first.phys + 0x1000) };
-    ok(
-        "a BAR is mapped and found again by phys_to_virt",
-        at.is_some() && at == Some(found),
-    );
-    // SAFETY: the BAR's second page, mapped above.
-    let back = unsafe {
-        let p = (found as *mut u32).add(3);
-        p.write_volatile(0x5eed_cafe);
-        p.read_volatile()
-    };
-    ok("its memory is reached", back == 0x5eed_cafe);
-    gpu.install_dma().unwrap_or_else(|e| fail(e));
+    for gpu in &gpus {
+        let dev = &gpu.dev;
+        ok(
+            "the probe through the ports finds the function",
+            dev.id.vendor_id == vendor && dev.id.device_id == device,
+        );
+        let config = |offset| gpu.pci.config_read(offset, 2).ok();
+        ok(
+            "...with the command register the kernel reads",
+            config(4).map(|c| c as u16) == Some(dev.command.bits()),
+        );
+        for bar in &gpu.bars {
+            let probed = match dev.bars[bar.index] {
+                Some(pci::BAR::Memory(addr, len, _, _)) => Some((addr as usize, len as usize)),
+                _ => None,
+            };
+            println!(
+                "{NAME}: bar {}: {:#x} {:#x} (probe {probed:x?})",
+                bar.index, bar.phys, bar.len
+            );
+            // The probe's length comes out of the `pci` crate 2 short, in the
+            // kernel as here.
+            ok(
+                "the probe sizes a BAR as the kernel did, without touching it",
+                probed.is_some_and(|(addr, len)| {
+                    addr == bar.phys && len.next_power_of_two() == bar.len
+                }),
+            );
+        }
+        let mapper = gpu.mapper();
+        let first = gpu
+            .bars
+            .first()
+            .copied()
+            .unwrap_or_else(|| fail("no BAR".into()));
+        let at = mapper.query_or_map(first.phys + 0x1000, 0x1000);
+        // SAFETY: a lookup among the ranges registered.
+        let found = unsafe { drivers_phys_to_virt(first.phys + 0x1000) };
+        ok(
+            "a BAR is mapped and found again by phys_to_virt",
+            at.is_some() && at == Some(found),
+        );
+        // SAFETY: the BAR's second page, mapped above.
+        let back = unsafe {
+            let p = (found as *mut u32).add(3);
+            p.write_volatile(0x5eed_cafe);
+            p.read_volatile()
+        };
+        ok("its memory is reached", back == 0x5eed_cafe);
+    }
+    let gpu = &gpus[0];
+    let first = gpu.bars[0];
+    gpu::install_dma(&gpus).unwrap_or_else(|e| fail(e));
     extern "C" {
         fn drivers_dma_alloc(pages: usize) -> usize;
     }
@@ -868,7 +926,7 @@ fn check(vendor: u16, device: u16) {
     // SAFETY: as above.
     let virt = unsafe { drivers_phys_to_virt(dma) };
     ok(
-        "DMA memory has a device address and a mapping",
+        "DMA memory has one device address for every function, and a mapping",
         dma != 0 && virt != 0,
     );
     // SAFETY: two pages just allocated, this process's.

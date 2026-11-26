@@ -4,8 +4,8 @@
 //!
 //! What the driver reaches through ports is, almost all of it, the PCI
 //! configuration mechanism: an address in 0xCF8, then the dword at
-//! 0xCFC. Here 0xCF8 is a latch, and a dword of the one function this
-//! process holds is read and written by the kernel for it ([`Space`]);
+//! 0xCFC. Here 0xCF8 is a latch, and a dword of a function this process
+//! holds (one per GPU) is read and written by the kernel for it ([`Space`]);
 //! every other function reads as absent (all ones, as a slot with nothing
 //! in it does) and its writes go nowhere. So a walk up to the GPU's root
 //! port finds nothing to change, which is what the driver, unchanged,
@@ -20,7 +20,7 @@
 //! Any other port (the VGA registers, say) reads as all ones and takes
 //! nothing; the first time each is touched it is logged.
 use std::collections::BTreeSet;
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Mutex, OnceLock, RwLock};
 
 /// Where the configuration mechanism's address goes, and its data.
 const CONFIG_ADDRESS: u32 = 0xcf8;
@@ -82,96 +82,123 @@ fn bars(raw: [u32; 6], len: [usize; 6]) -> [Bar; 6] {
     bars
 }
 
-/// The ports, for the function at `bus:device.function`.
-pub struct Ports {
+/// One function this process holds, at `bus:device.function`.
+struct Function {
     space: Box<dyn Space>,
     /// The function's address as 0xCF8 carries it (bits 23:8).
     place: u32,
-    state: Mutex<State>,
+    bars: Mutex<[Bar; 6]>,
 }
 
-struct State {
-    address: u32,
-    bars: [Bar; 6],
+/// The ports: the configuration mechanism's latch, and every function
+/// this process holds behind it, one per GPU.
+pub struct Ports {
+    address: Mutex<u32>,
+    functions: RwLock<Vec<Function>>,
     /// Ports and refused registers already logged.
-    told: BTreeSet<u32>,
+    told: Mutex<BTreeSet<u32>>,
+}
+
+/// 0xCF8's bits 23:8 for `bus:device.function`.
+fn place_bits((bus, device, function): (u8, u8, u8)) -> u32 {
+    (bus as u32) << 16 | (device as u32 & 0x1f) << 11 | (function as u32 & 7) << 8
 }
 
 impl Ports {
+    /// The ports, with the one function at `place` behind them.
     pub fn new(space: Box<dyn Space>, place: (u8, u8, u8), bar_len: [usize; 6]) -> Ports {
+        let ports = Ports {
+            address: Mutex::new(0),
+            functions: RwLock::new(Vec::new()),
+            told: Mutex::new(BTreeSet::new()),
+        };
+        ports.add(space, place, bar_len);
+        ports
+    }
+
+    /// Another function behind the same ports, at `place`. Refused when
+    /// one is already there.
+    pub fn add(&self, space: Box<dyn Space>, place: (u8, u8, u8), bar_len: [usize; 6]) -> bool {
+        let place = place_bits(place);
+        let mut functions = self.functions.write().unwrap();
+        if functions.iter().any(|f| f.place == place) {
+            return false;
+        }
         let mut raw = [0u32; 6];
         for (i, r) in raw.iter_mut().enumerate() {
             *r = space.read(0x10 + 4 * i as u8, 4).unwrap_or(0);
         }
-        let (bus, device, function) = place;
-        Ports {
+        functions.push(Function {
             space,
-            place: (bus as u32) << 16 | (device as u32 & 0x1f) << 11 | (function as u32 & 7) << 8,
-            state: Mutex::new(State {
-                address: 0,
-                bars: bars(raw, bar_len),
-                told: BTreeSet::new(),
-            }),
-        }
+            place,
+            bars: Mutex::new(bars(raw, bar_len)),
+        });
+        true
     }
 
-    /// The configuration register `offset` names, when the latch names
-    /// this process's function.
-    fn ours(&self, address: u32, port: u32) -> Option<u8> {
-        (address & ENABLE != 0 && address & 0x00ff_ff00 == self.place)
-            .then_some((address & 0xfc) as u8 + (port - CONFIG_DATA) as u8)
+    /// The function the latch names, and the configuration register
+    /// `port` reaches in it.
+    fn ours(&self, port: u32) -> Option<(usize, u8)> {
+        let address = *self.address.lock().unwrap();
+        if address & ENABLE == 0 {
+            return None;
+        }
+        let at = self
+            .functions
+            .read()
+            .unwrap()
+            .iter()
+            .position(|f| f.place == address & 0x00ff_ff00)?;
+        Some((at, (address & 0xfc) as u8 + (port - CONFIG_DATA) as u8))
     }
 
     pub fn read(&self, port: u32, width: u8) -> u32 {
         let ones = ones(width);
-        let mut state = self.state.lock().unwrap();
         if port == CONFIG_ADDRESS && width == 4 {
-            return state.address;
+            return *self.address.lock().unwrap();
         }
         if !(CONFIG_DATA..CONFIG_DATA + 4).contains(&port) {
-            tell(&mut state, port, || {
-                format!("port {port:#x} read: not here")
-            });
+            self.tell(port, || format!("port {port:#x} read: not here"));
             return ones;
         }
-        let Some(offset) = self.ours(state.address, port) else {
+        let Some((at, offset)) = self.ours(port) else {
             return ones;
         };
+        let functions = self.functions.read().unwrap();
+        let function = &functions[at];
         if BARS.contains(&offset) {
             let i = (offset - BARS.start) as usize / 4;
             let shift = (offset % 4) * 8;
-            return state.bars[i].value >> shift & ones;
+            return function.bars.lock().unwrap()[i].value >> shift & ones;
         }
-        drop(state);
-        self.space.read(offset, width).unwrap_or(ones)
+        function.space.read(offset, width).unwrap_or(ones)
     }
 
     pub fn write(&self, port: u32, width: u8, value: u32) {
-        let mut state = self.state.lock().unwrap();
         if port == CONFIG_ADDRESS && width == 4 {
-            state.address = value;
+            *self.address.lock().unwrap() = value;
             return;
         }
         if !(CONFIG_DATA..CONFIG_DATA + 4).contains(&port) {
-            tell(&mut state, port, || {
-                format!("port {port:#x} write: not here")
-            });
+            self.tell(port, || format!("port {port:#x} write: not here"));
             return;
         }
-        let Some(offset) = self.ours(state.address, port) else {
+        let Some((at, offset)) = self.ours(port) else {
             return;
         };
+        let functions = self.functions.read().unwrap();
+        let function = &functions[at];
         if BARS.contains(&offset) {
             let i = (offset - BARS.start) as usize / 4;
             let shift = (offset % 4) * 8;
             let lanes = ones(width) << shift;
-            let bar = &mut state.bars[i];
+            let bar = &mut function.bars.lock().unwrap()[i];
             let written = (bar.value & !lanes) | (value << shift & lanes);
             bar.value = (written & bar.mask) | (bar.value & !bar.mask);
             return;
         }
-        drop(state);
-        match self.space.write(offset, width, value) {
+        let space = &function.space;
+        match space.write(offset, width, value) {
             Ok(()) => {}
             // A wide write over a register the kernel keeps (a dword at
             // 0x0C covers the header type): the bytes that change go one
@@ -180,9 +207,7 @@ impl Ports {
                 for k in 0..width {
                     let byte = value >> (8 * k) & 0xff;
                     let at = offset + k;
-                    if self.space.read(at, 1) != Some(byte)
-                        && self.space.write(at, 1, byte).is_err()
-                    {
+                    if space.read(at, 1) != Some(byte) && space.write(at, 1, byte).is_err() {
                         self.refused(at);
                     }
                 }
@@ -192,10 +217,15 @@ impl Ports {
     }
 
     fn refused(&self, offset: u8) {
-        let mut state = self.state.lock().unwrap();
-        tell(&mut state, 0x1_0000 | offset as u32, || {
+        self.tell(0x1_0000 | offset as u32, || {
             format!("config write at {offset:#x} refused")
         });
+    }
+
+    fn tell(&self, key: u32, what: impl FnOnce() -> String) {
+        if self.told.lock().unwrap().insert(key) {
+            eprintln!("udrv-nvidia: {}", what());
+        }
     }
 }
 
@@ -207,17 +237,18 @@ fn ones(width: u8) -> u32 {
     }
 }
 
-fn tell(state: &mut State, key: u32, what: impl FnOnce() -> String) {
-    if state.told.insert(key) {
-        eprintln!("udrv-nvidia: {}", what());
-    }
-}
-
 static PORTS: OnceLock<Ports> = OnceLock::new();
 
-/// Answer the driver's ports with `ports` from now on. Only once.
-pub fn install(ports: Ports) -> Result<(), ()> {
-    PORTS.set(ports).map_err(|_| ())
+/// Answer the driver's ports for the function at `place` with `space`
+/// from now on, beside those already there. Refused for a place already
+/// taken.
+pub fn install(space: Box<dyn Space>, place: (u8, u8, u8), bar_len: [usize; 6]) -> Result<(), ()> {
+    let mut space = Some(space);
+    let ports = PORTS.get_or_init(|| Ports::new(space.take().unwrap(), place, bar_len));
+    match space {
+        None => Ok(()),
+        Some(space) => ports.add(space, place, bar_len).then_some(()).ok_or(()),
+    }
 }
 
 #[no_mangle]
@@ -409,5 +440,42 @@ mod tests {
         // The latch disabled: nothing.
         ports.write(CONFIG_ADDRESS, 4, 1 << 16);
         assert_eq!(ports.read(CONFIG_DATA, 4), 0xffff_ffff);
+    }
+
+    #[test]
+    fn two_gpus_behind_the_same_ports_each_answer_for_itself() {
+        let (ports, one) = gpu();
+        let other = Arc::new(Mutex::new(*one.lock().unwrap()));
+        other.lock().unwrap()[2] = 0x8a; // device 1e8a
+        let fake = |bytes: &Arc<Mutex<[u8; 256]>>| {
+            Box::new(Fake {
+                bytes: bytes.clone(),
+            })
+        };
+        let lens = [16 << 20, 256 << 20, 0, 32 << 20, 0, 0];
+        assert!(ports.add(fake(&other), (2, 0, 0), lens));
+        assert!(
+            !ports.add(fake(&other), (1, 0, 0), lens),
+            "01:00.0 is taken"
+        );
+        let second = Location {
+            bus: 2,
+            device: 0,
+            function: 0,
+        };
+        let ops = Through(&ports);
+        let am = CSpaceAccessMethod::IO;
+        // SAFETY: every port goes to `ports`.
+        unsafe {
+            assert_eq!(am.read32(&ops, GPU, 0) >> 16, 0x1e89);
+            assert_eq!(am.read32(&ops, second, 0) >> 16, 0x1e8a);
+            // Sizing one GPU's BAR leaves the other's as it was.
+            am.write32(&ops, second, 0x10, !0);
+            assert_eq!(am.read32(&ops, second, 0x10), 0xff00_0000);
+            assert_eq!(am.read32(&ops, GPU, 0x10), 0xf600_0000);
+            am.write32(&ops, second, 0x04, 0x0010_0002);
+        }
+        assert_eq!(other.lock().unwrap()[4], 2);
+        assert_eq!(one.lock().unwrap()[4], 7);
     }
 }
