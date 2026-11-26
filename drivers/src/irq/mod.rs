@@ -15,6 +15,10 @@ pub mod rp1;
 /// que la placa.
 pub mod bcm2712_mip;
 
+/// Interrupt remapping: the remappable form of an MSI or a redirection
+/// entry, when an IOMMU remaps interrupts.
+pub mod remap;
+
 cfg_if::cfg_if! {
     if #[cfg(any(target_arch = "riscv32", target_arch = "riscv64"))] {
         mod riscv_intc;

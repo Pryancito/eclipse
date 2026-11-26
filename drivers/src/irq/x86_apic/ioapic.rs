@@ -147,6 +147,8 @@ impl AcpiHandler for AcpiMapHandler {
 pub struct IoApic {
     /// I/O APIC id.
     id: u8,
+    /// Its id in the MADT, which the IOMMU's table names it by.
+    acpi_id: u8,
     /// GSI means Global System Interrupt, `gsi_start` is the base number of GSI
     /// in this I/O APIC.
     gsi_start: u32,
@@ -154,6 +156,9 @@ pub struct IoApic {
     max_entry: u8,
     /// Use `x2apic` crate to help us manipulate IOAPIC.
     inner: Mutex<IoApicInner>,
+    /// Where its two registers (select, window) are mapped: for the
+    /// remappable entries the crate cannot write.
+    base: usize,
 }
 
 /// A list of I/O-APICs for systems have multiple I/O subsystems.
@@ -245,9 +250,11 @@ impl IoApic {
         }
         Some(Self {
             id: effective_id,
+            acpi_id: id,
             gsi_start,
             max_entry,
             inner: Mutex::new(inner),
+            base: base_vaddr,
         })
     }
 
@@ -291,6 +298,45 @@ impl IoApic {
             entry.set_vector(vector);
             inner.set_table_entry(idx, entry);
         }
+        self.remap(&mut inner, idx);
+    }
+
+    /// With interrupts remapped (`irq::remap`), rewrite entry `idx` in the
+    /// remappable format, keeping its vector, trigger mode, polarity and
+    /// mask: a compatibility-format entry would be dropped by the IOMMU.
+    fn remap(&self, inner: &mut IoApicInner, idx: u8) {
+        let Some(r) = crate::irq::remap::remapper() else {
+            return;
+        };
+        let entry = unsafe { inner.table_entry(idx) };
+        let vector = entry.vector();
+        if vector == 0 {
+            return;
+        }
+        let flags = entry.flags();
+        let Some((lo, hi)) = r.ioapic(
+            self.acpi_id,
+            vector,
+            flags.contains(IrqFlags::LEVEL_TRIGGERED),
+            flags.contains(IrqFlags::LOW_ACTIVE),
+        ) else {
+            return;
+        };
+        let masked = flags.bits() & IrqFlags::MASKED.bits();
+        let select = self.base as *mut u32;
+        let window = (self.base + 0x10) as *mut u32;
+        let (lo_reg, hi_reg) = (0x10 + 2 * idx as u32, 0x11 + 2 * idx as u32);
+        // SAFETY: the I/O APIC's register window, mapped by whoever built
+        // it, under the same lock as every other access. Masked first, so
+        // the line never fires half-written.
+        unsafe {
+            select.write_volatile(lo_reg);
+            window.write_volatile(lo | IrqFlags::MASKED.bits());
+            select.write_volatile(hi_reg);
+            window.write_volatile(hi);
+            select.write_volatile(lo_reg);
+            window.write_volatile(lo | masked);
+        }
     }
 
     /// Set the interrupt trigger mode, polarity and destination of the `gsi` in
@@ -305,6 +351,7 @@ impl IoApic {
         let mut entry = unsafe { inner.table_entry(idx) };
         program_entry(&mut entry, tm, pol, dest);
         unsafe { inner.set_table_entry(idx, entry) };
+        self.remap(&mut inner, idx);
     }
 }
 

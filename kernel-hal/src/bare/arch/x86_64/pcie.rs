@@ -124,3 +124,45 @@ pub(super) fn isolate(r: PciRequester) {
         }
     }
 }
+
+/// Legacy capability list pointer, and the PCI Express capability id.
+const CAP_PTR: u16 = 0x34;
+const CAP_PCIE: u8 = 0x10;
+/// Device/port type of a PCI Express to PCI/PCI-X bridge.
+const TYPE_PCIE_TO_PCI: u8 = 0x7;
+
+/// The PCI Express device/port type of a function, or `None` when it has
+/// no PCI Express capability (a conventional PCI function).
+fn pcie_type(bus: u8, dev: u8, func: u8) -> Option<u8> {
+    let mut at = cfg_read(bus, dev, func, CAP_PTR) & !3;
+    for _ in 0..48 {
+        if at < 0x40 {
+            return None;
+        }
+        if cfg_read(bus, dev, func, at as u16) == CAP_PCIE {
+            return Some(cfg_read(bus, dev, func, at as u16 + 2) >> 4);
+        }
+        at = cfg_read(bus, dev, func, at as u16 + 1) & !3;
+    }
+    None
+}
+
+/// When a function on `bus` sits behind a conventional PCI bridge (a PCI
+/// Express to PCI one, or a plain PCI-to-PCI bridge), its requests reach
+/// the IOMMU carrying an id of that bridge's secondary side rather than its
+/// own: the buses, inclusive, they may carry, from the topmost such bridge.
+/// `None` when every bridge above is PCI Express, and its own id is seen.
+pub(super) fn conventional_bridge_above(bus: u8) -> Option<(u8, u8)> {
+    ports_above(bus).into_iter().find_map(|(b, d, f)| {
+        let conventional = match pcie_type(b, d, f) {
+            None => true,
+            Some(t) => t == TYPE_PCIE_TO_PCI,
+        };
+        conventional.then(|| {
+            (
+                cfg_read(b, d, f, SECONDARY_BUS),
+                cfg_read(b, d, f, SUBORDINATE_BUS),
+            )
+        })
+    })
+}

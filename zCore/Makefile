@@ -504,8 +504,12 @@ qemu_opts += -no-reboot
 # IOMMU=amd: the AMD one (QEMU `amd-iommu`, interrupt remapping off).
 # IOMMU=amd-ir: the same with interrupt remapping on, so that a claimed
 # device's interrupts go through the table the kernel gives it.
+# IOMMU=intel-ir: the Intel one with interrupt remapping on (xAPIC ids, no
+# x2APIC), which the kernel then uses for every interrupt.
 ifeq ($(IOMMU),intel)
   qemu_opts := -device intel-iommu $(qemu_opts)
+else ifeq ($(IOMMU),intel-ir)
+  qemu_opts := -device intel-iommu,intremap=on,eim=off $(qemu_opts)
 else ifeq ($(IOMMU),amd)
   qemu_opts := -device amd-iommu,intremap=off $(qemu_opts)
 else ifeq ($(IOMMU),amd-ir)

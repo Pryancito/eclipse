@@ -178,7 +178,9 @@ Para quitarlo, usa QUITAR DRIVER en el panel o
   DMA son físicas. En un PC con VT-d o AMD-Vi, el núcleo la enciende por
   defecto y tu dispositivo solo alcanza lo que fijaste con `Dma::new`; una
   escritura fuera de eso falla y aparece en `dmesg` como `iommu: DMA
-  fault`. Sin IOMMU (otras arquitecturas, máquinas sin ella, o arrancando
+  fault`. Sus interrupciones pasan por ella también: tu dispositivo solo
+  puede lanzar la suya (`iommu=noir` deja solo esa parte apagada). Sin
+  IOMMU (otras arquitecturas, máquinas sin ella, o arrancando
   con `iommu=off`), un driver con fallos puede escribir en cualquier parte
   de la memoria. El panel lo avisa al instalar. Prueba en una máquina que
   puedas reiniciar.

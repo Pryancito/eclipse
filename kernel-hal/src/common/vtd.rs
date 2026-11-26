@@ -30,8 +30,11 @@ pub enum ScopeKind {
     Endpoint,
     /// A bridge and every function behind it.
     Bridge,
-    /// An I/O APIC, an HPET, an ACPI namespace device: not a DMA requester
-    /// a driver in a process can hold.
+    /// The I/O APIC with this id (the MADT's): the requester id its
+    /// interrupts carry.
+    IoApic(u8),
+    /// An HPET, an ACPI namespace device: not a DMA requester a driver in a
+    /// process can hold.
     Other,
 }
 
@@ -100,6 +103,7 @@ fn scopes(mut bytes: &[u8]) -> Vec<Scope> {
         let kind = match bytes[0] {
             1 => ScopeKind::Endpoint,
             2 => ScopeKind::Bridge,
+            3 => ScopeKind::IoApic(bytes[4]),
             _ => ScopeKind::Other,
         };
         let path = bytes[6..len]
@@ -181,19 +185,10 @@ impl Scope {
     /// scope with no path, one that is not a DMA requester, or a bridge on
     /// the way that answers bus 0 (nothing behind it was numbered).
     pub fn resolve(&self, cfg: impl Fn(u8, u8, u8, u16) -> u8) -> Option<Target> {
-        if self.kind == ScopeKind::Other {
-            return None;
-        }
-        let (&last, hops) = self.path.split_last()?;
-        let mut bus = self.start_bus;
-        for &(dev, func) in hops {
-            let next = cfg(bus, dev, func, SECONDARY_BUS);
-            if next == 0 || next <= bus {
-                return None;
-            }
-            bus = next;
-        }
-        let (dev, func) = last;
+        let (bus, dev, func) = match self.kind {
+            ScopeKind::Endpoint | ScopeKind::Bridge => self.walk(&cfg)?,
+            ScopeKind::IoApic(_) | ScopeKind::Other => return None,
+        };
         match self.kind {
             ScopeKind::Endpoint => Some(Target::Function(bus, dev, func)),
             ScopeKind::Bridge => {
@@ -203,8 +198,22 @@ impl Scope {
                 );
                 (sec != 0 && sub >= sec).then_some(Target::Buses(sec, sub))
             }
-            ScopeKind::Other => None,
+            ScopeKind::IoApic(_) | ScopeKind::Other => None,
         }
+    }
+
+    /// The function at the end of the path, through the bridges on the way.
+    fn walk(&self, cfg: &impl Fn(u8, u8, u8, u16) -> u8) -> Option<(u8, u8, u8)> {
+        let (&(dev, func), hops) = self.path.split_last()?;
+        let mut bus = self.start_bus;
+        for &(d, f) in hops {
+            let next = cfg(bus, d, f, SECONDARY_BUS);
+            if next == 0 || next <= bus {
+                return None;
+            }
+            bus = next;
+        }
+        Some((bus, dev, func))
     }
 
     /// Whether this scope covers `(bus, device, function)`.
@@ -218,6 +227,18 @@ impl Scope {
 }
 
 impl Dmar {
+    /// The requester id the interrupts of the I/O APIC `id` carry, from the
+    /// unit scope that names it. `None` when no unit names it.
+    pub fn ioapic_source(&self, id: u8, cfg: impl Fn(u8, u8, u8, u16) -> u8) -> Option<u16> {
+        let (bus, dev, func) = self
+            .units
+            .iter()
+            .flat_map(|u| &u.scopes)
+            .find(|s| s.kind == ScopeKind::IoApic(id))?
+            .walk(&cfg)?;
+        Some((bus as u16) << 8 | (dev as u16) << 3 | func as u16)
+    }
+
     /// The index of the unit that translates `(segment, bus, dev, func)`: the
     /// one whose scopes name it, else the segment's include-all unit.
     pub fn unit_for(
@@ -277,6 +298,13 @@ pub mod reg {
     pub const CCMD: usize = 0x28;
     pub const FSTS: usize = 0x34;
     pub const FECTL: usize = 0x38;
+    /// Invalidation queue head, tail and address; completion status.
+    pub const IQH: usize = 0x80;
+    pub const IQT: usize = 0x88;
+    pub const IQA: usize = 0x90;
+    pub const ICS: usize = 0x9c;
+    /// Interrupt remapping table address.
+    pub const IRTA: usize = 0xb8;
 }
 
 /// Global command / status bits (GCMD sets, GSTS reports, same positions).
@@ -286,6 +314,8 @@ pub mod gcmd {
     pub const WBF: u32 = 1 << 27;
     pub const QIE: u32 = 1 << 26;
     pub const IRE: u32 = 1 << 25;
+    /// Set interrupt remap table pointer (one-shot, IRTPS in GSTS).
+    pub const SIRTP: u32 = 1 << 24;
     pub const CFI: u32 = 1 << 23;
     /// The status bits that are states rather than one-shot commands: a
     /// write to GCMD must carry them, or it turns them off.
@@ -349,6 +379,10 @@ impl Caps {
     pub fn queued_invalidation(&self) -> bool {
         self.ecap & (1 << 1) != 0
     }
+    /// Interrupt remapping.
+    pub fn interrupt_remapping(&self) -> bool {
+        self.ecap & (1 << 3) != 0
+    }
     /// Pass-through context entries.
     pub fn pass_through(&self) -> bool {
         self.ecap & (1 << 6) != 0
@@ -383,6 +417,100 @@ pub const IOTLB_GLOBAL: u64 = 1 << 63 | 1 << 60 | 1 << 49 | 1 << 48;
 /// IOTLB register: invalidate one domain, draining reads and writes.
 pub fn iotlb_domain(did: u16) -> u64 {
     1 << 63 | 2 << 60 | 1 << 49 | 1 << 48 | (did as u64) << 32
+}
+
+/// Invalidation queue descriptors (128-bit, low qword first), VT-d 3.x §6.5.2.
+pub mod qi {
+    use crate::PhysAddr;
+
+    /// The context cache, all of it.
+    pub fn context_global() -> [u64; 2] {
+        [1 | 1 << 4, 0]
+    }
+    /// The IOTLB, all of it, draining reads and writes.
+    pub fn iotlb_global() -> [u64; 2] {
+        [2 | 1 << 4 | 1 << 6 | 1 << 7, 0]
+    }
+    /// The IOTLB entries of domain `did`, draining reads and writes.
+    pub fn iotlb_domain(did: u16) -> [u64; 2] {
+        [2 | 2 << 4 | 1 << 6 | 1 << 7 | (did as u64) << 16, 0]
+    }
+    /// The interrupt entry cache, all of it.
+    pub fn iec_global() -> [u64; 2] {
+        [4, 0]
+    }
+    /// Once everything before it is done, store `data` at `status`.
+    pub fn wait(status: PhysAddr, data: u32) -> [u64; 2] {
+        [5 | 1 << 5 | (data as u64) << 32, status as u64 & !3]
+    }
+    /// The queue address register: one 4 KiB page, 256 descriptors.
+    pub fn queue_register(base: PhysAddr) -> u64 {
+        base as u64 & !0xfff
+    }
+    /// A tail (or head) register value for descriptor `index`.
+    pub fn tail(index: usize) -> u64 {
+        (index as u64) << 4
+    }
+    /// Descriptors in the queue.
+    pub const ENTRIES: usize = 256;
+}
+
+/// Interrupt remapping (VT-d §5, §9.10). A handle picks an entry of the
+/// table; the kernel uses each vector as its own handle, so one table of
+/// 256 entries (4 KiB) holds every interrupt the machine has.
+pub mod ir {
+    use crate::PhysAddr;
+
+    pub const ENTRIES: usize = 256;
+    /// IRTA size field: 2^(S+1) entries.
+    const SIZE: u64 = 7;
+
+    /// The IRTA register value for the table at `table`, xAPIC mode.
+    pub fn table_register(table: PhysAddr) -> u64 {
+        (table as u64 & !0xfff) | SIZE
+    }
+
+    /// What a remapping entry checks of the requester that raises it.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub enum Source {
+        /// Nothing: anyone may raise it.
+        Any,
+        /// Exactly this requester id.
+        Requester(u16),
+        /// Any requester on these buses, inclusive (a device behind a
+        /// PCIe-to-PCI bridge, whose requests carry the bridge's id).
+        Buses(u8, u8),
+    }
+
+    /// A remapping entry: fixed delivery of `vector` to the APIC `dest`,
+    /// physical mode, edge unless `level`.
+    pub fn entry(vector: u8, dest: u8, level: bool, source: Source) -> [u64; 2] {
+        let lo = 1 | (level as u64) << 4 | (vector as u64) << 16 | (dest as u64) << 40;
+        let hi = match source {
+            Source::Any => 0,
+            Source::Requester(sid) => sid as u64 | 1 << 18,
+            Source::Buses(first, last) => ((first as u64) << 8 | last as u64) | 2 << 18,
+        };
+        [lo, hi]
+    }
+
+    /// The MSI address a device uses to raise the entry `handle`, in
+    /// remappable format (subhandle off: the data is 0).
+    pub fn msi_address(handle: u16) -> u64 {
+        0xfee0_0000 | ((handle & 0x7fff) as u64) << 5 | 1 << 4 | ((handle >> 15) as u64 & 1) << 2
+    }
+
+    /// An I/O APIC redirection entry, as (low, high) dwords, in remappable
+    /// format: `vector` must match the entry's for level EOIs. Unmasked;
+    /// the caller keeps its own mask bit.
+    pub fn ioapic_entry(handle: u16, vector: u8, level: bool, active_low: bool) -> (u32, u32) {
+        let lo = vector as u32
+            | ((handle >> 15) as u32 & 1) << 11
+            | (active_low as u32) << 13
+            | (level as u32) << 15;
+        let hi = 1 << 16 | ((handle & 0x7fff) as u32) << 17;
+        (lo, hi)
+    }
 }
 
 /// One fault record, as a unit logs it.
@@ -521,6 +649,44 @@ pub fn translate(
 }
 
 #[cfg(test)]
+mod ir_tests {
+    use super::*;
+
+    #[test]
+    fn remapping_entries_and_messages_are_laid_out_as_the_spec_says() {
+        let e = ir::entry(0x41, 3, false, ir::Source::Requester(0x0010));
+        assert_eq!(e, [1 | 0x41 << 16 | 3 << 40, 0x10 | 1 << 18]);
+        let e = ir::entry(0x30, 0, true, ir::Source::Buses(2, 4));
+        assert_eq!(e, [1 | 1 << 4 | 0x30 << 16, 0x0204 | 2 << 18]);
+        assert_eq!(ir::entry(0x22, 1, false, ir::Source::Any)[1], 0);
+        assert_eq!(ir::msi_address(0x41), 0xfee0_0000 | 0x41 << 5 | 1 << 4);
+        assert_eq!(
+            ir::msi_address(0x8001),
+            0xfee0_0000 | 1 << 5 | 1 << 4 | 1 << 2
+        );
+        let (lo, hi) = ir::ioapic_entry(0x23, 0x23, true, true);
+        assert_eq!(lo, 0x23 | 1 << 13 | 1 << 15);
+        assert_eq!(hi, 1 << 16 | 0x23 << 17);
+        assert_eq!(ir::table_register(0x1234_5000), 0x1234_5007);
+    }
+
+    #[test]
+    fn invalidation_descriptors_are_laid_out_as_the_spec_says() {
+        assert_eq!(qi::context_global(), [0x11, 0]);
+        assert_eq!(qi::iotlb_global(), [0xd2, 0]);
+        assert_eq!(qi::iotlb_domain(5), [0xe2 | 5 << 16, 0]);
+        assert_eq!(qi::iec_global(), [4, 0]);
+        assert_eq!(qi::wait(0x1003, 7), [0x25 | 7 << 32, 0x1000]);
+        assert_eq!(qi::tail(3), 0x30);
+        let c = Caps {
+            cap: 0,
+            ecap: 0b1010,
+        };
+        assert!(c.interrupt_remapping() && c.queued_invalidation());
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use alloc::{collections::BTreeMap, vec};
@@ -656,6 +822,25 @@ mod tests {
         assert!(!br.covers(5, 0, 0, cfg));
         // An unnumbered bridge on the way: nothing.
         assert_eq!(ep.resolve(no_bridges), None);
+    }
+
+    #[test]
+    fn an_ioapic_scope_gives_the_source_of_its_interrupts() {
+        // Type 3, length 8, enumeration id 2, bus 0xf0, path 1f.0.
+        let parsed = scopes(&[3, 8, 0, 0, 2, 0xf0, 0x1f, 0]);
+        assert_eq!(parsed[0].kind, ScopeKind::IoApic(2));
+        assert_eq!(parsed[0].resolve(no_bridges), None);
+        let dmar = Dmar {
+            units: vec![Drhd {
+                segment: 0,
+                base: 0xfed90000,
+                include_all: true,
+                scopes: parsed,
+            }],
+            ..Dmar::default()
+        };
+        assert_eq!(dmar.ioapic_source(2, no_bridges), Some(0xf0f8));
+        assert_eq!(dmar.ioapic_source(0, no_bridges), None);
     }
 
     #[test]
