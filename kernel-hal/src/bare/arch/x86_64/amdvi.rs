@@ -466,16 +466,20 @@ pub(super) fn init() {
         );
         return;
     }
+    let noir = crate::cmdline::value(KCONFIG.cmdline, "iommu") == Some("noir");
     let mut units = Vec::new();
     for (i, ivhd) in ivrs.units.iter().enumerate() {
-        match bring_up(i, ivhd.base, ivhd.ioapic) {
+        let remaps = ivhd.ioapic && !noir;
+        match bring_up(i, ivhd.base, remaps) {
             Ok(unit) => {
                 crate::klog_info!(
                     "iommu: amd-vi unit {i} at {:#x}: 4 levels, 48 address bits, {} device ranges{}",
                     ivhd.base,
                     ivhd.devices.len(),
-                    if ivhd.ioapic {
+                    if remaps {
                         ", interrupts remapped per claimed device"
+                    } else if noir {
+                        ", no interrupt remapping (iommu=noir)"
                     } else {
                         ", no interrupt remapping (the IVRS names no IOAPIC)"
                     }

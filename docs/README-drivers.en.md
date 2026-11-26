@@ -175,7 +175,8 @@ To remove it, use REMOVE DRIVER in the panel or
   addresses are physical. On a PC with VT-d or AMD-Vi the kernel turns it
   on by default and your device reaches only what you pinned with
   `Dma::new`; a write outside it fails and shows in `dmesg` as `iommu: DMA
-  fault`. Without an IOMMU (other architectures, machines without one, or
+  fault`. Its interrupts go through it too: your device can raise only
+  its own (`iommu=noir` turns just that part off). Without an IOMMU (other architectures, machines without one, or
   a boot with `iommu=off`) a buggy driver can write anywhere in memory.
   The panel warns about this on install. Test on a machine you can
   restart.

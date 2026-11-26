@@ -251,18 +251,14 @@ pub unsafe fn arm_first_vector_sin_escotilla<T: PortOps, B: BarInfo>(
         (cap.table_offset as usize) + cap.table_size * super::ENTRY_SIZE,
     );
     let tabla = unsafe { MsixTable::new(va + cap.table_offset as usize, cap.table_size) };
-    if unsafe {
-        super::arm(
-            ops,
-            am,
-            loc,
-            &cap,
-            &tabla,
-            0,
-            lapic_msg_addr(dest),
-            irq + 32,
-        )
-    } {
+    // The LAPIC window and the vector, or with interrupts remapped the
+    // IOMMU's entry for it (`irq::remap`).
+    let message = crate::irq::remap::msi_message(
+        crate::irq::remap::rid(loc.bus, loc.device, loc.function),
+        dest,
+        irq + 32,
+    );
+    if unsafe { super::arm(ops, am, loc, &cap, &tabla, 0, message.0, message.1) } {
         let entrada = tabla.read_back(0).ok_or(NoHubo::SinVector)?;
         Ok(Armado { cap, entrada })
     } else {

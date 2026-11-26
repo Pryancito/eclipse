@@ -12,7 +12,7 @@
 
 use alloc::{sync::Arc, vec::Vec};
 use core::ptr::{read_volatile, write_volatile};
-use core::sync::atomic::{AtomicU64, Ordering};
+use core::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
 use acpi::sdt::Signature;
 use lock::Mutex;
@@ -101,6 +101,19 @@ struct Unit {
     /// Domain ids in use (beyond the pass-through one).
     dids: Mutex<Vec<u16>>,
     faults: AtomicU64,
+    /// The invalidation queue, once turned on: from then on every
+    /// invalidation goes through it (the registers may not be used).
+    queue: Option<Queue>,
+}
+
+/// An invalidation queue: 256 descriptors, and the word wait descriptors
+/// store to.
+struct Queue {
+    ring: PhysFrame,
+    status: PhysFrame,
+    /// The next free slot, and everything that writes the ring.
+    tail: Mutex<usize>,
+    stamp: AtomicU32,
 }
 
 impl Unit {
@@ -141,8 +154,44 @@ impl Unit {
         }
     }
 
+    /// Run `descs` through the invalidation queue, followed by a wait, and
+    /// return once the unit has done them all.
+    fn submit(&self, descs: &[[u64; 2]]) {
+        let Some(q) = &self.queue else {
+            return;
+        };
+        let mut tail = q.tail.lock();
+        let stamp = q.stamp.fetch_add(1, Ordering::Relaxed).wrapping_add(1);
+        let ring = phys_to_virt(q.ring.paddr()) as *mut u64;
+        let wait = vtd::qi::wait(q.status.paddr(), stamp);
+        for d in descs.iter().chain(core::iter::once(&wait)) {
+            // SAFETY: a slot of the queue's page, 16-byte descriptors.
+            unsafe {
+                write_volatile(ring.add(*tail * 2), d[0]);
+                write_volatile(ring.add(*tail * 2 + 1), d[1]);
+            }
+            *tail = (*tail + 1) % vtd::qi::ENTRIES;
+        }
+        if !self.caps.coherent() {
+            flush_lines(q.ring.paddr(), PAGE_SIZE);
+        }
+        self.w64(reg::IQT, vtd::qi::tail(*tail));
+        let word = phys_to_virt(q.status.paddr()) as *const u32;
+        // SAFETY: the status frame, which the unit writes.
+        if !(0..SPINS).any(|_| unsafe { read_volatile(word) } == stamp) {
+            crate::klog_err!(
+                "iommu: vt-d unit {}: an invalidation never completed (fault status {:#x})",
+                self.index,
+                self.r32(reg::FSTS)
+            );
+        }
+    }
+
     /// Invalidate the context cache with `cmd`, and wait for it.
     fn flush_context(&self, cmd: u64) {
+        if self.queue.is_some() {
+            return self.submit(&[vtd::qi::context_global()]);
+        }
         self.w64(reg::CCMD, cmd);
         if !(0..SPINS).any(|_| self.r64(reg::CCMD) & (1 << 63) == 0) {
             crate::klog_err!(
@@ -155,6 +204,14 @@ impl Unit {
     /// Invalidate the IOTLB with `cmd`, and wait for it: when this returns
     /// no translation it dropped can be used any more.
     fn flush_iotlb(&self, cmd: u64) {
+        if self.queue.is_some() {
+            let desc = if cmd == vtd::IOTLB_GLOBAL {
+                vtd::qi::iotlb_global()
+            } else {
+                vtd::qi::iotlb_domain((cmd >> 32) as u16)
+            };
+            return self.submit(&[desc]);
+        }
         let at = self.caps.iotlb_offset() + 8;
         self.w64(at, cmd);
         if !(0..SPINS).any(|_| self.r64(at) & (1 << 63) == 0) {
@@ -221,7 +278,17 @@ impl Unit {
                 continue;
             };
             let n = self.faults.fetch_add(1, Ordering::Relaxed);
-            if n < 64 || n.is_power_of_two() {
+            if (n < 64 || n.is_power_of_two()) && fault.reason >= 0x20 {
+                crate::klog_warn!(
+                    "iommu: interrupt fault #{}: {:02x}:{:02x}.{} handle {:#x}, reason {:#x} (an interrupt it may not raise)",
+                    n + 1,
+                    fault.source >> 8,
+                    (fault.source >> 3) & 0x1f,
+                    fault.source & 7,
+                    fault.address >> 48,
+                    fault.reason,
+                );
+            } else if n < 64 || n.is_power_of_two() {
                 crate::klog_warn!(
                     "iommu: DMA fault #{}: {:02x}:{:02x}.{} {} {:#x}, reason {:#x} (not in its domain)",
                     n + 1,
@@ -475,6 +542,7 @@ fn bring_up(index: usize, base: u64) -> Result<Unit, &'static str> {
         commands: Mutex::new(()),
         dids: Mutex::new(Vec::new()),
         faults: AtomicU64::new(0),
+        queue: None,
     };
     let gsts = unit.r32(reg::GSTS);
     if gsts & gcmd::TE != 0 {
@@ -517,6 +585,30 @@ fn bring_up(index: usize, base: u64) -> Result<Unit, &'static str> {
     unit.w64(reg::RTADDR, unit.root.paddr() as u64);
     if !unit.gcmd(gcmd::SRTP, true) {
         return Err("the root table pointer was not taken");
+    }
+    // The invalidation queue, where there is one: interrupt remapping
+    // needs it. Without it, the registers.
+    let mut unit = unit;
+    if caps.queued_invalidation() {
+        match (PhysFrame::new_zero(), PhysFrame::new_zero()) {
+            (Some(ring), Some(status)) => {
+                unit.w64(reg::IQT, 0);
+                unit.w64(reg::IQA, vtd::qi::queue_register(ring.paddr()));
+                if unit.gcmd(gcmd::QIE, true) {
+                    unit.queue = Some(Queue {
+                        ring,
+                        status,
+                        tail: Mutex::new(0),
+                        stamp: AtomicU32::new(0),
+                    });
+                } else {
+                    crate::klog_warn!(
+                        "iommu: vt-d unit {index}: queued invalidation would not turn on; registers instead"
+                    );
+                }
+            }
+            _ => return Err("no frames for its invalidation queue"),
+        }
     }
     unit.write_buffer_flush();
     unit.flush_context(vtd::CCMD_GLOBAL);
@@ -610,5 +702,134 @@ pub(super) fn init() {
             }
         }
     }
-    crate::common::iommu::install(Arc::new(VtD { dmar, units }));
+    let remap = remap_interrupts(&dmar, &units);
+    crate::common::iommu::install(Arc::new(VtD {
+        dmar: dmar.clone(),
+        units,
+    }));
+    if let Some(remap) = remap {
+        zcore_drivers::irq::remap::install(remap);
+    }
+}
+
+/// Turn interrupt remapping on, on every unit, with one table they share,
+/// and blocking every interrupt in the compatibility format: from then on
+/// only an interrupt the kernel put in the table is delivered, and only
+/// from the requester the entry names. `None`, and nothing changed, unless
+/// every unit that is on has a queue and remaps (`iommu=noir` says no).
+fn remap_interrupts(dmar: &Dmar, units: &[Option<Arc<Unit>>]) -> Option<Arc<Remap>> {
+    if crate::cmdline::value(KCONFIG.cmdline, "iommu") == Some("noir") {
+        crate::klog_info!("iommu: iommu=noir: interrupts not remapped");
+        return None;
+    }
+    let on: Vec<Arc<Unit>> = units.iter().flatten().cloned().collect();
+    if on.is_empty() {
+        return None;
+    }
+    if let Some(u) = on
+        .iter()
+        .find(|u| u.queue.is_none() || !u.caps.interrupt_remapping())
+    {
+        crate::klog_info!(
+            "iommu: vt-d unit {} does not remap interrupts (or has no queue); none are remapped",
+            u.index
+        );
+        return None;
+    }
+    let table = PhysFrame::new_zero()?;
+    let irta = vtd::ir::table_register(table.paddr());
+    let mut done = Vec::new();
+    for u in &on {
+        u.w64(reg::IRTA, irta);
+        let ok = u.gcmd(gcmd::SIRTP, true) && {
+            u.submit(&[vtd::qi::iec_global()]);
+            u.gcmd(gcmd::CFI, false) && u.gcmd(gcmd::IRE, true)
+        };
+        if !ok {
+            crate::klog_warn!(
+                "iommu: vt-d unit {}: interrupt remapping would not turn on; none are remapped",
+                u.index
+            );
+            for d in done.iter().chain(core::iter::once(u)) {
+                let d: &Arc<Unit> = d;
+                d.gcmd(gcmd::IRE, false);
+            }
+            return None;
+        }
+        done.push(u.clone());
+    }
+    crate::klog_info!("iommu: interrupts remapped; compatibility-format interrupts blocked");
+    Some(Arc::new(Remap {
+        dmar: dmar.clone(),
+        units: units.to_vec(),
+        table,
+        lock: Mutex::new(()),
+    }))
+}
+
+/// The shared interrupt remapping table. Each vector is its own handle:
+/// the kernel never gives one vector to two sources.
+struct Remap {
+    dmar: Dmar,
+    units: Vec<Option<Arc<Unit>>>,
+    table: PhysFrame,
+    lock: Mutex<()>,
+}
+
+impl Remap {
+    fn set(&self, handle: u8, entry: [u64; 2]) {
+        let _g = self.lock.lock();
+        let at = phys_to_virt(self.table.paddr()) + handle as usize * 16;
+        // SAFETY: an entry of the table, through the linear map. The high
+        // qword first: the low one holds the present bit.
+        unsafe {
+            write_volatile((at + 8) as *mut u64, entry[1]);
+            write_volatile(at as *mut u64, entry[0]);
+        }
+        flush_lines(self.table.paddr() + handle as usize * 16, 16);
+        for unit in self.units.iter().flatten() {
+            unit.submit(&[vtd::qi::iec_global()]);
+        }
+    }
+
+    fn dest() -> u8 {
+        zcore_drivers::irq::x86::Apic::bsp_apic_id()
+    }
+}
+
+impl zcore_drivers::irq::remap::Remapper for Remap {
+    fn msi(&self, rid: u16, vector: u8) -> Option<(u64, u32)> {
+        // A device behind a unit left off sends what it is given as it is:
+        // the compatibility format.
+        let unit = self.dmar.unit_for(
+            0,
+            (rid >> 8) as u8,
+            ((rid >> 3) & 0x1f) as u8,
+            (rid & 7) as u8,
+            cfg_read,
+        )?;
+        self.units.get(unit)?.as_ref()?;
+        let source = match super::pcie::conventional_bridge_above((rid >> 8) as u8) {
+            Some((first, last)) => vtd::ir::Source::Buses(first, last),
+            None => vtd::ir::Source::Requester(rid),
+        };
+        self.set(vector, vtd::ir::entry(vector, Self::dest(), false, source));
+        Some((vtd::ir::msi_address(vector as u16), 0))
+    }
+
+    fn ioapic(&self, ioapic: u8, vector: u8, level: bool, active_low: bool) -> Option<(u32, u32)> {
+        // Only the I/O APIC may raise its lines. One no unit names is let
+        // through from anyone rather than left dumb.
+        let source = match self.dmar.ioapic_source(ioapic, cfg_read) {
+            Some(sid) => vtd::ir::Source::Requester(sid),
+            None => vtd::ir::Source::Any,
+        };
+        self.set(vector, vtd::ir::entry(vector, Self::dest(), level, source));
+        Some(vtd::ir::ioapic_entry(
+            vector as u16,
+            vector,
+            level,
+            active_low,
+        ))
+    }
 }

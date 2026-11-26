@@ -354,6 +354,13 @@ pub(super) fn init() -> DeviceResult {
     zcore_drivers::init();
     boot_progress(82);
     Apic::init_local_apic_bsp(crate::mem::phys_to_virt);
+    // The IOMMU, before a single interrupt line or MSI is programmed: with
+    // interrupts remapped (VT-d) every one of them must be written in the
+    // remappable format, and the compatibility format is blocked. Every
+    // device stays in passthrough; only one a process claims later gets a
+    // domain.
+    super::vtd::init();
+    super::amdvi::init();
     let irq = Arc::new(Apic::new(
         super::special::pc_firmware_tables().0 as usize,
         crate::mem::phys_to_virt,
@@ -554,11 +561,6 @@ pub(super) fn init() -> DeviceResult {
     }
 
     boot_progress(88);
-
-    // The IOMMU, with every device the kernel drives already found and left
-    // in passthrough; only a device a process claims later gets a domain.
-    super::vtd::init();
-    super::amdvi::init();
 
     // Re-assert write-combining on the boot framebuffer AFTER the PCI scan.
     // The early retype in `primary_init` runs before PCI bring-up: on real

@@ -357,19 +357,22 @@ pub(crate) unsafe fn enable_with<T: PortOps>(
             let cap_id = am.read8(ops, loc, cap_ptr);
             if cap_id == PCI_CAP_ID_MSI {
                 let orig_ctrl = am.read32(ops, loc, cap_ptr + PCI_MSI_CTRL_CAP);
-                am.write32(ops, loc, cap_ptr + PCI_MSI_ADDR, 0xfee0_0000 | (dest << 12));
                 let irq = next_irq();
                 assigned_irq = Some(irq as usize);
-                // we offset all our irq numbers by 32
+                // we offset all our irq numbers by 32. With interrupts
+                // remapped, the message names the IOMMU's entry for it.
+                let rid = crate::irq::remap::rid(loc.bus, loc.device, loc.function);
+                let (addr, data) = crate::irq::remap::msi_message(rid, dest, irq + 32);
+                am.write32(ops, loc, cap_ptr + PCI_MSI_ADDR, addr as u32);
                 if (orig_ctrl >> 16) & (1 << 7) != 0 {
                     // 64bit: the message-address upper dword must be programmed too
                     // (to 0 for the 0xFEE00000 LAPIC window), or the device latches
                     // an undefined high address and MSIs go astray.
                     am.write32(ops, loc, cap_ptr + PCI_MSI_UPPER_ADDR, 0);
-                    am.write32(ops, loc, cap_ptr + PCI_MSI_DATA_64, irq + 32);
+                    am.write32(ops, loc, cap_ptr + PCI_MSI_DATA_64, data);
                 } else {
                     // 32bit
-                    am.write32(ops, loc, cap_ptr + PCI_MSI_DATA_32, irq + 32);
+                    am.write32(ops, loc, cap_ptr + PCI_MSI_DATA_32, data);
                 }
 
                 // enable MSI interrupt, assuming 64bit for now
