@@ -107,8 +107,8 @@ pub const LIBOS: bool = cfg!(feature = "libos");
 pub use common::boot_logo;
 pub use common::{
     addr, affinity_walk, boot_marks, cache_maint, cmdline, console, context, cpu_topology,
-    deadline, defs::*, dma_pin, dma_quarantine, fault_diag, fault_slots, getcpu, hart_walk, ipi::*,
-    kaddr, kstats, ksyms, ktop, oops_log, panic_lock, phys_watch, shrinker, stop_screen,
+    deadline, defs::*, dma_pin, dma_quarantine, fault_diag, fault_slots, getcpu, hart_walk, iommu,
+    ipi::*, kaddr, kstats, ksyms, ktop, oops_log, panic_lock, phys_watch, shrinker, stop_screen,
     timer_waker, user, watchpoint,
 };
 pub use config::KernelConfig;

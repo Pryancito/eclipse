@@ -657,6 +657,7 @@ pub fn init(mapper: Option<Arc<dyn IoMapper>>) -> DeviceResult<Vec<Device>> {
             dev.pic_interrupt_line,
             dev.interrupt_pin,
         );
+        crate::user::record_pci_function(place_of(&dev));
         let res = init_driver(&dev, &mapper);
         match res {
             Ok(d) => dev_list.push(d),

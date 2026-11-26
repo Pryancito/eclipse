@@ -159,6 +159,30 @@ fn device_interrupt(device: &user::UserDevice) -> Option<Arc<Interrupt>> {
     }
 }
 
+/// What the device will reach through its initiator: a domain of its own
+/// when an IOMMU is in use and covers it, so it sees only what its driver
+/// pins; otherwise passthrough, every byte, as on a machine without one.
+fn dma_view(device: &user::UserDevice) -> Arc<Iommu> {
+    let domain = device.pci_place().and_then(|place| {
+        kernel_hal::iommu::domain_for(kernel_hal::iommu::PciRequester {
+            segment: 0,
+            bus: place.bus,
+            device: place.device,
+            function: place.function,
+        })
+    });
+    match domain {
+        Some(domain) => Iommu::with_domain(domain),
+        None => {
+            if kernel_hal::iommu::unit().is_some() {
+                let (kind, index) = (device.kind, device.index);
+                warn!("udriver: {kind} #{index} has no IOMMU domain; its DMA reaches all memory");
+            }
+            Iommu::create()
+        }
+    }
+}
+
 /// How long a dead driver's threads are given to be gone before its device
 /// is reset regardless, and how often that is looked at.
 const THREADS_GRACE: Duration = Duration::from_millis(500);
@@ -406,7 +430,7 @@ pub(super) fn claim_device(proc: &Arc<Process>, args: &[usize; 6]) -> ZxResult {
     };
     let held = Held {
         holder: proc.id(),
-        bti: BusTransactionInitiator::create(Iommu::create(), 0),
+        bti: BusTransactionInitiator::create(dma_view(&device), 0),
         interrupt: device_interrupt(&device),
         device: device.clone(),
     };
