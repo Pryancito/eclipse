@@ -27,11 +27,30 @@ impl Space for Kernel {
     }
 
     fn write(&self, offset: u8, width: u8, value: u32) -> Result<(), Refused> {
-        match self.0.config_write(offset as usize, width as usize, value) {
-            Ok(()) => Ok(()),
-            Err(Status::ACCESS_DENIED) => Err(Refused::Kernel),
-            Err(_) => Err(Refused::Other),
-        }
+        self.0
+            .config_write(offset as usize, width as usize, value)
+            .map_err(refused)
+    }
+
+    fn read_at(&self, place: (u8, u8, u8), offset: u8, width: u8) -> Option<u32> {
+        self.0
+            .config_read_at(place, offset as usize, width as usize)
+            .ok()
+    }
+
+    fn bridge_control(&self, place: (u8, u8, u8), value: u16) -> Result<u16, Refused> {
+        self.0.bridge_control_write(place, value).map_err(refused)
+    }
+
+    fn restore_bars(&self) -> Result<(), Refused> {
+        self.0.restore_bars().map_err(refused)
+    }
+}
+
+fn refused(status: Status) -> Refused {
+    match status {
+        Status::ACCESS_DENIED => Refused::Kernel,
+        _ => Refused::Other,
     }
 }
 

@@ -36,6 +36,16 @@ use super::device_claim::{held_device, kind_of};
 ///   not one (an I/O BAR, the upper half of a 64-bit one, none). A driver
 ///   cannot size a BAR itself, by writing all ones to it, as the kernel
 ///   did when it scanned the bus: the BARs are the kernel's to write.
+/// - [`OP_CONFIG_READ_AT`]: `c` bytes at `b` of the configuration space of
+///   the function at `a` (placed as [`OP_PLACE`] answers), any function of
+///   the machine; a slot with nothing in it reads all ones. A driver reads
+///   the bridges above its function and the chipset, as the kernel's did.
+/// - [`OP_BRIDGE_CONTROL`]: write `b` to Bridge Control of the bridge at
+///   `a`, which must be above the function held: VGA Enable, and Secondary
+///   Bus Reset on a bridge that leads only to this device, are taken;
+///   every other bit stays. What the register holds afterwards.
+/// - [`OP_RESTORE_BARS`]: the kernel writes the function's memory BARs
+///   again, as it recorded them; for after that bus reset.
 ///
 /// `ACCESS_DENIED` when this process does not hold that device, or for a
 /// write to a register only the kernel sets; `NOT_SUPPORTED` for a device
@@ -51,6 +61,27 @@ pub const OP_CONFIG_READ: usize = 1;
 pub const OP_CONFIG_WRITE: usize = 2;
 pub const OP_PLACE: usize = 3;
 pub const OP_BAR_LEN: usize = 4;
+pub const OP_CONFIG_READ_AT: usize = 5;
+pub const OP_BRIDGE_CONTROL: usize = 6;
+pub const OP_RESTORE_BARS: usize = 7;
+
+/// `(bus, device, function)` of a place packed as [`OP_PLACE`] answers it;
+/// `None` for one with anything above the bus.
+fn unpack_place(packed: usize) -> Option<(u8, u8, u8)> {
+    (packed <= 0xffff).then_some((
+        (packed >> 8) as u8,
+        (packed >> 3 & 0x1f) as u8,
+        (packed & 7) as u8,
+    ))
+}
+
+fn refused(why: ConfigRefused) -> ZxError {
+    match why {
+        ConfigRefused::Range => ZxError::OUT_OF_RANGE,
+        ConfigRefused::Kernel => ZxError::ACCESS_DENIED,
+        ConfigRefused::NotHere => ZxError::NOT_SUPPORTED,
+    }
+}
 
 /// [`ECLIPSE_DEVICE_PCI_FN`].
 pub(super) fn device_pci_fn(proc: &Arc<Process>, args: &[usize; 6]) -> isize {
@@ -97,13 +128,28 @@ fn pci_fn(proc: &Arc<Process>, args: &[usize; 6]) -> Result<usize, ZxError> {
         OP_CONFIG_WRITE => {
             let value: u32 =
                 core::convert::TryFrom::try_from(c).map_err(|_| ZxError::INVALID_ARGS)?;
-            match place.config_write(a, b, value) {
-                Ok(()) => Ok(0),
-                Err(ConfigRefused::Range) => Err(ZxError::OUT_OF_RANGE),
-                Err(ConfigRefused::Kernel) => Err(ZxError::ACCESS_DENIED),
-                Err(ConfigRefused::NotHere) => Err(ZxError::NOT_SUPPORTED),
-            }
+            place.config_write(a, b, value).map(|()| 0).map_err(refused)
         }
+        OP_CONFIG_READ_AT => {
+            let at = unpack_place(a).ok_or(ZxError::INVALID_ARGS)?;
+            kernel_hal::drivers::user::PciPlace::config_read_at(at, b, c)
+                .map(|v| v as usize)
+                .ok_or(if cfg!(target_arch = "x86_64") {
+                    ZxError::OUT_OF_RANGE
+                } else {
+                    ZxError::NOT_SUPPORTED
+                })
+        }
+        OP_BRIDGE_CONTROL => {
+            let bridge = unpack_place(a).ok_or(ZxError::INVALID_ARGS)?;
+            let value: u16 =
+                core::convert::TryFrom::try_from(b).map_err(|_| ZxError::INVALID_ARGS)?;
+            place
+                .bridge_control_write(bridge, value)
+                .map(|now| now as usize)
+                .map_err(refused)
+        }
+        OP_RESTORE_BARS => place.restore_bars().map(|()| 0).map_err(refused),
         OP_PLACE => {
             Ok((place.bus as usize) << 8 | (place.device as usize) << 3 | place.function as usize)
         }

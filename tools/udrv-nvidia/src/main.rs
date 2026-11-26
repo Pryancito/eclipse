@@ -14,6 +14,9 @@
 //!   a machine with no NVIDIA GPU: the probe through the ports, the BARs
 //!   through the mapper, what the boot knows of the display, DMA memory
 //!   through the claim. The driver itself is not run.
+//! - `udrv-nvidia bridge-check VVVV DDDD`: what the driver does above its
+//!   GPU (the walk to the root port, VGA routing, a bus reset), on any PCI
+//!   function behind a bridge (`bridge_check`).
 //! - `udrv-nvidia irq-check VVVV DDDD OFF=VAL...`: the interrupt path of
 //!   the driver's GSP boot, on any PCI function that raises one when its
 //!   first BAR is written (QEMU's e1000e: `d0=4 c8=4`).
@@ -25,6 +28,7 @@
 //!   lent to it and given back, an OS event posted from its nonstall
 //!   interrupt waking a `poll`, a UVM semaphore pool lent to it while it
 //!   has memory of it (`nvidia.uvm` too), the close.
+mod bridge_check;
 mod drm;
 mod gem;
 mod gpu;
@@ -61,6 +65,14 @@ fn main() {
                     .unwrap_or_else(|| fail("usage: udrv-nvidia check VVVV DDDD".into()))
             };
             check(hex(1), hex(2))
+        }
+        Some("bridge-check") => {
+            let hex = |i: usize| {
+                args.get(i)
+                    .and_then(|s| u16::from_str_radix(s, 16).ok())
+                    .unwrap_or_else(|| fail("usage: udrv-nvidia bridge-check VVVV DDDD".into()))
+            };
+            bridge_check::bridge_check(hex(1), hex(2))
         }
         Some("drm-check") => drm_check(),
         Some("irq-check") => irq_check(&args[1..]),

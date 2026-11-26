@@ -188,6 +188,31 @@ pub enum ConfigRefused {
     NotHere,
 }
 
+/// One access to configuration space at a time, of those the kernel makes
+/// for the drivers that are processes. The mechanism is the whole machine's:
+/// an address in one port, then its data in another. A driver's walk up to
+/// its root port is thousands of reads, and a write of another driver's
+/// that fell between the address of one and its data would land in the
+/// bridge being read.
+#[cfg(target_arch = "x86_64")]
+static CONFIG_ACCESS: lock::Mutex<()> = lock::Mutex::new(());
+
+/// How long a bus a driver asked to reset stays in reset: what the
+/// kernel's NVIDIA driver held it (PCI asks for 1 ms).
+#[cfg(target_arch = "x86_64")]
+const RESET_HOLD_US: u64 = 5_000;
+
+/// Wait that long, with no lock held.
+#[cfg(target_arch = "x86_64")]
+fn reset_hold() {
+    // SAFETY: the kernel's clock.
+    let now = || unsafe { crate::bus::drivers_timer_now_as_micros() };
+    let start = now();
+    while now().wrapping_sub(start) < RESET_HOLD_US {
+        core::hint::spin_loop();
+    }
+}
+
 impl PciPlace {
     /// Whether the driver may write `width` bytes at `offset`: the command
     /// and status registers, the cache line, the latency and interrupt
@@ -224,15 +249,37 @@ impl PciPlace {
     /// which must be aligned to them. `None` outside the 256 bytes every
     /// machine here reaches, or on a machine with no PCI.
     pub fn config_read(&self, offset: usize, width: usize) -> Option<u32> {
-        if !in_space(offset, width) {
+        Self::config_read_at((self.bus, self.device, self.function), offset, width)
+    }
+
+    /// [`Self::config_read`] of the function at `(bus, device, function)`,
+    /// any function of the machine, for a driver that holds one of them: a
+    /// slot with nothing in it reads all ones, as on the bus. The kernel's
+    /// NVIDIA driver reads its GPU's root port and the bridges on the way
+    /// (`crate::bus::pci::upstream`), and the RM the chipset; a driver in a
+    /// process saw none of them. Reading configuration space changes
+    /// nothing, so it is not kept to the function held; writing is
+    /// ([`Self::config_write`], [`Self::bridge_control_write`]).
+    pub fn config_read_at(
+        (bus, device, function): (u8, u8, u8),
+        offset: usize,
+        width: usize,
+    ) -> Option<u32> {
+        if !in_space(offset, width) || device >= 32 || function >= 8 {
             return None;
         }
         #[cfg(target_arch = "x86_64")]
         {
             use crate::bus::pci::{PortOpsImpl, PCI_ACCESS};
-            // SAFETY: a read of the configuration space of a function the
-            // bus found.
-            let word = unsafe { PCI_ACCESS.read32(&PortOpsImpl, self.loc(), (offset & !3) as u16) };
+            let loc = pci::Location {
+                bus,
+                device,
+                function,
+            };
+            let _one = CONFIG_ACCESS.lock();
+            // SAFETY: a read of configuration space, which answers all
+            // ones where there is no function.
+            let word = unsafe { PCI_ACCESS.read32(&PortOpsImpl, loc, (offset & !3) as u16) };
             let shift = (offset & 3) * 8;
             let mask = if width == 4 {
                 u32::MAX
@@ -243,8 +290,73 @@ impl PciPlace {
         }
         #[cfg(not(target_arch = "x86_64"))]
         {
-            let _ = self.loc();
+            let _ = bus;
             None
+        }
+    }
+
+    /// Write Bridge Control of the bridge at `bridge` for this function's
+    /// driver: VGA Enable, and Secondary Bus Reset on a bridge that leads
+    /// only to this function's device; every other bit stays. The reset
+    /// is a pulse: held 5 ms and taken off before this returns
+    /// (`crate::bus::pci::upstream::bridge_control_pulsed`). What the
+    /// register holds afterwards.
+    pub fn bridge_control_write(
+        &self,
+        (bus, device, function): (u8, u8, u8),
+        value: u16,
+    ) -> Result<u16, ConfigRefused> {
+        if device >= 32 || function >= 8 {
+            return Err(ConfigRefused::Range);
+        }
+        #[cfg(target_arch = "x86_64")]
+        {
+            use crate::bus::pci::{upstream, PortOpsImpl, PCI_ACCESS};
+            let bridge = pci::Location {
+                bus,
+                device,
+                function,
+            };
+            // SAFETY: configuration space; what is written is decided by
+            // `upstream::bridge_control_write`.
+            unsafe {
+                upstream::bridge_control_pulsed(
+                    &PortOpsImpl,
+                    PCI_ACCESS,
+                    bridge,
+                    self.loc(),
+                    value,
+                    || CONFIG_ACCESS.lock(),
+                    reset_hold,
+                )
+            }
+            .map_err(|_| ConfigRefused::Kernel)
+        }
+        #[cfg(not(target_arch = "x86_64"))]
+        {
+            let _ = (self.loc(), bus, value);
+            Err(ConfigRefused::NotHere)
+        }
+    }
+
+    /// Write this function's memory BARs again, as the kernel recorded
+    /// them: what its driver asks for after the bus reset it asked for
+    /// (`crate::bus::pci::upstream::restore_bars`).
+    pub fn restore_bars(&self) -> Result<(), ConfigRefused> {
+        #[cfg(target_arch = "x86_64")]
+        {
+            use crate::bus::pci::{upstream, PortOpsImpl, PCI_ACCESS};
+            let bars = self.bars.map(|(paddr, _)| paddr);
+            let _one = CONFIG_ACCESS.lock();
+            // SAFETY: the BARs of this function, to the values the bus scan
+            // found in them.
+            unsafe { upstream::restore_bars(&PortOpsImpl, PCI_ACCESS, self.loc(), &bars) };
+            Ok(())
+        }
+        #[cfg(not(target_arch = "x86_64"))]
+        {
+            let _ = self.loc();
+            Err(ConfigRefused::NotHere)
         }
     }
 
@@ -267,6 +379,7 @@ impl PciPlace {
             } else {
                 ((1u32 << (width * 8)) - 1) << shift
             };
+            let _one = CONFIG_ACCESS.lock();
             // SAFETY: a read-modify-write of the dword holding registers
             // [`Self::may_write`] let through. The status register's bits
             // are cleared by writing ones, so a byte or a word written next

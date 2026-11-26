@@ -57,6 +57,14 @@ const PCI_FN_CONFIG_READ: usize = 1;
 const PCI_FN_CONFIG_WRITE: usize = 2;
 const PCI_FN_PLACE: usize = 3;
 const PCI_FN_BAR_LEN: usize = 4;
+const PCI_FN_CONFIG_READ_AT: usize = 5;
+const PCI_FN_BRIDGE_CONTROL: usize = 6;
+const PCI_FN_RESTORE_BARS: usize = 7;
+
+/// A place as the kernel names it: what [`PciFn::place`] unpacks.
+fn packed((bus, device, function): (u8, u8, u8)) -> usize {
+    (bus as usize) << 8 | (device as usize & 0x1f) << 3 | function as usize & 7
+}
 
 impl PciFn {
     /// Device `index` of claim `kind` ([`KIND_NVIDIA`]).
@@ -115,6 +123,36 @@ impl PciFn {
     /// which only the kernel may do.
     pub fn bar_len(&self, bar: usize) -> Result<usize, Status> {
         self.call(PCI_FN_BAR_LEN, bar, 0, 0)
+    }
+
+    /// `width` bytes (1, 2 or 4) at `offset` of the configuration space
+    /// of the function at `place` (`bus, device, function`), any function
+    /// of the machine: the bridges above this one, the chipset. A slot
+    /// with nothing in it reads all ones.
+    pub fn config_read_at(
+        &self,
+        place: (u8, u8, u8),
+        offset: usize,
+        width: usize,
+    ) -> Result<u32, Status> {
+        self.call(PCI_FN_CONFIG_READ_AT, packed(place), offset, width)
+            .map(|v| v as u32)
+    }
+
+    /// Write `value` to Bridge Control of the bridge at `place`, which
+    /// must be above this function. The kernel takes VGA Enable and, of a
+    /// bridge that leads only to this function's device, Secondary Bus
+    /// Reset; every other bit stays. What the register holds afterwards.
+    /// [`Status::ACCESS_DENIED`] for anything else there.
+    pub fn bridge_control_write(&self, place: (u8, u8, u8), value: u16) -> Result<u16, Status> {
+        self.call(PCI_FN_BRIDGE_CONTROL, packed(place), value as usize, 0)
+            .map(|v| v as u16)
+    }
+
+    /// Have the kernel write this function's memory BARs again, as it
+    /// recorded them: after a bus reset, which clears them.
+    pub fn restore_bars(&self) -> Result<(), Status> {
+        self.call(PCI_FN_RESTORE_BARS, 0, 0, 0).map(|_| ())
     }
 }
 
