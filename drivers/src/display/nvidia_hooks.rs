@@ -599,10 +599,7 @@ mod nvidia_hooks_tests {
             0x1_0000_2000,
             "the console card's BAR, through its own mapper"
         );
-        assert_eq!(
-            hooks.map_kernel_space(0xB000_3000, 0x1000),
-            0x2_0000_3000
-        );
+        assert_eq!(hooks.map_kernel_space(0xB000_3000, 0x1000), 0x2_0000_3000);
         assert_eq!(console.calls.load(Ordering::Relaxed), 1);
         assert_eq!(
             compute.calls.load(Ordering::Relaxed),

@@ -271,7 +271,10 @@ mod tests {
                     continue;
                 }
                 let name = format!("{}{rest}", &prefix[1..]);
-                assert!(claves.iter().any(|(n, _)| *n == name), "{name} ({src}) has no clave");
+                assert!(
+                    claves.iter().any(|(n, _)| *n == name),
+                    "{name} ({src}) has no clave"
+                );
             }
         }
         let _ = fs::remove_dir_all(&tmp);

@@ -346,6 +346,7 @@ version = "0.1.0"
 dependencies = [
  "eclipse-udrivers",
  "libc",
+ "log",
  "nvidia-rm-sys",
  "pci",
  "zcore-drivers",
