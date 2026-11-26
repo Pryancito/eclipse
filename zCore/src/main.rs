@@ -1596,15 +1596,22 @@ fn primary_main(config: kernel_hal::KernelConfig) {
             // wedge takes the whole machine with no second card to fall back
             // on. That box still opts in with `nvidia.console_gpu`.
             let nvidia_cards = kernel_hal::drivers::all_drm().as_vec();
-            // The GPUs left to udrv-nvidia do not count here: the console
-            // one brought up in the process left the monitor black on real
-            // hardware (2x RTX 2060), so there it is brought up only when
-            // `nvidia.console_gpu` asks for it by name.
-            let console_cards = nvidia_cards.iter().filter(|d| d.is_console_gpu()).count();
+            // The GPUs left to udrv-nvidia count as the kernel's would: the
+            // process brings them up as its own, and the console one through
+            // this same task. They were left out while that bring-up left the
+            // monitor black on real hardware (2x RTX 2060); with the session
+            // held for it, nvidia-modeset in the process and the syncobj
+            // answers fixed, the box came up with both cards and labwc on
+            // Vulkan (2026-11-26), as with the driver in the kernel, so the
+            // console GPU no longer needs `nvidia.console_gpu` there either.
+            let (left, left_scanning) = kernel_hal::drivers::user::nvidia_left();
+            let console_cards =
+                nvidia_cards.iter().filter(|d| d.is_console_gpu()).count() + left_scanning;
             let nvidia_cards = nvidia_cards
                 .iter()
                 .filter(|d| d.is_console_gpu() || d.is_compute_gpu())
-                .count();
+                .count()
+                + left;
             let verdict = multigpu_verdict(&options.cmdline, nvidia_cards, console_cards);
             let console_gpu_by_default = verdict.is_multigpu()
                 && !kernel_hal::cmdline::flag(&options.cmdline, "nvidia.noconsole_gpu");
