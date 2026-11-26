@@ -84,6 +84,12 @@ pub mod op {
     /// `b`; the bytes are the source pitch, the scanout pitch, the bytes of
     /// a row and the rows (u32 each).
     pub const CE_PRESENT_2D: u32 = 95;
+    /// `deferred_console_bringup`, with the console-GSP gate opened first
+    /// on the driver's side when `a` is 1 (the kernel opened its own): the
+    /// line it says, in the bytes.
+    pub const CONSOLE_BRINGUP: u32 = 96;
+    /// `build_console_gr_ladder`: the line it says, in the bytes.
+    pub const CONSOLE_GR_LADDER: u32 = 97;
 }
 
 pub mod ioctl;
@@ -426,6 +432,18 @@ pub fn answer(
             };
             found(gpu.ce_present_2d_pitched(a, src_pitch, b, dst_pitch, row_bytes, rows))
         }
+        op::CONSOLE_BRINGUP => {
+            #[cfg(target_arch = "x86_64")]
+            if a == 1 {
+                crate::display::set_console_gsp_enabled(true);
+            }
+            o.0.extend_from_slice(gpu.deferred_console_bringup().as_bytes());
+            Ok(0)
+        }
+        op::CONSOLE_GR_LADDER => {
+            o.0.extend_from_slice(gpu.build_console_gr_ladder().as_bytes());
+            Ok(0)
+        }
         op::HW_CURSOR_HIDE => found(gpu.hw_cursor_hide()),
         op::POLL => found(gpu.poll_connectors()),
         op::EDID => {
@@ -627,6 +645,13 @@ impl<T: Transport> Remote<T> {
         self.call(op, a, 0, &[]).ok().map(|(_, b)| b)
     }
 
+    /// A line of text the driver answers `op` with; empty when it cannot.
+    fn line(&self, op: u32, a: u64) -> String {
+        self.bytes(op, a)
+            .map(|b| String::from_utf8_lossy(&b).into_owned())
+            .unwrap_or_default()
+    }
+
     fn yes(&self, op: u32, a: u64, b: u64, data: &[u8]) -> bool {
         self.word(op, a, b, data) == Some(1)
     }
@@ -729,6 +754,21 @@ impl<T: Transport> DrmScheme for Remote<T> {
         // A card that is not ready declines without a call: the kernel
         // offers every frame to every card.
         self.ce_present_ready() && self.yes(op::CE_PRESENT, src_sysmem_pa, size, &[])
+    }
+
+    /// The console GPU of the process brought up as the kernel's would
+    /// be, in the window the kernel's task holds the scanout for. The
+    /// console-GSP gate the kernel opened for it is opened there too.
+    fn deferred_console_bringup(&self) -> String {
+        #[cfg(target_arch = "x86_64")]
+        let gate = crate::display::console_gsp_enabled() as u64;
+        #[cfg(not(target_arch = "x86_64"))]
+        let gate = 0;
+        self.line(op::CONSOLE_BRINGUP, gate)
+    }
+
+    fn build_console_gr_ladder(&self) -> String {
+        self.line(op::CONSOLE_GR_LADDER, 0)
     }
 
     fn ce_present_2d_pitched(

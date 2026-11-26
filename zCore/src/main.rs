@@ -1596,11 +1596,17 @@ fn primary_main(config: kernel_hal::KernelConfig) {
             // wedge takes the whole machine with no second card to fall back
             // on. That box still opts in with `nvidia.console_gpu`.
             let nvidia_cards = kernel_hal::drivers::all_drm().as_vec();
-            let console_cards = nvidia_cards.iter().filter(|d| d.is_console_gpu()).count();
+            // The GPUs left to udrv-nvidia count as the kernel's would: the
+            // process brings them up as its own, and the console one through
+            // this same task.
+            let (left, left_scanning) = kernel_hal::drivers::user::nvidia_left();
+            let console_cards =
+                nvidia_cards.iter().filter(|d| d.is_console_gpu()).count() + left_scanning;
             let nvidia_cards = nvidia_cards
                 .iter()
                 .filter(|d| d.is_console_gpu() || d.is_compute_gpu())
-                .count();
+                .count()
+                + left;
             let verdict = multigpu_verdict(&options.cmdline, nvidia_cards, console_cards);
             let console_gpu_by_default = verdict.is_multigpu()
                 && !kernel_hal::cmdline::flag(&options.cmdline, "nvidia.noconsole_gpu");
@@ -2188,7 +2194,9 @@ fn schedule_deferred_console_bringup(
         // that drives the boot display and returns an empty line otherwise, so
         // this is correct for 1, 2 or N cards without counting them here.
         let mut any = false;
-        for d in kernel_hal::drivers::all_drm().as_vec().iter() {
+        // The cards a process serves too (`udriver=nvidia@N`): its console
+        // GPU is brought up in this same window.
+        for d in linux_object::fs::devfs::drm::every_card().iter() {
             let line = d.deferred_console_bringup();
             if !line.is_empty() {
                 any = true;
@@ -2222,7 +2230,7 @@ fn schedule_deferred_console_bringup(
         // the scanout parked is how a boot lost the monitor. Nothing waits on
         // it -- a client whose context could not be built yet retries on its
         // next ioctl.
-        for d in kernel_hal::drivers::all_drm().as_vec().iter() {
+        for d in linux_object::fs::devfs::drm::every_card().iter() {
             let line = d.build_console_gr_ladder();
             if !line.is_empty() {
                 kernel_hal::klog_info!("Eclipse: NVIDIA {}", line);

@@ -1351,6 +1351,18 @@ pub fn reset_gpus_for_reboot() -> usize {
     reserved.iter().filter(|d| d.gpu_reset_for_reboot()).count()
 }
 
+/// The NVIDIA GPUs left to userspace (`udriver=nvidia@N`), and how many
+/// of them show the boot framebuffer: what the kernel's own driver would
+/// have counted as its cards and its console cards.
+pub fn nvidia_left() -> (usize, usize) {
+    let Some(reserved) = RESERVED.try_lock().map(|r| r.clone()) else {
+        return (0, 0);
+    };
+    let gpus = reserved.iter().filter(|d| d.kind == NVIDIA);
+    let scanning = gpus.clone().filter(|d| d.holds_boot_framebuffer()).count();
+    (gpus.count(), scanning)
+}
+
 /// The devices left to userspace, as `udriver=` would name each
 /// (`virtio-net@0`, `pci-14c3-0616@0`), in the order the buses found them.
 pub fn reserved() -> Vec<alloc::string::String> {
