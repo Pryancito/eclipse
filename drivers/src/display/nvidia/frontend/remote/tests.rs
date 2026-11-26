@@ -1,13 +1,12 @@
 use super::super::{
-    alloc_os_event, cards, map_unrecorded, release, rm_escape, rm_escape_lending, rm_map_memory,
-    rm_up,
+    alloc_os_event, cards, free_os_event, map_unrecorded, release, rm_escape, rm_escape_lending,
+    rm_map_memory, rm_up, service_nonstall,
 };
 use super::*;
 use alloc::vec;
 use core::sync::atomic::{AtomicUsize, Ordering};
 use nvidia_rm_sys::types::{
-    NV_ERR_INSUFFICIENT_RESOURCES, NV_ERR_INVALID_STATE, NV_ERR_NOT_READY, NV_ERR_NOT_SUPPORTED,
-    NV_OK,
+    NV_ERR_INSUFFICIENT_RESOURCES, NV_ERR_INVALID_STATE, NV_ERR_NOT_READY, NV_OK,
 };
 
 fn card(minor: u32, instance: Option<u32>) -> ServedCard {
@@ -106,6 +105,11 @@ struct Mirror {
     kept: lock::Mutex<Option<UserPages>>,
     keeps: core::sync::atomic::AtomicBool,
     lent: lock::Mutex<Option<(usize, Vec<u64>, bool)>>,
+    /// The last OS event registered and freed, as (client, os_info, fd).
+    registered: lock::Mutex<Option<(u32, usize, u32)>>,
+    freed: lock::Mutex<Option<(u32, u32)>>,
+    /// What a look at the nonstall interrupts finds.
+    nonstall: lock::Mutex<Option<NonstallPoll>>,
 }
 
 impl Rm for Mirror {
@@ -142,6 +146,20 @@ impl Rm for Mirror {
     fn map_unrecorded(&self, payload: &mut [u8], _caller: &Caller, why: NV_STATUS) {
         payload[0] = 0x55;
         self.unrecorded.store(why as usize, Ordering::SeqCst);
+    }
+
+    fn alloc_os_event(&self, client: u32, os_info: usize, fd: u32) -> NV_STATUS {
+        *self.registered.lock() = Some((client, os_info, fd));
+        0x31
+    }
+
+    fn free_os_event(&self, client: u32, fd: u32) -> NV_STATUS {
+        *self.freed.lock() = Some((client, fd));
+        0x32
+    }
+
+    fn service_nonstall(&self) -> NonstallPoll {
+        self.nonstall.lock().unwrap_or(NonstallPoll::Serviced(0))
     }
 }
 
@@ -266,7 +284,22 @@ fn a_served_rm_is_the_one_the_device_files_reach() {
     release(0x99);
     assert_eq!(direct.0.released.load(Ordering::SeqCst), 0x99);
     assert_eq!(direct.1.load(Ordering::SeqCst), 1, "told, not asked");
-    assert_eq!(alloc_os_event(1, 2, 3), NV_ERR_NOT_SUPPORTED);
+    assert_eq!(alloc_os_event(1, 0xffff_8000_0000_1000, 3), 0x31);
+    assert_eq!(
+        *direct.0.registered.lock(),
+        Some((1, 0xffff_8000_0000_1000, 3))
+    );
+    assert_eq!(free_os_event(1, 3), 0x32);
+    assert_eq!(*direct.0.freed.lock(), Some((1, 3)));
+    for poll in [
+        NonstallPoll::Serviced(0b101),
+        NonstallPoll::Busy,
+        NonstallPoll::Failed(0x1f),
+    ] {
+        *direct.0.nonstall.lock() = Some(poll);
+        assert_eq!(service_nonstall(), poll, "the process's look");
+    }
+    assert!(is_server(SERVER) && !is_server(SERVER + 1));
 
     let other: Arc<dyn Link> = Arc::new(Direct(Mirror::default(), AtomicUsize::new(0)));
     assert_eq!(
@@ -278,6 +311,8 @@ fn a_served_rm_is_the_one_the_device_files_reach() {
 
     gone(&link);
     assert!(!rm_up());
+    assert!(!is_server(SERVER));
+    assert_eq!(service_nonstall(), NonstallPoll::Serviced(0));
     assert_eq!(rm_escape(0x2a, &mut payload, &a_caller()), NV_ERR_NOT_READY);
     assert_eq!(alloc_os_event(1, 2, 3), NV_OK);
     let _ = nvidia_rm_sys::frontend::events::free_os_event(1, 3);
@@ -485,6 +520,41 @@ fn a_loan_goes_whole() {
     reserved[CALLER_LEN + 24] = 1;
     assert_eq!(
         answer(&rm, op::RM_ESCAPE_LENDING, 1, &reserved, &mut out),
+        Err(EINVAL)
+    );
+}
+
+/// A look at the nonstall interrupts goes whole, and a word that is not one
+/// is refused; so is an OS event's message that is not one.
+#[test]
+fn a_nonstall_look_and_an_os_event_go_whole() {
+    for poll in [
+        NonstallPoll::Serviced(0),
+        NonstallPoll::Serviced(u32::MAX),
+        NonstallPoll::Busy,
+        NonstallPoll::Failed(0x56),
+    ] {
+        assert_eq!(decode_nonstall(encode_nonstall(poll)), Some(poll));
+    }
+    assert_eq!(decode_nonstall(1 << 32 | 1), None);
+    assert_eq!(decode_nonstall(3 << 32), None);
+    let rm = Mirror::default();
+    let mut out = Vec::new();
+    let msg = encode_os_event(7, 0x1000);
+    assert_eq!(answer(&rm, op::ALLOC_OS_EVENT, 9, &msg, &mut out), Ok(0x31));
+    assert_eq!(*rm.registered.lock(), Some((7, 0x1000, 9)));
+    let mut padded = msg;
+    padded[4] = 1;
+    assert_eq!(
+        answer(&rm, op::ALLOC_OS_EVENT, 9, &padded, &mut out),
+        Err(EINVAL)
+    );
+    assert_eq!(
+        answer(&rm, op::FREE_OS_EVENT, 9, &msg[..8], &mut out),
+        Err(EINVAL)
+    );
+    assert_eq!(
+        answer(&rm, op::FREE_OS_EVENT, 1 << 40, &msg, &mut out),
         Err(EINVAL)
     );
 }

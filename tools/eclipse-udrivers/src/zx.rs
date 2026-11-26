@@ -53,6 +53,7 @@ pub mod nr {
     pub const ECLIPSE_SYNCOBJ: i64 = 0x4018;
     pub const ECLIPSE_NVCTL_SERVE: i64 = 0x4019;
     pub const ECLIPSE_NVCTL_RETURN: i64 = 0x401a;
+    pub const ECLIPSE_NVCTL_EVENT: i64 = 0x401b;
 }
 
 /// A `zx_status_t` that is not `ZX_OK`.

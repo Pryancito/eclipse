@@ -29,12 +29,19 @@
 //! process that ends with pages it was lent leaves the grants where they
 //! are, quarantined with its devices until those are reset.
 //!
-//! This carries the plain escapes, the lent pages, the mappings and
-//! `release`. The others (OS events, UVM) are refused with
-//! `NV_ERR_NOT_SUPPORTED` until they are carried too.
+//! OS events are the process's RM's registrations ([`op::ALLOC_OS_EVENT`]),
+//! and what it posts to them it hands the kernel with
+//! `ECLIPSE_NVCTL_EVENT`, which queues it on the open as the kernel's own
+//! RM's posts are. The nonstall poll that wakes a sleeping CUDA wait asks
+//! the process to look ([`op::SERVICE_NONSTALL`]).
+//!
+//! This carries the plain escapes, the lent pages, the mappings, OS events
+//! and `release`. UVM is refused with `NV_ERR_NOT_SUPPORTED` until it is
+//! carried too.
 
 use super::{
-    Caller, Card, MmapContext, MmapMemory, RawMmapContext, UserPages, CALLER_NAME_LEN, GPU_UUID_LEN,
+    Caller, Card, MmapContext, MmapMemory, NonstallPoll, RawMmapContext, UserPages,
+    CALLER_NAME_LEN, GPU_UUID_LEN,
 };
 use alloc::boxed::Box;
 use alloc::collections::BTreeMap;
@@ -67,6 +74,15 @@ pub mod op {
     /// ([`super::LOAN_LEN`] bytes, then each page's physical address)
     /// between the caller and the payload. The answer as [`RM_ESCAPE`]'s.
     pub const RM_ESCAPE_LENDING: u32 = 132;
+    /// `ALLOC_OS_EVENT`: `a` = the client's fd; the message is the client
+    /// (`u32`), 4 bytes at zero and the open's `os_info` (`u64`). The
+    /// answer's `a` is the RM's status.
+    pub const ALLOC_OS_EVENT: u32 = 133;
+    /// `FREE_OS_EVENT`: as [`ALLOC_OS_EVENT`], `os_info` at zero.
+    pub const FREE_OS_EVENT: u32 = 134;
+    /// Look at the nonstall interrupts pending: no message, and the answer's
+    /// `a` is what was found ([`super::encode_nonstall`]).
+    pub const SERVICE_NONSTALL: u32 = 135;
 }
 
 /// The most bytes a message carries: a slot of the link.
@@ -172,6 +188,12 @@ pub fn serve(
     Ok(cards)
 }
 
+/// Whether the process `server` is the one serving the RM: who may post
+/// its OS events (`ECLIPSE_NVCTL_EVENT`).
+pub fn is_server(server: u64) -> bool {
+    served().is_some_and(|s| s.server.id == server)
+}
+
 /// `ECLIPSE_NVCTL_RETURN`: the process `server` gives back the pages of
 /// `loan`. `false` for a loan it does not have, or a process that does not
 /// serve the RM.
@@ -244,6 +266,35 @@ impl Served {
 
     pub(super) fn release(&self, os_info: usize) {
         self.link.tell(op::RELEASE, os_info as u64);
+    }
+
+    pub(super) fn alloc_os_event(&self, client: u32, os_info: usize, fd: u32) -> NV_STATUS {
+        self.os_event(op::ALLOC_OS_EVENT, client, os_info, fd)
+    }
+
+    pub(super) fn free_os_event(&self, client: u32, fd: u32) -> NV_STATUS {
+        self.os_event(op::FREE_OS_EVENT, client, 0, fd)
+    }
+
+    fn os_event(&self, op: u32, client: u32, os_info: usize, fd: u32) -> NV_STATUS {
+        match self
+            .link
+            .call(op, fd as u64, &encode_os_event(client, os_info))
+        {
+            Ok((status, _)) => status as NV_STATUS,
+            Err(errno) => {
+                warn!("[nvidiactl] OS event op {op}: the RM's process did not answer ({errno})");
+                NV_ERR_OPERATING_SYSTEM
+            }
+        }
+    }
+
+    pub(super) fn service_nonstall(&self) -> NonstallPoll {
+        let failed = NonstallPoll::Failed(NV_ERR_OPERATING_SYSTEM);
+        match self.link.call(op::SERVICE_NONSTALL, 0, &[]) {
+            Ok((word, _)) => decode_nonstall(word).unwrap_or(failed),
+            Err(_) => failed,
+        }
     }
 
     /// [`Self::rm_escape`], with `pages` lent to the process's RM.
@@ -365,6 +416,44 @@ fn with_caller(caller: &Caller, payload: &[u8]) -> Vec<u8> {
     msg
 }
 
+/// An OS event's message: the client, 4 bytes at zero, the open.
+const OS_EVENT_LEN: usize = 16;
+
+fn encode_os_event(client: u32, os_info: usize) -> [u8; OS_EVENT_LEN] {
+    let mut b = [0u8; OS_EVENT_LEN];
+    b[0..4].copy_from_slice(&client.to_le_bytes());
+    b[8..16].copy_from_slice(&(os_info as u64).to_le_bytes());
+    b
+}
+
+fn decode_os_event(b: &[u8]) -> Option<(u32, usize)> {
+    if b.len() != OS_EVENT_LEN || u32_at(b, 4) != 0 {
+        return None;
+    }
+    Some((u32_at(b, 0), usize::try_from(u64_at(b, 8)).ok()?))
+}
+
+/// A look at the nonstall interrupts as a word: its kind in the high half
+/// (0 serviced, 1 busy, 2 failed), the GPUs serviced or the status in the
+/// low.
+pub fn encode_nonstall(poll: NonstallPoll) -> u64 {
+    match poll {
+        NonstallPoll::Serviced(gpus) => u64::from(gpus),
+        NonstallPoll::Busy => 1 << 32,
+        NonstallPoll::Failed(status) => 2 << 32 | u64::from(status),
+    }
+}
+
+pub fn decode_nonstall(word: u64) -> Option<NonstallPoll> {
+    let low = word as u32;
+    match word >> 32 {
+        0 => Some(NonstallPoll::Serviced(low)),
+        1 if low == 0 => Some(NonstallPoll::Busy),
+        2 => Some(NonstallPoll::Failed(low)),
+        _ => None,
+    }
+}
+
 /// A loan on the link: its id, the user address of its first page,
 /// whether it is writable (`u32`), its page count (`u32`), and 8 bytes
 /// kept at zero.
@@ -395,8 +484,10 @@ fn decode_loan(data: &[u8]) -> Option<(UserPages, &[u8])> {
     let end = LOAN_LEN.checked_add(count.checked_mul(8)?)?;
     let phys = data
         .get(LOAN_LEN..end)?
-        .chunks_exact(8)
-        .map(|b| u64_at(b, 0))
+        .as_chunks::<8>()
+        .0
+        .iter()
+        .map(|b| u64::from_le_bytes(*b))
         .collect();
     let pages = UserPages {
         va: usize::try_from(u64_at(head, 8)).ok()?,
@@ -478,6 +569,9 @@ pub trait Rm {
     ) -> NV_STATUS;
     fn map_memory(&self, payload: &mut [u8], caller: &Caller) -> (NV_STATUS, Option<MmapContext>);
     fn map_unrecorded(&self, payload: &mut [u8], caller: &Caller, why: NV_STATUS);
+    fn alloc_os_event(&self, client: u32, os_info: usize, fd: u32) -> NV_STATUS;
+    fn free_os_event(&self, client: u32, fd: u32) -> NV_STATUS;
+    fn service_nonstall(&self) -> NonstallPoll;
 }
 
 /// This address space's RM: the driver's own.
@@ -508,6 +602,18 @@ impl Rm for ThisRm {
 
     fn map_unrecorded(&self, payload: &mut [u8], caller: &Caller, why: NV_STATUS) {
         super::map_unrecorded(payload, caller, why)
+    }
+
+    fn alloc_os_event(&self, client: u32, os_info: usize, fd: u32) -> NV_STATUS {
+        super::alloc_os_event(client, os_info, fd)
+    }
+
+    fn free_os_event(&self, client: u32, fd: u32) -> NV_STATUS {
+        super::free_os_event(client, fd)
+    }
+
+    fn service_nonstall(&self) -> NonstallPoll {
+        super::service_nonstall()
     }
 }
 
@@ -555,6 +661,21 @@ pub fn answer(rm: &dyn Rm, op: u32, a: u64, data: &[u8], out: &mut Vec<u8>) -> R
         op::RELEASE => {
             rm.release(a as usize);
             Ok(0)
+        }
+        op::ALLOC_OS_EVENT | op::FREE_OS_EVENT => {
+            let fd = u32::try_from(a).map_err(|_| EINVAL)?;
+            let (client, os_info) = decode_os_event(data).ok_or(EINVAL)?;
+            out.clear();
+            let status = if op == op::ALLOC_OS_EVENT {
+                rm.alloc_os_event(client, os_info, fd)
+            } else {
+                rm.free_os_event(client, fd)
+            };
+            Ok(status as u64)
+        }
+        op::SERVICE_NONSTALL => {
+            out.clear();
+            Ok(encode_nonstall(rm.service_nonstall()))
         }
         _ => Err(ENOSYS),
     }

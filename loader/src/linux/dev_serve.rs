@@ -240,6 +240,43 @@ pub(super) fn nvctl_return(proc: &Arc<Process>, args: &[usize; 6]) -> ZxResult {
     }
 }
 
+/// `eclipse_nvctl_event(os_info, flags, h_object, notify_index, info32,
+/// info16)`: the RM this process serves posts an OS event to the open
+/// `os_info` ([`ECLIPSE_NVCTL_SERVE`] told it of in the caller of its
+/// `ALLOC_OS_EVENT`), queued there for `poll` and `RM_GET_EVENT_DATA`.
+/// `flags` bit 0 says the other words are the event's data (`NvUnixEvent`);
+/// with it clear they are zero, an event with no data. An open that has
+/// closed takes nothing. `NOT_FOUND` to a process that serves no RM;
+/// `INVALID_ARGS` for other flags, or a word too wide for its field.
+pub const ECLIPSE_NVCTL_EVENT: u32 = super::ECLIPSE_GATEWAY_EXT + 27;
+
+#[cfg(target_arch = "x86_64")]
+pub(super) fn nvctl_event(proc: &Arc<Process>, args: &[usize; 6]) -> ZxResult {
+    use core::convert::TryFrom;
+    use linux_object::fs::devfs::served::nvctl;
+    let word = |v: usize| u32::try_from(v).map_err(|_| ZxError::INVALID_ARGS);
+    let event = match args[1] {
+        0 if args[2..].iter().all(|&w| w == 0) => None,
+        1 => Some(nvctl::UnixEvent {
+            h_object: word(args[2])?,
+            notify_index: word(args[3])?,
+            info32: word(args[4])?,
+            info16: u16::try_from(args[5]).map_err(|_| ZxError::INVALID_ARGS)?,
+        }),
+        _ => return Err(ZxError::INVALID_ARGS),
+    };
+    if nvctl::post_event(proc.id(), args[0], event) {
+        Ok(())
+    } else {
+        Err(ZxError::NOT_FOUND)
+    }
+}
+
+#[cfg(not(target_arch = "x86_64"))]
+pub(super) fn nvctl_event(_proc: &Arc<Process>, _args: &[usize; 6]) -> ZxResult {
+    Err(ZxError::NOT_SUPPORTED)
+}
+
 #[cfg(not(target_arch = "x86_64"))]
 pub(super) fn nvctl_return(_proc: &Arc<Process>, _args: &[usize; 6]) -> ZxResult {
     Err(ZxError::NOT_SUPPORTED)

@@ -21,7 +21,8 @@
 //!   cmdline, and a PCI function claimed as for `check`, for its BAR and
 //!   DMA memory): an escape's parameters reached through its pointer, the
 //!   GPU node, mappings of its memory and its BAR, pages of the caller's
-//!   lent to it and given back, the close.
+//!   lent to it and given back, an OS event posted from its nonstall
+//!   interrupt waking a `poll`, the close.
 mod drm;
 mod gem;
 mod gpu;
@@ -339,6 +340,7 @@ fn nvctl_check(vendor: u16, device: u16) {
         rm.unrecorded.load(Ordering::Relaxed) != 0,
     );
     lent_pages_check(rm, &map, &ok);
+    os_event_check(rm, &ok);
     drop(ctl);
     let start = Instant::now();
     while rm.released.load(Ordering::Relaxed) == 0 && start.elapsed() < Duration::from_secs(2) {
@@ -445,6 +447,89 @@ fn lent_pages_check(
     );
     // SAFETY: the mapping made above, no longer used.
     unsafe { libc::munmap(buf, PAGES * 4096) };
+}
+
+/// `nvctl-check`'s OS events: an open registered with `ALLOC_OS_EVENT` is
+/// polled, which has the kernel ask the RM to look at its nonstall
+/// interrupts; the RM posts what it finds, and the poll wakes with it on
+/// the queue (`RM_GET_EVENT_DATA`).
+fn os_event_check(rm: &nvctl::check::CheckRm, ok: &dyn Fn(&str, bool)) {
+    use std::os::fd::AsRawFd;
+    use std::sync::atomic::Ordering;
+    use std::time::Instant;
+    // `_IOWR('F', NV_ESC_ALLOC_OS_EVENT, 16)`, `..._FREE_OS_EVENT` and
+    // `NV_ESC_RM_GET_EVENT_DATA`.
+    const ALLOC_OS_EVENT: u64 = 0xc010_46ce;
+    const FREE_OS_EVENT: u64 = 0xc010_46cf;
+    const GET_EVENT_DATA: u64 = 0xc010_4652;
+    const CLIENT: u32 = 0xc1d0_0001;
+    let ev = open_rw("/dev/nvidia0").unwrap_or_else(|| fail("open /dev/nvidia0".into()));
+    let fd = ev.as_raw_fd();
+    let ioctl = |nr: u64, p: &mut [u8; 16]| {
+        // SAFETY: `p` is the 16 bytes of each of the three payloads.
+        unsafe { libc::ioctl(fd, nr as _, p.as_mut_ptr()) }
+    };
+    let status = |p: &[u8; 16]| u32::from_le_bytes(p[12..16].try_into().unwrap());
+    let mut p = [0u8; 16];
+    p[0..4].copy_from_slice(&CLIENT.to_le_bytes());
+    p[8..12].copy_from_slice(&(fd as u32).to_le_bytes());
+    ok(
+        "an OS event is registered with the RM",
+        ioctl(ALLOC_OS_EVENT, &mut p) == 0 && status(&p) == 0,
+    );
+    let posted = nvctl::POSTED.load(Ordering::Relaxed);
+    let mut poll = libc::pollfd {
+        fd,
+        events: libc::POLLIN,
+        revents: 0,
+    };
+    let t = Instant::now();
+    // SAFETY: one pollfd, this process's.
+    let ready = unsafe { libc::poll(&mut poll, 1, 5000) };
+    let took = t.elapsed();
+    ok(
+        "a poll on it wakes with what the RM's nonstall interrupt posted",
+        ready == 1 && poll.revents & libc::POLLIN != 0,
+    );
+    println!(
+        "{NAME}: OS event through the served RM: {} us from poll to wake, {} looks",
+        took.as_micros(),
+        rm.looks.load(Ordering::Relaxed)
+    );
+    ok(
+        "...posted to the kernel by the RM's process",
+        nvctl::POSTED.load(Ordering::Relaxed) == posted + 1
+            && nvctl::POST_REFUSED.load(Ordering::Relaxed) == 0,
+    );
+    let mut event = [0u8; 16];
+    let mut get = [0u8; 16];
+    get[0..8].copy_from_slice(&(event.as_mut_ptr() as u64).to_le_bytes());
+    ok(
+        "...and read back as the RM said it",
+        ioctl(GET_EVENT_DATA, &mut get) == 0 && status(&get) == 0 && {
+            let (h, index, info32, info16) = nvctl::check::EVENT;
+            let word = |at: usize| u32::from_le_bytes(event[at..at + 4].try_into().unwrap());
+            word(0) == h
+                && word(4) == index
+                && word(8) == info32
+                && u16::from_le_bytes([event[12], event[13]]) == info16
+        },
+    );
+    ok(
+        "...once",
+        ioctl(GET_EVENT_DATA, &mut get) == 0 && status(&get) != 0,
+    );
+    let mut free = [0u8; 16];
+    free[0..4].copy_from_slice(&CLIENT.to_le_bytes());
+    free[8..12].copy_from_slice(&(fd as u32).to_le_bytes());
+    ok(
+        "...and freed in the RM",
+        ioctl(FREE_OS_EVENT, &mut free) == 0 && status(&free) == 0,
+    );
+    ok(
+        "...once",
+        ioctl(FREE_OS_EVENT, &mut free) == 0 && status(&free) != 0,
+    );
 }
 
 /// `DRM_IOCTL_MODE_GETRESOURCES`, `_IOWR('d', 0xA0, struct drm_mode_card_res)`.

@@ -436,7 +436,7 @@ static EVENT_OPENS: Mutex<BTreeMap<usize, Arc<OpenEvents>>> = Mutex::new(BTreeMa
 
 /// `nv_post_event`, as the RM's registrations hand it an event for the open
 /// `os_info`. An open that has closed takes nothing.
-fn post_event(os_info: usize, event: Option<nvctl::UnixEvent>) {
+pub(crate) fn post_event(os_info: usize, event: Option<nvctl::UnixEvent>) {
     let events = EVENT_OPENS.lock().get(&os_info).cloned();
     if let Some(events) = events {
         events.post(event);

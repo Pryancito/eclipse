@@ -81,19 +81,20 @@ fn served_elsewhere() -> bool {
     remote::served().is_some()
 }
 
-/// `nvidia_rm_sys::frontend::events::alloc_os_event`, on this address
-/// space's RM only.
+/// `nvidia_rm_sys::frontend::events::alloc_os_event`, of the RM a
+/// process serves when one does: its registrations are its own, and what
+/// it posts to them comes back through `ECLIPSE_NVCTL_EVENT`.
 pub fn alloc_os_event(h_client: u32, os_info: usize, fd: u32) -> NV_STATUS {
-    if served_elsewhere() {
-        return NV_ERR_NOT_SUPPORTED;
+    if let Some(served) = remote::served() {
+        return served.alloc_os_event(h_client, os_info, fd);
     }
     nvidia_rm_sys::frontend::events::alloc_os_event(h_client, os_info, fd)
 }
 
 /// `nvidia_rm_sys::frontend::events::free_os_event`, likewise.
 pub fn free_os_event(h_client: u32, fd: u32) -> NV_STATUS {
-    if served_elsewhere() {
-        return NV_ERR_NOT_SUPPORTED;
+    if let Some(served) = remote::served() {
+        return served.free_os_event(h_client, fd);
     }
     nvidia_rm_sys::frontend::events::free_os_event(h_client, fd)
 }
@@ -102,10 +103,15 @@ pub use nvidia_rm_sys::frontend::events::NonstallPoll;
 
 /// `nvidia_rm_sys::frontend::events::service_nonstall`: service the nonstall
 /// interrupts pending on every GPU, which posts the OS events bound to them.
-/// With no RM core there is nothing to look at, and an RM a process serves
-/// is not this address space's to look at (its OS events are not carried
-/// yet).
+/// With no RM core there is nothing to look at. An RM a process serves
+/// looks in the process, which posts what it finds as its other events.
 pub fn service_nonstall() -> NonstallPoll {
+    if let Some(served) = remote::served() {
+        if !served.rm_up() {
+            return NonstallPoll::Serviced(0);
+        }
+        return served.service_nonstall();
+    }
     if !local_rm_up() {
         return NonstallPoll::Serviced(0);
     }
@@ -400,6 +406,8 @@ mod tests {
     /// the RM's globals were never constructed).
     #[test]
     fn nothing_reaches_an_rm_that_was_never_built() {
+        // Not while a test serves an RM from a process.
+        let _g = crate::test_globals::LOCK.lock();
         assert!(!rm_up());
         let caller = Caller {
             os_info: 0x1000,
