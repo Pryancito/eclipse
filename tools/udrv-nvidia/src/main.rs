@@ -129,6 +129,22 @@ fn run(only: Option<usize>) {
             Err(e) => fail(format!("{}: {e:?}", drv.name())),
         }
     }
+    // What the kernel does for its own GPUs at boot, before anything else
+    // touches the RM: the GSP firmware to every GPU, and the RM up on each
+    // that does not scan out the console (the console one stays cold unless
+    // `nvidia.console_gpu`). Before the RM says what it has: a GPU whose RM
+    // never came up has a node no client can open.
+    gsp_firmware(&cards);
+    if cmdline_has("nvidia.noautoboot") {
+        println!("{NAME}: nvidia.noautoboot: no GPU's RM is brought up");
+    } else {
+        for card in &cards {
+            let line = card.auto_bringup_compute();
+            if !line.is_empty() {
+                println!("{NAME}: {line}");
+            }
+        }
+    }
     println!(
         "{NAME}: {} up on {} GPU(s), serving them",
         drv.name(),
@@ -159,6 +175,51 @@ fn run(only: Option<usize>) {
     for card in served {
         let _ = card.join();
     }
+}
+
+/// The GSP-RM firmware, where the image has it and the kernel reads it
+/// from for its own GPUs.
+const GSP_FIRMWARE: &str = "/lib/firmware/nvidia/gsp/gsp.bin";
+
+/// Hand every GPU the GSP firmware, or why there is none: without it no
+/// RM comes up.
+fn gsp_firmware(cards: &[std::sync::Arc<dyn zcore_drivers::scheme::DrmScheme>]) {
+    match std::fs::read(GSP_FIRMWARE) {
+        Ok(bytes) if !bytes.is_empty() => {
+            println!("{NAME}: GSP-RM firmware, {} bytes", bytes.len());
+            let status = format!("OK: {} bytes delivered by {NAME}", bytes.len());
+            for card in cards {
+                card.set_gsp_firmware(bytes.clone());
+                card.set_gsp_firmware_status(status.clone());
+            }
+        }
+        Ok(_) => gsp_firmware_missing(cards, format!("{GSP_FIRMWARE} is 0 bytes")),
+        Err(e) => gsp_firmware_missing(cards, format!("{GSP_FIRMWARE}: {e}")),
+    }
+}
+
+fn gsp_firmware_missing(
+    cards: &[std::sync::Arc<dyn zcore_drivers::scheme::DrmScheme>],
+    why: String,
+) {
+    println!("{NAME}: no GSP-RM firmware ({why}): no GPU's RM comes up");
+    for card in cards {
+        card.set_gsp_firmware_status(why.clone());
+    }
+}
+
+/// Whether the boot line has `flag`, as the kernel reads its flags: a word
+/// of its own, words split by blanks and `:`.
+fn cmdline_has(flag: &str) -> bool {
+    std::fs::read_to_string("/proc/cmdline")
+        .map(|line| has_flag(&line, flag))
+        .unwrap_or(false)
+}
+
+fn has_flag(cmdline: &str, flag: &str) -> bool {
+    cmdline
+        .split([':', ' ', '\t', '\n'])
+        .any(|word| word == flag)
 }
 
 /// What the boot knows of the display, as the kernel's driver was told.
@@ -1120,4 +1181,18 @@ fn syncobj_check(dma: u64, size: u64, ok: impl Fn(&str, bool)) {
         "{NAME}: poll_pending through the kernel: {:.1} us",
         t.elapsed().as_secs_f64() * 1e6 / N as f64
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::has_flag;
+
+    #[test]
+    fn a_flag_is_a_word_of_the_boot_line() {
+        let line = "LOG=warn nvidia.noautoboot:nvidia.cuda udriver=nvidia@0\n";
+        assert!(has_flag(line, "nvidia.noautoboot"));
+        assert!(has_flag(line, "nvidia.cuda"));
+        assert!(!has_flag(line, "nvidia.noauto"));
+        assert!(!has_flag("nvidia.noautobootx", "nvidia.noautoboot"));
+    }
 }
