@@ -32,6 +32,7 @@ const PCI_CAP_ID_MSI: u8 = 0x05;
 const PCI_MAX_CAP_TRAVERSAL: usize = 64;
 
 pub mod cfgwrite;
+pub mod host;
 pub mod msix;
 
 pub struct PortOpsImpl;
@@ -210,9 +211,15 @@ pub const PCI_CONFIG_SIZE: usize = 256 * 32 * 8 * 4096;
 const E1000_BASE: usize = 0x40000000;
 // riscv64 Qemu
 
-// aarch64 QEMU `virt` PCIe ECAM configuration space base.
+/// aarch64 QEMU `virt` PCIe ECAM configuration space base (its high
+/// window). The config accessors reach it with a bare `phys_to_virt`, so
+/// the kernel maps it first -- see `kernel_hal`'s aarch64 `drivers::init`,
+/// which also checks the device tree puts the bridge here.
 #[cfg(target_arch = "aarch64")]
-const PCI_BASE: usize = 0x40_1000_0000;
+pub const PCI_BASE: usize = 0x40_1000_0000;
+/// The whole ECAM window: 256 buses x 32 devices x 8 functions x 4 KiB.
+#[cfg(target_arch = "aarch64")]
+pub const PCI_CONFIG_SIZE: usize = 256 * 32 * 8 * 4096;
 
 #[cfg(target_arch = "x86_64")]
 pub const PCI_ACCESS: CSpaceAccessMethod = CSpaceAccessMethod::IO;
@@ -253,6 +260,7 @@ impl PortOps for PortOpsImpl {
 static MSI_IRQ: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(23);
 
 /// The next interrupt number for a message-signalled interrupt, MSI or MSI-X.
+#[cfg_attr(target_arch = "aarch64", allow(dead_code))]
 fn next_msi_irq() -> u32 {
     MSI_IRQ.fetch_add(1, core::sync::atomic::Ordering::Relaxed) + 1
 }
@@ -265,6 +273,7 @@ fn next_msi_irq() -> u32 {
 /// BSP any other id, every MSI (xHCI keyboard/mouse, e1000e RX) went to a CPU
 /// that may never come up and was silently lost. Route them to the CPU that
 /// actually runs the interrupt handlers.
+#[cfg_attr(target_arch = "aarch64", allow(dead_code))]
 fn msi_dest() -> u32 {
     #[cfg(target_arch = "x86_64")]
     return crate::irq::x86::Apic::bsp_apic_id() as u32;
@@ -272,6 +281,52 @@ fn msi_dest() -> u32 {
     0u32
 }
 
+/// The host bridge, where the device tree describes it (aarch64): which
+/// line each function's INTx pin raises. Set once, before the scan.
+static HOST: spin::Once<host::PciHost> = spin::Once::new();
+
+/// Give the scan the bridge the device tree describes.
+pub fn set_host(h: host::PciHost) {
+    HOST.call_once(|| h);
+}
+
+/// The bridge [`set_host`] gave, if any.
+pub fn host() -> Option<&'static host::PciHost> {
+    HOST.get()
+}
+
+/// On aarch64 a function interrupts through its INTx pin: no message
+/// address is known here (the GIC's v2m frame or ITS is not set up), so no
+/// MSI is armed. The line the bridge routes the pin to, a level, is the
+/// function's interrupt; `None` when the bridge names none.
+#[cfg(target_arch = "aarch64")]
+unsafe fn enable_intx(loc: Location) -> Option<usize> {
+    let (ops, am) = (&PortOpsImpl, PCI_ACCESS);
+    // SAFETY: this function's configuration space, through the mapped ECAM.
+    unsafe {
+        let cmd = am.read16(ops, loc, PCI_COMMAND);
+        // Memory space and bus mastering on, INTx not disabled.
+        cfgwrite::cfg_write16(
+            ops,
+            am,
+            loc,
+            PCI_COMMAND,
+            (cmd | 0x6) & !PCI_COMMAND_INTX_DISABLE,
+        );
+        let pin = am.read8(ops, loc, PCI_INTERRUPT_PIN);
+        HOST.get()?
+            .intx_for(loc.bus, loc.device, loc.function, pin)
+            .map(|e| e.intid as usize)
+    }
+}
+
+#[cfg(target_arch = "aarch64")]
+unsafe fn enable(loc: Location, _paddr: u64) -> Option<usize> {
+    // SAFETY: the caller's, as below.
+    unsafe { enable_intx(loc) }
+}
+
+#[cfg(not(target_arch = "aarch64"))]
 unsafe fn enable(loc: Location, paddr: u64) -> Option<usize> {
     // SAFETY: same call as the body below, against the real config ports.
     unsafe {

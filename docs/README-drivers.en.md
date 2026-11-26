@@ -171,15 +171,15 @@ To remove it, use REMOVE DRIVER in the panel or
 
 ## Limits to know
 
-- **An IOMMU only on x86_64, and only if the machine has one.** DMA
-  addresses are physical. On a PC with VT-d or AMD-Vi the kernel turns it
-  on by default and your device reaches only what you pinned with
-  `Dma::new`; a write outside it fails and shows in `dmesg` as `iommu: DMA
-  fault`. Its interrupts go through it too: your device can raise only
-  its own (`iommu=noir` turns just that part off). Without an IOMMU (other architectures, machines without one, or
-  a boot with `iommu=off`) a buggy driver can write anywhere in memory.
-  The panel warns about this on install. Test on a machine you can
-  restart.
+- **An IOMMU only if the machine has one.** DMA addresses are physical.
+  On a PC with VT-d or AMD-Vi, and on aarch64 with QEMU `virt`'s SMMUv3
+  (for PCI), the kernel turns it on by default and your device reaches
+  only what you pinned with `Dma::new`; a write outside it fails and shows
+  in `dmesg` as `iommu: DMA fault`. On x86_64 its interrupts go through it
+  too: your device can raise only its own (`iommu=noir` turns just that
+  part off). Without an IOMMU (riscv64, machines without one, or a boot
+  with `iommu=off`) a buggy driver can write anywhere in memory. The panel
+  warns about this on install. Test on a machine you can restart.
 - **If the driver dies, the device waits for a restart.** The kernel does
   not know how to stop a device it does not know, so it keeps it out of use
   with its memory pinned. Exit cleanly: leave the device stopped before you

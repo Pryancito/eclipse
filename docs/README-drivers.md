@@ -174,16 +174,16 @@ Para quitarlo, usa QUITAR DRIVER en el panel o
 
 ## Límites que debes conocer
 
-- **IOMMU solo en x86_64, y solo si la máquina la tiene.** Las direcciones
-  DMA son físicas. En un PC con VT-d o AMD-Vi, el núcleo la enciende por
-  defecto y tu dispositivo solo alcanza lo que fijaste con `Dma::new`; una
-  escritura fuera de eso falla y aparece en `dmesg` como `iommu: DMA
-  fault`. Sus interrupciones pasan por ella también: tu dispositivo solo
-  puede lanzar la suya (`iommu=noir` deja solo esa parte apagada). Sin
-  IOMMU (otras arquitecturas, máquinas sin ella, o arrancando
-  con `iommu=off`), un driver con fallos puede escribir en cualquier parte
-  de la memoria. El panel lo avisa al instalar. Prueba en una máquina que
-  puedas reiniciar.
+- **IOMMU solo si la máquina la tiene.** Las direcciones DMA son físicas.
+  En un PC con VT-d o AMD-Vi, y en aarch64 con la SMMUv3 de la `virt` de
+  QEMU (para PCI), el núcleo la enciende por defecto y tu dispositivo solo
+  alcanza lo que fijaste con `Dma::new`; una escritura fuera de eso falla
+  y aparece en `dmesg` como `iommu: DMA fault`. En x86_64 sus
+  interrupciones pasan por ella también: tu dispositivo solo puede lanzar
+  la suya (`iommu=noir` deja solo esa parte apagada). Sin IOMMU (riscv64,
+  máquinas sin ella, o arrancando con `iommu=off`), un driver con fallos
+  puede escribir en cualquier parte de la memoria. El panel lo avisa al
+  instalar. Prueba en una máquina que puedas reiniciar.
 - **Si el driver muere, el dispositivo espera al reinicio.** El núcleo no
   sabe parar un dispositivo que no conoce, así que lo deja fuera de uso con
   su memoria fijada. Sal limpiamente: deja el dispositivo parado antes de

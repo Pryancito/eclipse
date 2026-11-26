@@ -1101,7 +1101,7 @@ mod aarch64_boot_cmdline_tests {
     fn probe_devicetree_reads_the_owned_copy() {
         let src = include_str!("../bare/arch/aarch64/drivers.rs");
         let body = src
-            .split("fn probe_devicetree() {")
+            .split("fn probe_devicetree() -> Found {")
             .nth(1)
             .expect("probe_devicetree moved");
         assert!(

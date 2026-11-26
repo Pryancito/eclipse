@@ -455,7 +455,7 @@ else ifeq ($(ARCH), aarch64)
   # the desktop image, or nothing on a tree that only has the minimal one.
   aarch64_rootfs := $(if $(filter 1,$(LINUX)),$(user_img),aarch64.img)
 	qemu_opts += \
-		-machine virt \
+		-machine virt$(if $(filter smmuv3,$(IOMMU)),$(comma)iommu=smmuv3) \
 		-cpu cortex-a72 \
 		-m 1G \
 		-serial mon:stdio \
@@ -504,6 +504,7 @@ qemu_opts += -no-reboot
 # IOMMU=amd: the AMD one (QEMU `amd-iommu`, interrupt remapping off).
 # IOMMU=amd-ir: the same with interrupt remapping on, so that a claimed
 # device's interrupts go through the table the kernel gives it.
+# IOMMU=smmuv3 (aarch64): QEMU `virt`'s SMMUv3 in front of the PCIe bus.
 # IOMMU=intel-ir: the Intel one with interrupt remapping on (xAPIC ids, no
 # x2APIC), which the kernel then uses for every interrupt.
 ifeq ($(IOMMU),intel)
@@ -567,8 +568,8 @@ endif
 
 # UNVME=<raw image>: an NVMe disk (QEMU `nvme`, on PCI), served by the
 # driver in userspace (`tools/eclipse-udrivers`, `udrv-nvme`): the kernel
-# has none of its own. aarch64's kernel probes no PCI bus, so there the
-# disk is not seen at all.
+# has none of its own. On aarch64 the controller is on `virt`'s PCIe bus,
+# which the kernel finds in the device tree QEMU leaves at the base of RAM.
 ifneq ($(UNVME),)
   qemu_opts += -drive file=$(UNVME),if=none,format=raw,id=unvme
   qemu_opts += -device nvme,serial=eclipse0,drive=unvme
