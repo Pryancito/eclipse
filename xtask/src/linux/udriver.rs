@@ -49,6 +49,7 @@ use std::path::{Path, PathBuf};
 use super::mtime::newest_mtime_under;
 use super::LinuxRootfs;
 use crate::commands::optional_status;
+use crate::Arch;
 use crate::PROJECT_DIR;
 use os_xtask_utils::{CommandExt, Ext};
 
@@ -86,6 +87,19 @@ const INPUT_DRIVERS: [&str; 4] = [
 /// what plays a tone through such nodes and checks them, `udrv-dsp-check`
 /// and `udrv-snd-check`.
 const AUDIO_DRIVERS: [&str; 3] = ["udrv-hda", "udrv-dsp-check", "udrv-snd-check"];
+/// The NVIDIA driver in a process (`tools/udrv-nvidia`): the kernel's own
+/// driver and NVIDIA's RM linked into one binary, which claims every NVIDIA
+/// GPU the boot leaves to userspace (`udriver=nvidia@0`, ...) and serves a
+/// card per GPU and `/dev/nvidia*` for all of them. x86_64 only, like the
+/// RM. What it is built from besides its own sources: the drivers' library,
+/// the drivers (the kernel's NVIDIA driver) and the RM's Rust side.
+const NVIDIA_PACKAGE: &str = "udrv-nvidia";
+const NVIDIA: [&str; 1] = ["udrv-nvidia"];
+const NVIDIA_USES: [&str; 3] = [
+    "tools/eclipse-udrivers/src",
+    "drivers/src",
+    "nvidia-rm-sys/src",
+];
 /// How many virtio input devices get a driver service of their own
 /// (`uinput` to `uinput4`): a keyboard, a mouse or tablet, and two more.
 /// The kernel has no driver for one: the kernel leaves this many to
@@ -467,6 +481,33 @@ pub(super) fn write_services(localbin: &Path, svc_dir: &Path) {
     )
     .unwrap();
 
+    // The NVIDIA GPUs the boot leaves to userspace (`udriver=nvidia@0`,
+    // and `nvidia@1` for a second): every one of them, to one process,
+    // which serves a card per GPU and `/dev/nvidia*` for all of them. Only
+    // when the boot asks: the kernel's own driver is the default.
+    fs::write(
+        svc_dir.join("unvidia.service"),
+        "# Driver of every NVIDIA GPU the kernel left to userspace\n\
+         # (udriver=nvidia@N): one process for all of them, a card per GPU\n\
+         # and /dev/nvidia*. See /usr/local/bin/eclipse-unvidia.\n\
+         exec = /usr/local/bin/eclipse-unvidia\n\
+         type = respawn\n\
+         udriver = nvidia\n",
+    )
+    .unwrap();
+    fs::write(
+        localbin.join("eclipse-unvidia"),
+        b"#!/bin/sh\n\
+          # Eclipse OS: the userspace driver of the NVIDIA GPUs the kernel\n\
+          # left alone (udriver=nvidia@N), in the foreground for eclipse-init,\n\
+          # which starts it again if it dies. It claims every one of them.\n\
+          # See tools/udrv-nvidia.\n\
+          grep -q '^nvidia@' /proc/udrivers || { echo 'eclipse-unvidia: the kernel left no NVIDIA GPU to userspace' >&2; sleep 5; exit 1; }\n\
+          [ -x /bin/udrv-nvidia ] || { echo 'eclipse-unvidia: /bin/udrv-nvidia is not in this image (it is built on x86_64 only; or its build failed: see the image log)' >&2; sleep 5; exit 127; }\n\
+          exec /bin/udrv-nvidia\n",
+    )
+    .unwrap();
+
     // Gone: what fstab puts on a disk a process drives is fs-mounts's now
     // (every type it has is one a process serves), which waits for that
     // disk as this did.
@@ -712,6 +753,12 @@ impl LinuxRootfs {
         let built = self.rust_tools(NFS_PACKAGE, &NFS, &NFS_USES);
         for name in NFS {
             put(&built.join(name), name);
+        }
+        if matches!(self.0, Arch::X86_64) {
+            let built = self.rust_tools(NVIDIA_PACKAGE, &NVIDIA, &NVIDIA_USES);
+            for name in NVIDIA {
+                put(&built.join(name), name);
+            }
         }
     }
 
