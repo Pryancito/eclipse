@@ -1367,12 +1367,7 @@ pub fn create_nodes(root: &Arc<DevINode>) {
         return;
     }
     let cards = nvctl::cards();
-    for card in cards.iter().filter(|card| card.minor <= GPU_MINOR_MAX) {
-        let name = format!("nvidia{}", card.minor);
-        if let Err(e) = root.add(&name, Arc::new(NvidiaDev::new(Node::Gpu(card.minor)))) {
-            zcore_drivers::klog_warn!("[nvidiactl] failed to mknod /dev/{}: {:?}", name, e);
-        }
-    }
+    add_nodes_of(root, &cards);
     let ready = cards.iter().filter(|card| card.instance.is_some()).count();
     zcore_drivers::klog_warn!(
         "[nvidiactl] /dev/nvidiactl and {} GPU node(s), {} with the RM up (RM {})",
@@ -1385,6 +1380,36 @@ pub fn create_nodes(root: &Arc<DevINode>) {
     // the RM up` is the whole of what `dmesg | grep -i nvidia` had to say
     // about the card that stayed down, and the node it belongs to (the one a
     // client opens, and the one NVML numbers) was not in the log at all.
+    for card in cards.iter().filter(|card| card.minor <= GPU_MINOR_MAX) {
+        zcore_drivers::klog_warn!("[nvidiactl]   {}", card_roster_line(card));
+    }
+}
+
+/// A `/dev/nvidia<N>` for each of `cards` that has none.
+fn add_nodes_of(root: &Arc<DevINode>, cards: &[nvctl::Card]) {
+    for card in cards.iter().filter(|card| card.minor <= GPU_MINOR_MAX) {
+        let name = format!("nvidia{}", card.minor);
+        if (root.clone() as Arc<dyn INode>).find(&name).is_ok() {
+            continue;
+        }
+        if let Err(e) = root.add(&name, Arc::new(NvidiaDev::new(Node::Gpu(card.minor)))) {
+            zcore_drivers::klog_warn!("[nvidiactl] failed to mknod /dev/{}: {:?}", name, e);
+        }
+    }
+}
+
+/// The GPU nodes of an RM that came after the device files were made (one
+/// a process serves, `served::nvctl`), each listed as at boot. Nothing
+/// without `/dev/nvidiactl`.
+pub fn add_gpu_nodes() {
+    let Some(root) = crate::fs::DEVFS_ROOT.lock().clone() else {
+        return;
+    };
+    if (root.clone() as Arc<dyn INode>).find("nvidiactl").is_err() {
+        return;
+    }
+    let cards = nvctl::cards();
+    add_nodes_of(&root, &cards);
     for card in cards.iter().filter(|card| card.minor <= GPU_MINOR_MAX) {
         zcore_drivers::klog_warn!("[nvidiactl]   {}", card_roster_line(card));
     }

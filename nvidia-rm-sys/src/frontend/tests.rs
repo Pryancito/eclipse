@@ -220,6 +220,58 @@ fn user_copies_ask_the_kernel_inside_a_call() {
     );
 }
 
+/// A copy hook that "copies" between a fake caller memory at 0x5000.. and
+/// this address space, refusing anything else.
+static FAKE_USER: [AtomicU8; 4] = [const { AtomicU8::new(0) }; 4];
+
+fn fake_copy(to_user: bool, user: usize, ours: *mut u8, len: usize) -> bool {
+    if user < 0x5000 || user + len > 0x5004 {
+        return false;
+    }
+    for i in 0..len {
+        let cell = &FAKE_USER[user - 0x5000 + i];
+        // SAFETY: `ours` is the RM's buffer of `len` bytes.
+        unsafe {
+            if to_user {
+                cell.store(*ours.add(i), Ordering::SeqCst);
+            } else {
+                *ours.add(i) = cell.load(Ordering::SeqCst);
+            }
+        }
+    }
+    true
+}
+
+/// With a copy registered (the RM in a process of its own) the copies go
+/// through it, not through this address space, and only inside a call.
+#[test]
+fn a_registered_copy_reaches_the_caller_s_memory() {
+    let _t = turnstile();
+    set_user_copy(fake_copy);
+    set_user_range_validator(refuse_all);
+    let mut ours = [9u8, 8, 7, 6];
+    assert_eq!(
+        copy_to_user(0x5000 as *mut u8, ours.as_ptr(), 4),
+        NV_ERR_NOT_SUPPORTED
+    );
+    {
+        let _scope = CallScope::enter(&a_caller(0, false));
+        assert_eq!(copy_to_user(0x5000 as *mut u8, ours.as_ptr(), 4), NV_OK);
+        ours = [0; 4];
+        assert_eq!(
+            copy_from_user(ours.as_mut_ptr(), 0x5001 as *const u8, 3),
+            NV_OK
+        );
+        assert_eq!(ours, [8, 7, 6, 0]);
+        assert_eq!(
+            copy_from_user(ours.as_mut_ptr(), 0x5002 as *const u8, 4),
+            NV_ERR_INVALID_ADDRESS,
+            "past what the caller has"
+        );
+    }
+    USER_COPY.store(0, Ordering::Release);
+}
+
 #[test]
 fn the_call_scope_sets_and_clears_the_caller() {
     let _t = turnstile();

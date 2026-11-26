@@ -51,6 +51,7 @@ pub mod nr {
     pub const ECLIPSE_DRM_SERVE: i64 = 0x4016;
     pub const ECLIPSE_GEM: i64 = 0x4017;
     pub const ECLIPSE_SYNCOBJ: i64 = 0x4018;
+    pub const ECLIPSE_NVCTL_SERVE: i64 = 0x4019;
 }
 
 /// A `zx_status_t` that is not `ZX_OK`.

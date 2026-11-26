@@ -19,9 +19,9 @@ use super::{NvidiaGpu, NVIDIA_GPUS, RM_CORE_INIT_STATUS};
 use alloc::vec::Vec;
 use core::sync::atomic::{AtomicBool, Ordering};
 
-pub use nvidia_rm_sys::frontend::events::{
-    alloc_os_event, free_os_event, set_event_sink, UnixEvent, NV_ERR_INVALID_EVENT,
-};
+pub mod remote;
+
+pub use nvidia_rm_sys::frontend::events::{set_event_sink, UnixEvent, NV_ERR_INVALID_EVENT};
 pub use nvidia_rm_sys::frontend::user_pages::UserPages;
 pub use nvidia_rm_sys::frontend::uvm::{
     ExternalMapping, P2pCaps, Pages, SkedRange, NV_ERR_INVALID_CLIENT,
@@ -31,7 +31,7 @@ pub use nvidia_rm_sys::frontend::{
     Caller, CpuCaching, MmapContext, MmapMemory, CALLER_NAME_LEN, GPU_UUID_LEN, LAYOUT,
     NV_ERR_STATE_IN_USE, VERSION_CMD_QUERY, VERSION_REPLY_RECOGNIZED, VERSION_STRING_LENGTH,
 };
-use nvidia_rm_sys::types::{NV_ERR_NOT_READY, NV_OK, NV_STATUS};
+use nvidia_rm_sys::types::{NV_ERR_NOT_READY, NV_ERR_NOT_SUPPORTED, NV_OK, NV_STATUS};
 
 static ENABLED: AtomicBool = AtomicBool::new(false);
 
@@ -62,12 +62,50 @@ pub fn uvm_enabled() -> bool {
 /// is built by the first GPU attach, so a machine with no NVIDIA GPU, or a
 /// boot that has not attached one yet, has no RM to take an escape at all.
 pub fn rm_up() -> bool {
+    match remote::served() {
+        Some(served) => served.rm_up(),
+        None => local_rm_up(),
+    }
+}
+
+/// Whether this address space's own RM core is constructed.
+fn local_rm_up() -> bool {
     *RM_CORE_INIT_STATUS.lock() == Some(NV_OK)
+}
+
+/// Whether the RM is a process's ([`remote`]), whose answers to what it
+/// does not carry yet are `NV_ERR_NOT_SUPPORTED`: this address space's RM
+/// is never entered then, as it is never built.
+fn served_elsewhere() -> bool {
+    remote::served().is_some()
+}
+
+/// `nvidia_rm_sys::frontend::events::alloc_os_event`, on this address
+/// space's RM only.
+pub fn alloc_os_event(h_client: u32, os_info: usize, fd: u32) -> NV_STATUS {
+    if served_elsewhere() {
+        return NV_ERR_NOT_SUPPORTED;
+    }
+    nvidia_rm_sys::frontend::events::alloc_os_event(h_client, os_info, fd)
+}
+
+/// `nvidia_rm_sys::frontend::events::free_os_event`, likewise.
+pub fn free_os_event(h_client: u32, fd: u32) -> NV_STATUS {
+    if served_elsewhere() {
+        return NV_ERR_NOT_SUPPORTED;
+    }
+    nvidia_rm_sys::frontend::events::free_os_event(h_client, fd)
 }
 
 /// `nvidia_rm_sys::frontend::rm_escape`, refused with `NV_ERR_NOT_READY`
 /// while there is no RM core to run it.
 pub fn rm_escape(cmd: u32, payload: &mut [u8], caller: &Caller) -> NV_STATUS {
+    if let Some(served) = remote::served() {
+        if !served.rm_up() {
+            return NV_ERR_NOT_READY;
+        }
+        return served.rm_escape(cmd, payload, caller);
+    }
     if !rm_up() {
         return NV_ERR_NOT_READY;
     }
@@ -83,6 +121,9 @@ pub fn rm_escape_lending(
     caller: &Caller,
     pages: Option<UserPages>,
 ) -> NV_STATUS {
+    if served_elsewhere() {
+        return NV_ERR_NOT_SUPPORTED;
+    }
     if !rm_up() {
         return NV_ERR_NOT_READY;
     }
@@ -92,6 +133,9 @@ pub fn rm_escape_lending(
 /// `nvidia_rm_sys::frontend::rm_map_memory`, refused with `NV_ERR_NOT_READY`
 /// while there is no RM core to run it.
 pub fn rm_map_memory(payload: &mut [u8], caller: &Caller) -> (NV_STATUS, Option<MmapContext>) {
+    if served_elsewhere() {
+        return (NV_ERR_NOT_SUPPORTED, None);
+    }
     if !rm_up() {
         return (NV_ERR_NOT_READY, None);
     }
@@ -102,7 +146,7 @@ pub fn rm_map_memory(payload: &mut [u8], caller: &Caller) -> (NV_STATUS, Option<
 /// [`rm_map_memory`] returned is ever handed back, and with no RM core it
 /// returns none.
 pub fn map_unrecorded(payload: &mut [u8], caller: &Caller, why: NV_STATUS) {
-    if rm_up() {
+    if !served_elsewhere() && rm_up() {
         nvidia_rm_sys::frontend::map_unrecorded(payload, caller, why);
     }
 }
@@ -111,6 +155,10 @@ pub fn map_unrecorded(payload: &mut [u8], caller: &Caller, why: NV_STATUS) {
 /// filed under anything, and no OS event registered (the kernel refuses
 /// ALLOC_OS_EVENT then), and the RM must not be entered to find that out.
 pub fn release(os_info: usize) {
+    if let Some(served) = remote::served() {
+        served.release(os_info);
+        return;
+    }
     if rm_up() {
         nvidia_rm_sys::frontend::release(os_info);
     }
@@ -124,6 +172,9 @@ pub fn uvm_va_space_device(
     h_va_space: u32,
     gpu_instance: u32,
 ) -> Result<u32, NV_STATUS> {
+    if served_elsewhere() {
+        return Err(NV_ERR_NOT_SUPPORTED);
+    }
     if !rm_up() {
         return Err(NV_ERR_NOT_READY);
     }
@@ -133,6 +184,9 @@ pub fn uvm_va_space_device(
 /// `nvidia_rm_sys::frontend::uvm::map_external`, refused with
 /// `NV_ERR_NOT_READY` while there is no RM core to map in.
 pub fn uvm_map_external(caller: &Caller, m: &ExternalMapping) -> Result<u32, NV_STATUS> {
+    if served_elsewhere() {
+        return Err(NV_ERR_NOT_SUPPORTED);
+    }
     if !rm_up() {
         return Err(NV_ERR_NOT_READY);
     }
@@ -148,6 +202,9 @@ pub fn uvm_pages(
     pages: &Pages,
     gpu_cached: bool,
 ) -> Result<u32, NV_STATUS> {
+    if served_elsewhere() {
+        return Err(NV_ERR_NOT_SUPPORTED);
+    }
     if !rm_up() {
         return Err(NV_ERR_NOT_READY);
     }
@@ -164,6 +221,9 @@ pub fn uvm_user_pages(
     pages: UserPages,
     gpu_cached: bool,
 ) -> Result<u32, NV_STATUS> {
+    if served_elsewhere() {
+        return Err(NV_ERR_NOT_SUPPORTED);
+    }
     if !rm_up() {
         return Err(NV_ERR_NOT_READY);
     }
@@ -173,6 +233,9 @@ pub fn uvm_user_pages(
 /// `nvidia_rm_sys::frontend::uvm::p2p_caps` between RM GPU instances `a`
 /// and `b`, refused with `NV_ERR_NOT_READY` while there is no RM core.
 pub fn uvm_p2p_caps(a: u32, b: u32) -> Result<P2pCaps, NV_STATUS> {
+    if served_elsewhere() {
+        return Err(NV_ERR_NOT_SUPPORTED);
+    }
     if !rm_up() {
         return Err(NV_ERR_NOT_READY);
     }
@@ -182,6 +245,9 @@ pub fn uvm_p2p_caps(a: u32, b: u32) -> Result<P2pCaps, NV_STATUS> {
 /// `nvidia_rm_sys::frontend::uvm::sked_reflected`, refused with
 /// `NV_ERR_NOT_READY` while there is no RM core to map in.
 pub fn uvm_sked_reflected(caller: &Caller, r: &SkedRange) -> Result<(u32, u32), NV_STATUS> {
+    if served_elsewhere() {
+        return Err(NV_ERR_NOT_SUPPORTED);
+    }
     if !rm_up() {
         return Err(NV_ERR_NOT_READY);
     }
@@ -191,6 +257,9 @@ pub fn uvm_sked_reflected(caller: &Caller, r: &SkedRange) -> Result<(u32, u32), 
 /// `nvidia_rm_sys::frontend::uvm::free`. With no RM core nothing was ever
 /// mapped, and the RM must not be entered to find that out.
 pub fn uvm_free(caller: &Caller, h_client: u32, h_object: u32) -> NV_STATUS {
+    if served_elsewhere() {
+        return NV_ERR_NOT_SUPPORTED;
+    }
     if !rm_up() {
         return NV_ERR_NOT_READY;
     }
@@ -227,16 +296,23 @@ impl Card {
     /// `CARD_INFO` reports is the id the client then hands back to the RM.
     /// `u32::MAX` (`NV0000_CTRL_GPU_INVALID_ID`) for a GPU with no instance.
     pub fn gpu_id(&self) -> u32 {
-        match self.instance {
-            Some(instance) => nvidia_rm_sys::frontend::gpu_id(instance),
-            None => u32::MAX,
+        match (self.instance, remote::served()) {
+            (Some(instance), Some(served)) => {
+                served.by_instance(instance).map_or(u32::MAX, |c| c.gpu_id)
+            }
+            (Some(instance), None) => nvidia_rm_sys::frontend::gpu_id(instance),
+            (None, _) => u32::MAX,
         }
     }
 
     /// The GPU's binary UUID, the one a client reads with GET_GID_INFO and
     /// UVM_REGISTER_GPU names it by; `None` for a GPU with no instance.
     pub fn uuid(&self) -> Option<[u8; GPU_UUID_LEN]> {
-        self.instance.and_then(nvidia_rm_sys::frontend::gpu_uuid)
+        let instance = self.instance?;
+        match remote::served() {
+            Some(served) => served.by_instance(instance).and_then(|c| c.uuid),
+            None => nvidia_rm_sys::frontend::gpu_uuid(instance),
+        }
     }
 }
 
@@ -259,6 +335,9 @@ impl NvidiaGpu {
 
 /// Every GPU this driver probed, in minor order.
 pub fn cards() -> Vec<Card> {
+    if let Some(served) = remote::served() {
+        return served.cards();
+    }
     // The list is cloned out first: no GPU's own lock is taken under it.
     let gpus = NVIDIA_GPUS.lock().clone();
     gpus.iter()

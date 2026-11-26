@@ -391,6 +391,46 @@ impl Node {
         })
     }
 
+    /// Serve the NVIDIA RM this process runs (`ECLIPSE_NVCTL_SERVE`): the
+    /// kernel's `/dev/nvidiactl` and `/dev/nvidia<N>` pass what they ask of
+    /// the RM here. `hello` is what the RM says of itself
+    /// (`zcore_drivers::display::nvctl::remote::hello`).
+    pub fn serve_nvctl(hello: &[u8]) -> Result<Node, (Status, String)> {
+        let (fifo, theirs) = Fifo::<Msg>::create(SLOTS * 4)
+            .map_err(|e| (Status::NO_MEMORY, format!("fifo_create: {e}")))?;
+        let (window, vmo) =
+            zx::shared_memory(SLOTS * SLOT_LEN).map_err(|e| (Status::NO_MEMORY, e))?;
+        // SAFETY: the kernel reads `hello.len()` bytes of `hello`; both
+        // handles go to it.
+        unsafe {
+            zx::call(
+                nr::ECLIPSE_NVCTL_SERVE,
+                [
+                    theirs as usize,
+                    vmo as usize,
+                    hello.as_ptr() as usize,
+                    hello.len(),
+                    0,
+                    0,
+                ],
+            )
+        }
+        .map_err(|e| (e, format!("nvctl_serve: {e}")))?;
+        Ok(Node {
+            fifo,
+            window,
+            held: std::sync::Mutex::new(None),
+        })
+    }
+
+    /// While the value lives, [`caller_read`] and [`caller_write`] reach
+    /// the memory of the program whose request `req` is: for an answer
+    /// not made through [`Node::answer`] whose request lends it (the
+    /// kernel says which do).
+    pub fn reaching(&self, req: &Msg) -> impl Drop {
+        Asking::new(self.fifo.handle(), req.reqid)
+    }
+
     /// The bytes of request `req`'s slot: what it carries in, and where its
     /// answer goes out. Only while it is being answered.
     #[allow(clippy::mut_from_ref)]

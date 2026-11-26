@@ -16,11 +16,16 @@
 //! - `udrv-nvidia irq-check VVVV DDDD OFF=VAL...`: the interrupt path of
 //!   the driver's GSP boot, on any PCI function that raises one when its
 //!   first BAR is written (QEMU's e1000e: `d0=4 c8=4`).
+//! - `udrv-nvidia nvctl-check`: `/dev/nvidiactl` served with an RM that
+//!   only checks the way there (`nvidia.nvidiactl` on the kernel's
+//!   cmdline): an escape's parameters reached through its pointer, the
+//!   GPU node, the close.
 mod drm;
 mod gem;
 mod gpu;
 mod irq;
 mod mapper;
+mod nvctl;
 mod platform;
 mod ports;
 mod syncobj;
@@ -50,6 +55,7 @@ fn main() {
         }
         Some("drm-check") => drm_check(),
         Some("irq-check") => irq_check(&args[1..]),
+        Some("nvctl-check") => nvctl_check(),
         n => run(n.and_then(|n| n.parse().ok()).unwrap_or(0)),
     }
 }
@@ -70,6 +76,19 @@ fn run(index: usize) {
         Err(e) => fail(format!("{}: {e:?}", drv.name())),
     };
     println!("{NAME}: {} up, serving it", drv.name());
+    // `/dev/nvidiactl`, on its own thread: its escapes wait in the RM, not
+    // behind the card's calls.
+    std::thread::spawn(|| {
+        let rm = zcore_drivers::display::nvctl::remote::ThisRm;
+        let hello = zcore_drivers::display::nvctl::remote::hello();
+        match nvctl::serve(&rm, &hello) {
+            Ok(why) => eprintln!("{NAME}: the kernel let go of the RM: {why}"),
+            Err((udrivers::zx::Status::NOT_SUPPORTED, _)) => {
+                println!("{NAME}: no /dev/nvidiactl (nvidia.nvidiactl is off)")
+            }
+            Err((_, e)) => eprintln!("{NAME}: {e}"),
+        }
+    });
     match drm::serve(card) {
         Ok(why) => fail(format!("the kernel let go of the card: {why}")),
         Err(e) => fail(e),
@@ -162,6 +181,77 @@ fn irq_check(args: &[String]) {
         fail("irq-check FAILED".into());
     }
     println!("{NAME}: irq-check ok");
+}
+
+/// `udrv-nvidia nvctl-check`: see the top of this file.
+fn nvctl_check() {
+    use std::os::fd::AsRawFd;
+    use std::sync::atomic::Ordering;
+    use std::time::{Duration, Instant};
+    let ok = |what: &str, ok: bool| {
+        println!("{NAME}: {what}: {}", if ok { "ok" } else { "FAILED" });
+        if !ok {
+            exit(1);
+        }
+    };
+    static RM: std::sync::OnceLock<nvctl::check::CheckRm> = std::sync::OnceLock::new();
+    let rm = RM.get_or_init(Default::default);
+    std::thread::spawn(move || match nvctl::serve(rm, &nvctl::check::hello()) {
+        Ok(why) => eprintln!("{NAME}: the kernel let go of the RM: {why}"),
+        Err((_, e)) => fail(e),
+    });
+    let start = Instant::now();
+    while std::fs::metadata("/dev/nvidia0").is_err() && start.elapsed() < Duration::from_secs(2) {
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    ok(
+        "the served RM's GPU has its node",
+        std::fs::metadata("/dev/nvidia0").is_ok(),
+    );
+    let ctl = open_rw("/dev/nvidiactl").unwrap_or_else(|| fail("open /dev/nvidiactl".into()));
+    // `_IOWR('F', NV_ESC_RM_CONTROL, NVOS54_PARAMETERS)`.
+    const CONTROL: u64 = 0xc020_462a;
+    let mut params = [10u32, 20, 30, 40];
+    let mut control = [0u8; nvctl::check::NVOS54_LEN];
+    control[16..24].copy_from_slice(&(params.as_mut_ptr() as u64).to_le_bytes());
+    control[24..28].copy_from_slice(&16u32.to_le_bytes());
+    let escape = |control: &mut [u8]| {
+        // SAFETY: `control` is the 32 bytes of NVOS54_PARAMETERS, whose
+        // pointer is to `params`, alive for the call.
+        unsafe { libc::ioctl(ctl.as_raw_fd(), CONTROL as _, control.as_mut_ptr()) }
+    };
+    let ret = escape(&mut control);
+    ok(
+        "an RM_CONTROL's parameters are read and written where it points",
+        ret == 0 && params == [11, 21, 31, 41] && control[28..32] == [0; 4],
+    );
+    const N: u32 = 100;
+    let t = Instant::now();
+    for _ in 0..N {
+        escape(&mut control);
+    }
+    println!(
+        "{NAME}: RM_CONTROL through the served RM: {} us",
+        t.elapsed().as_micros() / N as u128
+    );
+    ok("...each of them", params == [111, 121, 131, 141]);
+    // A pointer the caller does not have: the RM is told so.
+    control[16..24].copy_from_slice(&8u64.to_le_bytes());
+    ok("a pointer to nothing is refused", escape(&mut control) != 0);
+    ok("the GPU node opens", open_rw("/dev/nvidia0").is_some());
+    drop(ctl);
+    let start = Instant::now();
+    while rm.released.load(Ordering::Relaxed) == 0 && start.elapsed() < Duration::from_secs(2) {
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    ok(
+        "a close reaches the RM",
+        rm.released.load(Ordering::Relaxed) != 0,
+    );
+    println!(
+        "{NAME}: nvctl-check ok ({} escapes)",
+        rm.escapes.load(Ordering::Relaxed)
+    );
 }
 
 /// `DRM_IOCTL_MODE_GETRESOURCES`, `_IOWR('d', 0xA0, struct drm_mode_card_res)`.

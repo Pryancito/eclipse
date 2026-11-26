@@ -32,6 +32,10 @@
 pub mod card;
 pub mod input;
 mod link;
+/// The RM of `/dev/nvidiactl` in a process. x86_64 only, like the device
+/// files.
+#[cfg(target_arch = "x86_64")]
+pub mod nvctl;
 #[cfg(test)]
 mod tests;
 pub mod wire;
