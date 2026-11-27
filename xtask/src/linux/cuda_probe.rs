@@ -30,6 +30,10 @@ pub(super) fn install(rootfs: &Path) {
     install_shell(rootfs, "cuda-status.sh", STATUS_PATH);
     install_shell(rootfs, "install-ollama-cuda.sh", INSTALL_OLLAMA_PATH);
     install_shell(rootfs, "eclipse-ollama.sh", ECLIPSE_OLLAMA_PATH);
+    // A probe left by an earlier build would pass for this one: take it out
+    // first, so an image either has this tree's probe or none.
+    let dst = rootfs.join(PATH);
+    let _ = fs::remove_file(&dst);
     if !cfg!(all(
         target_os = "linux",
         target_arch = "x86_64",
@@ -53,8 +57,6 @@ pub(super) fn install(rootfs: &Path) {
         eprintln!("warning: cuda-probe not built (cc); no CUDA probe in the image");
         return;
     }
-    let dst = rootfs.join(PATH);
-    let _ = fs::remove_file(&dst);
     if let Err(e) = fs::copy(&executable, &dst) {
         eprintln!("warning: cuda-probe: {}: {e}", dst.display());
         return;
