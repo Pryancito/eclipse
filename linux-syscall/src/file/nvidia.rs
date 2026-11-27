@@ -65,8 +65,12 @@ impl Syscall<'_> {
         };
         match (uvm, open) {
             (Some(uvm), _) => {
-                // A CUDA program: its failing calls go to dmesg from now on.
+                // A CUDA program: its failing calls go to dmesg from now on,
+                // and its mmaps are placed top-down, as Linux places them,
+                // clear of the low GPU VA the RM keeps: the GPU maps host
+                // memory at the CPU's address (`cuMemHostRegister`).
                 crate::cuda_failures::note_uvm_caller(self.zircon_process().id());
+                vmar.set_mmap_top_down();
                 Some(uvm.ioctl(request as u32, arg, &caller))
             }
             (_, Some(open)) => Some(open.ioctl(request as u32, arg, &caller)),
