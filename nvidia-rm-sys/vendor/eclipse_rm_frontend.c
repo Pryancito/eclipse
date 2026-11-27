@@ -89,6 +89,7 @@
 #include "gpu/mem_mgr/mem_desc.h"
 #include "gpu/mem_mgr/rm_page_size.h"
 #include "gpu/mem_mgr/vaspace_api.h"
+#include "mem_mgr/gpu_vaspace.h"   /* OBJGVASPACE: the ranges a failed map reports */
 #include "class/cl0040.h"      /* NV01_MEMORY_LOCAL_USER */
 #include "class/cl0071.h"      /* NV01_MEMORY_SYSTEM_OS_DESCRIPTOR */
 #include "class/cl50a0.h"      /* NV50_MEMORY_VIRTUAL */
@@ -1794,6 +1795,82 @@ NV_STATUS eclipse_rm_frontend_uvm_va_space(
  * is mapped with 4 KiB pages; any other with the RM's default, as
  * nvGpuOpsMapGpuMemory does.
  */
+/*
+ * What the last failed eclipse_rm_frontend_uvm_map was asked and where it
+ * stopped, with the GPU VA space's ranges: the virtual allocation of a
+ * mapping is at a fixed address (UVM's, which is the CPU's), and the RM
+ * turns every reason it cannot place one there (outside the VA space, on
+ * the RM's internal range or the GSP's split range, on something already
+ * there) into one NV_ERR_INSUFFICIENT_RESOURCES. The kernel side logs this
+ * with the failure (eclipse_rm_frontend_uvm_map_failure).
+ */
+typedef struct
+{
+    NvU32 stage;          /* 1 the virtual allocation, 2 the map, 3 a moved address */
+    NvU32 status;
+    NvU32 bSmallPages;
+    NvU32 bRanges;        /* the VA space was found and the ranges are filled */
+    NvU64 base;
+    NvU64 length;
+    NvU64 offset;
+    NvU64 vasStart;
+    NvU64 vasLimit;
+    NvU64 vaStartInternal;
+    NvU64 vaLimitInternal;
+    NvU64 vaStartServerRMOwned;
+    NvU64 vaLimitServerRMOwned;
+} EclipseUvmMapFailure;
+
+static EclipseUvmMapFailure s_mapFailure;
+static NvBool s_bMapFailure = NV_FALSE;
+
+/* The VA space's ranges into `pOut`, under the API lock the caller holds. */
+static void _eclipse_rm_frontend_uvm_va_ranges(NvHandle hClient, NvHandle hVaSpace,
+                                               EclipseUvmMapFailure *pOut)
+{
+    CLIENT_ENTRY *pClientEntry;
+    RmClient *pRmClient;
+    RsResourceRef *pResourceRef;
+    VaSpaceApi *pVaSpaceApi;
+    OBJVASPACE *pVAS;
+    OBJGVASPACE *pGVAS;
+
+    if (serverutilAcquireClient(hClient, LOCK_ACCESS_READ, &pClientEntry, &pRmClient) != NV_OK)
+    {
+        return;
+    }
+    if ((clientGetResourceRef(staticCast(pRmClient, RsClient), hVaSpace, &pResourceRef) == NV_OK) &&
+        ((pVaSpaceApi = dynamicCast(pResourceRef->pResource, VaSpaceApi)) != NULL) &&
+        ((pVAS = pVaSpaceApi->pVASpace) != NULL))
+    {
+        pOut->vasStart = pVAS->vasStart;
+        pOut->vasLimit = pVAS->vasLimit;
+        pGVAS = dynamicCast(pVAS, OBJGVASPACE);
+        if (pGVAS != NULL)
+        {
+            pOut->vaStartInternal = pGVAS->vaStartInternal;
+            pOut->vaLimitInternal = pGVAS->vaLimitInternal;
+            pOut->vaStartServerRMOwned = pGVAS->vaStartServerRMOwned;
+            pOut->vaLimitServerRMOwned = pGVAS->vaLimitServerRMOwned;
+        }
+        pOut->bRanges = NV_TRUE;
+    }
+    serverutilReleaseClient(LOCK_ACCESS_READ, pClientEntry);
+}
+
+/* The last failure eclipse_rm_frontend_uvm_map recorded, once: NV_TRUE when
+ * there was one to copy to `pOut`. */
+NvU32 eclipse_rm_frontend_uvm_map_failure(EclipseUvmMapFailure *pOut)
+{
+    if ((pOut == NULL) || !s_bMapFailure)
+    {
+        return NV_FALSE;
+    }
+    *pOut = s_mapFailure;
+    s_bMapFailure = NV_FALSE;
+    return NV_TRUE;
+}
+
 NV_STATUS eclipse_rm_frontend_uvm_map(
     void     *pOsInfo,
     NvU32     bAdmin,
@@ -1859,19 +1936,40 @@ NV_STATUS eclipse_rm_frontend_uvm_map(
                                           sizeof(allocParams),
                                           RMAPI_ALLOC_FLAGS_NONE, NvP64_NULL,
                                           &secInfo);
+        NvU32 stage = (status != NV_OK) ? 1 : 0;
         if ((status == NV_OK) && (allocParams.offset != base))
         {
             status = NV_ERR_INVALID_STATE;
+            stage = 3;
         }
 
         if (status == NV_OK)
         {
             mapParams.hDma = hVirtual;
             status = pRmApi->MapWithSecInfo(pRmApi, &mapParams, &secInfo);
+            stage = (status != NV_OK) ? 2 : 0;
             if ((status == NV_OK) && (mapParams.dmaOffset != base))
             {
                 status = NV_ERR_INVALID_STATE;
+                stage = 3;
             }
+        }
+
+        if (status != NV_OK)
+        {
+            portMemSet(&s_mapFailure, 0, sizeof(s_mapFailure));
+            s_mapFailure.stage = stage;
+            s_mapFailure.status = status;
+            s_mapFailure.bSmallPages = bSmallPages;
+            s_mapFailure.base = base;
+            s_mapFailure.length = length;
+            s_mapFailure.offset = offset;
+            if (rmapiLockAcquire(RMAPI_LOCK_FLAGS_READ, RM_LOCK_MODULES_OSAPI) == NV_OK)
+            {
+                _eclipse_rm_frontend_uvm_va_ranges(hClient, hVaSpace, &s_mapFailure);
+                rmapiLockRelease();
+            }
+            s_bMapFailure = NV_TRUE;
         }
 
         if ((status != NV_OK) && (hVirtual != NV01_NULL_OBJECT))

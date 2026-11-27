@@ -722,7 +722,13 @@ impl Rm for KernelRm {
     }
 
     fn map(&self, by: &nvctl::Caller, m: &nvctl::ExternalMapping) -> RmResult {
-        nvctl::uvm_map_external(by, m)
+        let result = nvctl::uvm_map_external(by, m);
+        if result.is_err() {
+            if let Some(failure) = nvctl::uvm_take_map_failure() {
+                map_failed(&failure);
+            }
+        }
+        result
     }
 
     fn pages(
@@ -1904,6 +1910,58 @@ fn not_served(cmd: u32) {
             cmd
         );
     }
+}
+
+/// How many failed mappings [`map_failed`] describes in a boot.
+const MAP_FAILURES_LOGGED: u32 = 8;
+
+/// One dmesg line for a mapping the RM refused, with where it stopped and
+/// the GPU VA space's ranges, for the first [`MAP_FAILURES_LOGGED`] of a
+/// boot. The mapping's virtual allocation is at UVM's address, which is the
+/// CPU's, and the RM answers every reason it cannot place it there with one
+/// NV_ERR_INSUFFICIENT_RESOURCES: outside the VA space, on the RM's internal
+/// range, on the GSP's split range, or on something of the RM's already
+/// there. The ranges say which; `cuMemHostRegister` then reports
+/// CUDA_ERROR_OUT_OF_MEMORY.
+fn map_failed(f: &nvctl::MapFailure) {
+    static SAID: core::sync::atomic::AtomicU32 = core::sync::atomic::AtomicU32::new(0);
+    if SAID.fetch_add(1, Ordering::Relaxed) >= MAP_FAILURES_LOGGED {
+        return;
+    }
+    let stage = match f.stage {
+        1 => "virtual allocation",
+        2 => "map",
+        3 => "address moved",
+        _ => "?",
+    };
+    let end = f.base.saturating_add(f.length);
+    if f.ranges == 0 {
+        zcore_drivers::klog_warn!(
+            "[nvidia-uvm] map of [{:#x}, {:#x}) (memory offset {:#x}, {} pages) failed at the {}: {:#x}; VA space not found",
+            f.base,
+            end,
+            f.offset,
+            if f.small_pages != 0 { "4 KiB" } else { "default" },
+            stage,
+            f.status
+        );
+        return;
+    }
+    zcore_drivers::klog_warn!(
+        "[nvidia-uvm] map of [{:#x}, {:#x}) (memory offset {:#x}, {} pages) failed at the {}: {:#x}; VA space [{:#x}, {:#x}], RM internal [{:#x}, {:#x}], GSP split [{:#x}, {:#x}]",
+        f.base,
+        end,
+        f.offset,
+        if f.small_pages != 0 { "4 KiB" } else { "default" },
+        stage,
+        f.status,
+        f.va_start,
+        f.va_limit,
+        f.internal_start,
+        f.internal_limit,
+        f.server_start,
+        f.server_limit
+    );
 }
 
 /// The (command, status) pairs already logged.

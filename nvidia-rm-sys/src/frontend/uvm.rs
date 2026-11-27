@@ -52,6 +52,7 @@ extern "C" {
         read_only: NvU32,
         h_virtual: *mut NvU32,
     ) -> NV_STATUS;
+    fn eclipse_rm_frontend_uvm_map_failure(out: *mut MapFailure) -> NvU32;
     fn eclipse_rm_frontend_uvm_free(
         os_info: *mut c_void,
         admin: NvU32,
@@ -125,6 +126,10 @@ unsafe fn eclipse_rm_frontend_uvm_map(
     _h_virtual: *mut NvU32,
 ) -> NV_STATUS {
     NV_ERR_INVALID_CLIENT
+}
+#[cfg(not(nvrm_real))]
+unsafe fn eclipse_rm_frontend_uvm_map_failure(_out: *mut MapFailure) -> NvU32 {
+    0
 }
 #[cfg(not(nvrm_real))]
 unsafe fn eclipse_rm_frontend_uvm_free(
@@ -282,8 +287,42 @@ pub struct ExternalMapping {
     pub read_only: bool,
 }
 
+/// Mirror of `EclipseUvmMapFailure` (eclipse_rm_frontend.c): what the last
+/// failed [`map_external`] was asked, where it stopped, and the GPU VA
+/// space's ranges. The RM answers every reason it cannot place a mapping's
+/// virtual allocation at its fixed address with one
+/// NV_ERR_INSUFFICIENT_RESOURCES; these say which.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct MapFailure {
+    /// 1 the virtual allocation, 2 the map, 3 the RM moved the address.
+    pub stage: NvU32,
+    pub status: NvU32,
+    pub small_pages: NvU32,
+    /// The VA space was found, and the ranges below are its.
+    pub ranges: NvU32,
+    pub base: NvU64,
+    pub length: NvU64,
+    pub offset: NvU64,
+    pub va_start: NvU64,
+    pub va_limit: NvU64,
+    pub internal_start: NvU64,
+    pub internal_limit: NvU64,
+    pub server_start: NvU64,
+    pub server_limit: NvU64,
+}
+
+/// The last failure of [`map_external`], until [`take_map_failure`].
+static MAP_FAILURE: lock::Mutex<Option<MapFailure>> = lock::Mutex::new(None);
+
+/// What the last failed [`map_external`] recorded, once.
+pub fn take_map_failure() -> Option<MapFailure> {
+    MAP_FAILURE.lock().take()
+}
+
 /// Map `m`: the handle of the NV50_MEMORY_VIRTUAL holding the mapping, which
-/// [`free`] unmaps. Nothing is left behind on failure.
+/// [`free`] unmaps. Nothing is left behind on failure, but what it was is
+/// kept for [`take_map_failure`].
 pub fn map_external(caller: &Caller, m: &ExternalMapping) -> Result<u32, NV_STATUS> {
     if caller.os_info == 0 {
         return Err(NV_ERR_INVALID_ARGUMENT);
@@ -308,6 +347,10 @@ pub fn map_external(caller: &Caller, m: &ExternalMapping) -> Result<u32, NV_STAT
     if status == NV_OK {
         Ok(h_virtual)
     } else {
+        let mut failure = MapFailure::default();
+        if unsafe { eclipse_rm_frontend_uvm_map_failure(&mut failure) } != 0 {
+            *MAP_FAILURE.lock() = Some(failure);
+        }
         Err(status)
     }
 }
