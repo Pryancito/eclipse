@@ -350,6 +350,44 @@ impl Dma {
         Dma::new_on(&[bti], len, window)
     }
 
+    /// The same, all of it where a device that puts out 32-bit addresses
+    /// only reaches it: below `limit` ([`DMA32_LIMIT`]). The kernel's
+    /// contiguous memory comes from wherever it has a run free, so memory
+    /// that ends above is set aside and asked for again, a few times,
+    /// before it is given up; what was set aside goes back.
+    pub fn new_below(
+        bti: Handle,
+        len: usize,
+        window: Option<(usize, usize)>,
+        limit: u64,
+    ) -> Result<Dma, String> {
+        let mut set_aside = Vec::new();
+        let mut got = Err(format!(
+            "no {} KiB of contiguous memory below {limit:#x} after {DMA_BELOW_TRIES} tries",
+            len / 1024
+        ));
+        for _ in 0..DMA_BELOW_TRIES {
+            let dma = Dma::new(bti, len, window)?;
+            if fits_below(dma.daddr, len, limit) {
+                got = Ok(dma);
+                break;
+            }
+            set_aside.push(dma);
+        }
+        for dma in set_aside {
+            dma.give_back();
+        }
+        got
+    }
+
+    /// Back to the kernel, window and all: memory nobody else was handed.
+    fn give_back(self) {
+        if let Some(window) = self.window {
+            zx::close(window);
+        }
+        let _ = Dma::release_on(self.ptr, self.len, self.pmt, self.also);
+    }
+
     /// The same, for every device of `btis`, the first one's: one process
     /// driving several (a GPU per initiator) whose memory any of them may
     /// reach. Each pin is a grant of the device's IOMMU, and each must
@@ -477,6 +515,18 @@ impl Dma {
     }
 }
 
+/// Where a device that puts out 32-bit addresses stops reaching.
+pub const DMA32_LIMIT: u64 = 1 << 32;
+/// How many times [`Dma::new_below`] asks.
+const DMA_BELOW_TRIES: usize = 8;
+
+/// Whether `len` bytes at device address `daddr` end at or below `limit`.
+pub fn fits_below(daddr: u64, len: usize, limit: u64) -> bool {
+    daddr
+        .checked_add(len as u64)
+        .is_some_and(|end| end <= limit)
+}
+
 /// A VMO over `len` bytes of `vmo` from `offset`.
 fn slice(vmo: Handle, offset: usize, len: usize) -> Result<Handle, String> {
     assert!(offset.is_multiple_of(PAGE) && len.is_multiple_of(PAGE));
@@ -575,6 +625,22 @@ pub fn port_out(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn memory_for_a_32_bit_device_must_end_by_4_gib() {
+        let mib = 1 << 20;
+        assert!(fits_below(0x1000_0000, mib, DMA32_LIMIT));
+        assert!(
+            fits_below(DMA32_LIMIT - mib as u64, mib, DMA32_LIMIT),
+            "ends right at it"
+        );
+        assert!(
+            !fits_below(DMA32_LIMIT - 4096, mib, DMA32_LIMIT),
+            "straddles it"
+        );
+        assert!(!fits_below(DMA32_LIMIT, 4096, DMA32_LIMIT));
+        assert!(!fits_below(u64::MAX - 10, 4096, u64::MAX), "no wrap");
+    }
 
     #[test]
     fn a_virtio_mmio_claim_is_read_out_of_its_eight_words() {

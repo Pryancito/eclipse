@@ -128,7 +128,9 @@ impl Regs {
         PORTS + p * PORT_SIZE + reg
     }
 
-    /// AHCI mode on, and whether the controller addresses 64 bits.
+    /// AHCI mode on, and whether the controller addresses 64 bits
+    /// (`CAP.S64A`): without, every address it is given (command list,
+    /// received FIS, command table, data) must be below 4 GiB.
     pub fn enable(&self) -> bool {
         self.write(GHC, self.read(GHC) | GHC_AE);
         self.read(CAP) & CAP_S64A != 0
@@ -233,8 +235,11 @@ pub enum Waker {
 /// it has its `PxIS` cleared and its thread woken. Until the wait fails.
 pub fn interrupts(regs: Regs, irq: Handle, wakes: Vec<(usize, Arc<Wake>)>) -> Status {
     loop {
-        if let Err(e) = claim::interrupt_wait(irq) {
-            return e;
+        match claim::interrupt_wait(irq) {
+            Ok(()) => {}
+            // A signal: the wait is to be made again, not given up.
+            Err(Status::INTERNAL_INTR_RETRY) => continue,
+            Err(e) => return e,
         }
         let is = regs.read(IS);
         for (p, wake) in &wakes {
@@ -543,8 +548,13 @@ impl Port {
                 // interrupt: IDENTIFY ends in a PIO Setup one and FLUSH
                 // is rare, and those two are watched.
                 (Waker::Direct(irq), _) if lookable => {
-                    if claim::interrupt_wait(*irq).is_err() {
-                        return false;
+                    // No longer than the command has left: a disk that
+                    // never raises the interrupt is given up on all the
+                    // same, at the deadline above.
+                    let left = COMMAND_NS.saturating_sub(now_ns() - started);
+                    match claim::interrupt_wait_for(*irq, left.max(1)) {
+                        Ok(()) | Err(Status::TIMED_OUT) | Err(Status::INTERNAL_INTR_RETRY) => {}
+                        Err(_) => return false,
                     }
                 }
                 _ => std::thread::yield_now(),
