@@ -229,6 +229,29 @@ pub trait VMObjectTrait: Sync + Send {
         None
     }
 
+    /// The committed pages of `start..end`, in order, as `(page, paddr)`
+    /// into `out` until it is full: how many it holds, and the page to go
+    /// on from (`end` when there is nothing left). One look at the object
+    /// for many pages, where [`committed_paddr`](Self::committed_paddr)
+    /// takes its lock for each. Never commits.
+    fn committed_paddrs(
+        &self,
+        start: usize,
+        end: usize,
+        out: &mut [(usize, PhysAddr)],
+    ) -> (usize, usize) {
+        let mut n = 0;
+        let mut at = start;
+        while at < end && n < out.len() {
+            if let Some(paddr) = self.committed_paddr(at) {
+                out[n] = (at, paddr);
+                n += 1;
+            }
+            at += 1;
+        }
+        (n, at)
+    }
+
     /// Independent copy for Linux `fork`: committed pages are copied eagerly;
     /// pages never touched by the parent stay lazy in the child (refilled from
     /// the same backing source, or demand-zero). Implementations that cannot
@@ -1010,6 +1033,17 @@ impl VmObject {
     /// Physical address of `page_idx` if already committed (never commits).
     pub fn committed_paddr(&self, page_idx: usize) -> Option<PhysAddr> {
         self.trait_.committed_paddr(page_idx)
+    }
+
+    /// The committed pages of `start..end`, many at a time (see
+    /// [`VMObjectTrait::committed_paddrs`]).
+    pub fn committed_paddrs(
+        &self,
+        start: usize,
+        end: usize,
+        out: &mut [(usize, PhysAddr)],
+    ) -> (usize, usize) {
+        self.trait_.committed_paddrs(start, end, out)
     }
 
     /// Independent copy for Linux `fork`: only committed pages are copied;

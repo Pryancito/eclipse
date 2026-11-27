@@ -1854,6 +1854,27 @@ impl VMObjectTrait for VMObjectPaged {
         inner.frames.get(&page_idx).map(|s| s.frame.paddr())
     }
 
+    fn committed_paddrs(
+        &self,
+        start: usize,
+        end: usize,
+        out: &mut [(usize, PhysAddr)],
+    ) -> (usize, usize) {
+        if start >= end || out.is_empty() {
+            return (0, end.max(start));
+        }
+        let inner = self.get_inner();
+        let mut n = 0;
+        for (&page, state) in inner.frames.range(start..end) {
+            if n == out.len() {
+                return (n, page);
+            }
+            out[n] = (page, state.frame.paddr());
+            n += 1;
+        }
+        (n, end)
+    }
+
     fn is_demand_paged(&self) -> bool {
         self.get_inner().source.is_some()
     }

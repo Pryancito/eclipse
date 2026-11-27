@@ -888,3 +888,28 @@ fn two_forks_then_the_parent_writes_and_exits() {
     assert_eq!(b.test_read(0), 0x10);
     assert_eq!(c.test_read(0), 0x10);
 }
+
+/// `committed_paddrs` answers what `committed_paddr` of each page would,
+/// in order, a buffer at a time, and says where to go on from.
+#[test]
+fn committed_pages_are_handed_out_a_buffer_at_a_time() {
+    let vmo = VmObject::new_paged(16);
+    for page in [1, 3, 4, 9, 15] {
+        vmo.commit_page(page, MMUFlags::WRITE).unwrap();
+    }
+    assert!(vmo.committed_paddr(2).is_none());
+    let one = |p| vmo.committed_paddr(p).unwrap();
+    let mut out = [(0, 0); 2];
+    assert_eq!(vmo.committed_paddrs(0, 16, &mut out), (2, 4));
+    assert_eq!(out, [(1, one(1)), (3, one(3))]);
+    assert_eq!(vmo.committed_paddrs(4, 16, &mut out), (2, 15));
+    assert_eq!(out, [(4, one(4)), (9, one(9))]);
+    assert_eq!(vmo.committed_paddrs(15, 16, &mut out).0, 1);
+    assert_eq!(vmo.committed_paddrs(15, 16, &mut out), (1, 16));
+    // A window that stops short leaves out what is past it.
+    let mut wide = [(0, 0); 8];
+    assert_eq!(vmo.committed_paddrs(2, 9, &mut wide), (2, 9));
+    assert_eq!(&wide[..2], &[(3, one(3)), (4, one(4))]);
+    assert_eq!(vmo.committed_paddrs(5, 9, &mut wide), (0, 9));
+    assert_eq!(vmo.committed_paddrs(9, 9, &mut wide), (0, 9));
+}

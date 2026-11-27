@@ -2712,6 +2712,10 @@ pub struct VmMapping {
     inner: Mutex<VmMappingInner>,
 }
 
+/// Pages `VmMapping::map_committed` asks the object for, and installs, at
+/// a time: 128 is 5 KiB of kernel stack for the two arrays.
+const FORK_MAP_BATCH: usize = 128;
+
 impl VmMapping {
     /// The VMO this mapping covers. Used by `msync` to write back shared
     /// file-backed objects without walking internal VMAR state again.
@@ -2940,20 +2944,35 @@ impl VmMapping {
         // one more mapping (`vm.max_map_count`, 65530 by default): a kernel
         // panic there took the whole core-test down in
         // `RseqTest.ManyConcurrent` (2048 threads, one host VMA per page).
+        //
+        // In batches of [`FORK_MAP_BATCH`]: the object is asked once per batch
+        // for its committed pages, and the page table installs them with one
+        // walk per leaf table and one TLB flush (`map_pages`), where a page
+        // at a time took the object's lock, walked from the root and flushed
+        // for each: 3.5 us a page, a quarter of a fork.
         let inner = self.inner.lock();
         let mut page_table = self.page_table.lock();
         let page_num = inner.size / PAGE_SIZE;
         let vmo_offset = inner.vmo_offset / PAGE_SIZE;
-        for i in 0..page_num {
-            if let Some(paddr) = self.vmo.committed_paddr(vmo_offset + i) {
-                page_table
-                    .map(
-                        Page::new_aligned(inner.addr + i * PAGE_SIZE, PageSize::Size4K),
-                        paddr,
-                        inner.flags[i],
-                    )
-                    .map_err(|_| ZxError::NO_MEMORY)?;
+        let end = vmo_offset + page_num;
+        let mut found = [(0usize, 0 as PhysAddr); FORK_MAP_BATCH];
+        let mut batch = [(0 as VirtAddr, 0 as PhysAddr, MMUFlags::empty()); FORK_MAP_BATCH];
+        let mut at = vmo_offset;
+        while at < end {
+            let (n, next) = self.vmo.committed_paddrs(at, end, &mut found);
+            for (slot, &(page, paddr)) in batch.iter_mut().zip(&found[..n]) {
+                let i = page - vmo_offset;
+                *slot = (inner.addr + i * PAGE_SIZE, paddr, inner.flags[i]);
             }
+            page_table
+                .map_pages(&batch[..n])
+                .map_err(|_| ZxError::NO_MEMORY)?;
+            if next <= at {
+                // Nothing to go on from (an object that answers so is
+                // wrong): what is left faults in when touched.
+                break;
+            }
+            at = next;
         }
         Ok(())
     }
