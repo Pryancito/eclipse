@@ -245,8 +245,13 @@ impl Link {
     /// Read whatever replies have come back and mark their slots. Returns
     /// how many there were.
     fn pump(&self) -> usize {
-        let Some(fifo) = self.fifo.lock().clone() else {
-            return 0;
+        // Nothing to read, as on most looks: no reference taken and no
+        // buffer cleared. A caller told 0 looks again or sleeps on these
+        // same signals, so a reply landing just after is not lost.
+        const ANY: Signal = Signal::READABLE.union(Signal::PEER_CLOSED);
+        let fifo = match self.fifo.lock().as_ref() {
+            Some(f) if f.signal().intersects(ANY) => f.clone(),
+            _ => return 0,
         };
         let mut back = [0u8; MSG * SLOTS];
         let n = match fifo.read(MSG, &mut back, SLOTS) {

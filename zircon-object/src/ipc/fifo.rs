@@ -125,9 +125,12 @@ impl Fifo {
                 peer.base.signal_set(Signal::WRITABLE);
             }
         }
-        for (i, x) in recv_queue.drain(..read_size).enumerate() {
-            data[i] = x;
-        }
+        // Both halves of the ring in two copies, not a byte at a time.
+        let (front, back) = recv_queue.as_slices();
+        let first = front.len().min(read_size);
+        data[..first].copy_from_slice(&front[..first]);
+        data[first..read_size].copy_from_slice(&back[..read_size - first]);
+        recv_queue.drain(..read_size);
         if recv_queue.is_empty() {
             self.base.signal_clear(Signal::READABLE);
         }

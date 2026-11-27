@@ -1445,12 +1445,12 @@ impl Process {
         handle_value: HandleValue,
         desired_rights: Rights,
     ) -> ZxResult<Arc<dyn KernelObject>> {
-        let handle = self.get_handle(handle_value)?;
+        let (object, rights) = self.get_dyn_object_and_rights(handle_value)?;
         // check type before rights
-        if !handle.rights.contains(desired_rights) {
+        if !rights.contains(desired_rights) {
             return Err(ZxError::ACCESS_DENIED);
         }
-        Ok(handle.object.clone())
+        Ok(object)
     }
 
     /// Get the kernel object corresponding to this `handle_value` and this handle's rights.
@@ -1458,19 +1458,22 @@ impl Process {
         &self,
         handle_value: HandleValue,
     ) -> ZxResult<(Arc<dyn KernelObject>, Rights)> {
-        let handle = self.get_handle(handle_value)?;
+        // The object and the rights, not a `Handle`: a clone of the handle
+        // is a handle more for the object to count, and one less when it
+        // goes a moment later, each under the object's census lock. Every
+        // call on a handle (a driver's every FIFO turn) came through here.
+        let inner = self.inner.lock();
+        let (handle, _) = inner
+            .handles
+            .get(&handle_value)
+            .ok_or(ZxError::BAD_HANDLE)?;
         Ok((handle.object.clone(), handle.rights))
     }
 
     /// Get the kernel object corresponding to this `handle_value`
     pub fn get_object<T: KernelObject>(&self, handle_value: HandleValue) -> ZxResult<Arc<T>> {
-        let handle = self.get_handle(handle_value)?;
-        let object = handle
-            .object
-            .clone()
-            .downcast_arc::<T>()
-            .map_err(|_| ZxError::WRONG_TYPE)?;
-        Ok(object)
+        let (object, _) = self.get_dyn_object_and_rights(handle_value)?;
+        object.downcast_arc::<T>().map_err(|_| ZxError::WRONG_TYPE)
     }
 
     /// Get the handle's information corresponding to `handle_value`.
