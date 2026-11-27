@@ -92,6 +92,7 @@ fn only_the_device_disk_and_network_calls_are_the_administrators() {
         ECLIPSE_CHANNEL_REPLY_WAIT,
         ECLIPSE_FIFO_REPLY_WAIT,
         ECLIPSE_NET_LENT_TURN,
+        ECLIPSE_INTERRUPT_WAIT_FOR,
     ] {
         assert!(!gateway_call_is_admins(num), "{:#x} is everyone's", num);
     }

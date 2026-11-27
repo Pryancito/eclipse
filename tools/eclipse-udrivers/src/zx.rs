@@ -56,6 +56,7 @@ pub mod nr {
     pub const ECLIPSE_NVCTL_EVENT: i64 = 0x401b;
     pub const ECLIPSE_BOOT_DISPLAY: i64 = 0x401c;
     pub const ECLIPSE_DRIVER_FLAGS: i64 = 0x401d;
+    pub const ECLIPSE_INTERRUPT_WAIT_FOR: i64 = 0x401e;
 }
 
 /// A `zx_status_t` that is not `ZX_OK`.

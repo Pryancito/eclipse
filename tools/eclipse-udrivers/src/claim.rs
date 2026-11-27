@@ -519,6 +519,32 @@ pub fn interrupt_wait(interrupt: Handle) -> Result<(), Status> {
     .map(|_| ())
 }
 
+/// Sleep until the device's interrupt fires, or `timeout_ns` nanoseconds
+/// have gone by: `TIMED_OUT` then (`eclipse_interrupt_wait_for`). A kernel
+/// without that call (`NOT_SUPPORTED`) gets an ordinary wait, with no
+/// bound.
+pub fn interrupt_wait_for(interrupt: Handle, timeout_ns: u64) -> Result<(), Status> {
+    let mut timestamp: i64 = 0;
+    // SAFETY: the kernel writes the interrupt's timestamp into `timestamp`.
+    let got = unsafe {
+        zx::call(
+            nr::ECLIPSE_INTERRUPT_WAIT_FOR,
+            [
+                interrupt as usize,
+                timeout_ns as usize,
+                &mut timestamp as *mut i64 as usize,
+                0,
+                0,
+                0,
+            ],
+        )
+    };
+    match got {
+        Err(Status::NOT_SUPPORTED) => interrupt_wait(interrupt),
+        got => got.map(|_| ()),
+    }
+}
+
 /// Read `width` bytes (1, 2 or 4) at port `offset` of the window of
 /// device `index` of claim `kind`, which this process holds: the kernel
 /// does the `in` (`ECLIPSE_DEVICE_PORT`).
