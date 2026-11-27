@@ -1,4 +1,6 @@
 use super::page_flags::PageFlags;
+#[path = "vmar/top_down.rs"]
+mod top_down;
 #[path = "vmar_vm_size.rs"]
 mod vmar_vm_size;
 use vmar_vm_size::VmSizeMeter;
@@ -1473,6 +1475,7 @@ impl VmAddressRegion {
 
     /// Unmap all mappings within the VMAR, and destroy all sub-regions of the region.
     pub fn destroy(self: &Arc<Self>) -> ZxResult {
+        self.forget_top_down();
         self.destroy_internal()?;
         // remove from parent
         if let Some(parent) = &self.parent {
@@ -1936,7 +1939,8 @@ impl VmAddressRegion {
             // SIGSEGVs every process (observed when the floor was mistakenly
             // applied here globally).
             let floor = min_offset.next_multiple_of(align.max(1));
-            self.find_free_area(inner, floor, len, align, max_offset)
+            top_down::place(self, inner, floor, len, align, max_offset)
+                .or_else(|| self.find_free_area(inner, floor, len, align, max_offset))
                 .ok_or(ZxError::NO_MEMORY)
         }
     }
