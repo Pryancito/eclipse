@@ -57,7 +57,7 @@ class OpenPosixReport(unittest.TestCase):
 
     def test_the_expected_list_reads(self):
         expected = run.load_expected()
-        self.assertEqual(expected["conformance/interfaces/mq_open/1-1.run-test"], "FAIL")
+        self.assertEqual(expected["conformance/interfaces/aio_cancel/3-1.run-test"], "FAIL")
         self.assertEqual(expected[C], "FLAKY")
 
     def test_areas(self):
