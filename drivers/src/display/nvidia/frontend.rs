@@ -24,7 +24,8 @@ pub mod remote;
 pub use nvidia_rm_sys::frontend::events::{set_event_sink, UnixEvent, NV_ERR_INVALID_EVENT};
 pub use nvidia_rm_sys::frontend::user_pages::UserPages;
 pub use nvidia_rm_sys::frontend::uvm::{
-    ExternalMapping, P2pCaps, Pages, SkedRange, NV_ERR_INVALID_CLIENT,
+    take_map_failure as uvm_take_map_failure, ExternalMapping, MapFailure, P2pCaps, Pages,
+    SkedRange, NV_ERR_INVALID_CLIENT,
 };
 pub use nvidia_rm_sys::frontend::{
     caching, copy_version, layout_mismatch, rm_version, set_user_range_validator, version_check,

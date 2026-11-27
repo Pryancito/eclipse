@@ -464,6 +464,10 @@ static int deep_registered(struct deep *g)
     deep_fill(r, WORDS, 0x5eed);
     deep_fill(g->want, WORDS, 0x5eed);
     int registered = deep_call("cuMemHostRegister", d_register(r, BYTES, 0));
+    // Where it was: the GPU maps it at the same address (unified addressing),
+    // and `dmesg | grep nvidia-uvm` names the GPU ranges it may not land on.
+    if (!registered)
+        printf("  registered buffer at %p, %d MiB\n", (void *)r, BYTES >> 20);
     int ok = registered && deep_call("HtoDAsync", d_htod_async(g->c, r, BYTES, g->stream)) &&
              deep_call("sync", d_stream_sync(g->stream));
     if (ok) {
