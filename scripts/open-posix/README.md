@@ -24,7 +24,8 @@ cada PR: es para lanzarla a mano, o cada noche, al tocar señales, hilos,
 timers, memoria o IPC.
 
 Medido el 2026-11-22: Eclipse pasa 1316 de 1596 (82,5 %); Linux, con los
-mismos binarios, 1412 (88,5 %). Casi toda la diferencia son las colas de
-mensajes POSIX, que no existen. Con musl, la planificación POSIX
+mismos binarios, 1412 (88,5 %). Casi toda la diferencia eran las colas de
+mensajes POSIX, que no existian. El 2026-11-27, con ellas: Eclipse pasa 1435
+de 1596 (89,9 %), y los 127 tests de `mq_*`. Con musl, la planificación POSIX
 (`sched_setscheduler` y compañía) es ENOSYS por diseño de musl, y esos tests
 fallan igual en Linux.

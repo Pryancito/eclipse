@@ -7,6 +7,9 @@ use zircon_object::vm::*;
 
 pub use linux_object::ipc::*;
 
+/// POSIX message queues (`mq_open` and the rest).
+mod mq;
+
 /// `shmat(2)` attach flags (`linux/shm.h`).
 const SHM_RDONLY: usize = 0o10000;
 const SHM_RND: usize = 0o20000;
@@ -2924,6 +2927,10 @@ mod semctl_wiring_tests;
 /// two parks a queue has.
 #[cfg(test)]
 mod msg_wiring_tests;
+
+/// POSIX message queues reached through the syscalls.
+#[cfg(test)]
+mod mq_wiring_tests;
 
 /// System V shared memory reached through the syscall: a segment made in one
 /// process and read in another, where an attach lands, and what a detach

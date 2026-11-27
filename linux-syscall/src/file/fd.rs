@@ -975,6 +975,7 @@ impl Syscall<'_> {
                     self.zircon_process().id(),
                 );
             }
+            self.mq_flush(&f);
             if let Some(desc) = linux_object::fs::drm_fd_desc(&f) {
                 debug!(
                     "[drm] pid={} close(fd={:?}) of {}",

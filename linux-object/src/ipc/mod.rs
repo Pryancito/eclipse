@@ -1,11 +1,13 @@
 //! Linux Inter-Process Communication
 #![deny(missing_docs)]
+mod mqueue;
 mod msgqueue;
 mod semary;
 #[cfg(test)]
 pub(crate) use self::semary::test_globals as sem_test_globals;
 mod shared_mem;
 
+pub use self::mqueue::*;
 pub use self::msgqueue::*;
 pub use self::semary::*;
 pub use self::shared_mem::*;

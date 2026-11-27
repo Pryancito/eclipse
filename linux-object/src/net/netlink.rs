@@ -126,6 +126,13 @@ impl NetlinkSocketState {
         }
     }
 
+    /// Queue a message nobody asked for on this socket, for its next
+    /// `recv`: what `netlink_sendskb` does for the cookie of a POSIX message
+    /// queue's `SIGEV_THREAD` notification ([`crate::ipc::deliver`]).
+    pub fn push_datagram(&self, msg: Vec<u8>) {
+        push_netlink_rx(&mut self.data.lock(), msg);
+    }
+
     fn auto_port_id(&self) -> u32 {
         let reduced = self.base.id % u32::MAX as u64;
         (reduced as u32).max(1)
