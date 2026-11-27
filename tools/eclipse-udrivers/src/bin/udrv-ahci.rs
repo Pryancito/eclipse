@@ -61,9 +61,11 @@ fn main() {
     let base = claim.map_regs().unwrap_or_else(|e| die(e));
     // SAFETY: the claimed ABAR, mapped for good.
     let regs = unsafe { Regs::new(base) };
-    if !regs.enable() {
-        // Every DMA address here may be above 4 GiB.
-        die("the controller addresses 32 bits only");
+    // A controller without 64-bit addressing reaches only the first 4 GiB:
+    // every port's memory is asked for there.
+    let dma32 = !regs.enable();
+    if dma32 {
+        println!("{NAME}: the controller addresses 32 bits only: its memory goes below 4 GiB");
     }
     let ports = regs.disks();
     if ports.is_empty() {
@@ -89,12 +91,20 @@ fn main() {
 
     let mut serving = Vec::new();
     for (p, wake) in wakes {
-        let dma = Dma::new(
-            claim.bti,
-            ahci::DMA_SIZE,
-            Some((ahci::DMA_DATA, blk::DATA_MAX)),
-        )
-        .unwrap_or_else(|e| die(e));
+        let window = Some((ahci::DMA_DATA, blk::DATA_MAX));
+        let dma = if dma32 {
+            Dma::new_below(claim.bti, ahci::DMA_SIZE, window, claim::DMA32_LIMIT)
+        } else {
+            Dma::new(claim.bti, ahci::DMA_SIZE, window)
+        };
+        let dma = match dma {
+            Ok(dma) => dma,
+            Err(e) if dma32 => {
+                println!("{NAME}: {e}; port {p} left out");
+                continue;
+            }
+            Err(e) => die(e),
+        };
         let window = dma.window.expect("asked for above");
         let wake = match claim.interrupt {
             None => Waker::Poll,
