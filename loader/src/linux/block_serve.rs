@@ -71,6 +71,15 @@ pub(super) const REPLY_TIMEOUT_MS: u64 = 30_000;
 /// How often a link wakes the requests asleep on it, to look at their
 /// deadlines: so late, at most, a request gives up.
 const WATCH_EVERY: Duration = Duration::from_secs(1);
+/// How long a driver may say nothing while a request waits on it -- that
+/// one or any other -- before it is taken for hung and killed: init starts
+/// the next, and what was waiting is made again with it, as when a driver
+/// dies. Well under [`REPLY_TIMEOUT_MS`], so a hung driver costs the
+/// request a wait and not an error; well over what a disk that answers
+/// takes, a hard disk spinning up from standby (up to ten seconds or so) or
+/// a cache flush included: every answer, to any request, starts the count
+/// again.
+const HUNG_AFTER_MS: u64 = 20_000;
 /// The smallest slot worth serving through: one page.
 const MIN_SLOT: usize = 4096;
 /// The most slots, and so the most requests in flight: the driver's FIFO
@@ -123,11 +132,48 @@ struct Link {
     /// The driver closed its end: nothing will be answered again.
     dead: AtomicBool,
     next_id: AtomicU32,
+    /// How many answers have come back, ever: all a request pays for the
+    /// watch on hangs ([`Link::watch`]), which reads no clock of its own on
+    /// the way of a request.
+    answers_seen: AtomicU32,
+    /// What the watch saw the last time it looked.
+    quiet: lock::Mutex<Quiet>,
+    /// What ends the driver when it hangs ([`Link::killed_with`]).
+    kill: lock::Mutex<Option<Kill>>,
     /// Waits left to sleep through before the next look, and the run after
     /// the next miss: see [`after_look`]. Racy on purpose: a lost update
     /// costs a look or saves one.
     look_skip: AtomicU32,
     look_backoff: AtomicU32,
+}
+
+/// What ends a driver that hangs.
+type Kill = Box<dyn Fn() + Send + Sync>;
+
+/// What a link's watch knows of its driver's silence: how many answers it
+/// had seen, and since when (`now_ms`) a request has waited with no answer
+/// coming, to it or any other.
+#[derive(Clone, Copy, Default, PartialEq, Debug)]
+pub(super) struct Quiet {
+    answers: u32,
+    since: Option<u64>,
+}
+
+impl Quiet {
+    /// The look at `now`: `waiting` whether a request waits for an answer,
+    /// `answers` how many have come back so far. The silence is counted from
+    /// the first look that found a request waiting and nothing answered since
+    /// the look before, so a second late at most. Whether the driver is
+    /// hung: silent for [`HUNG_AFTER_MS`] while a request waited.
+    pub(super) fn look(&mut self, now: u64, waiting: bool, answers: u32) -> bool {
+        if !waiting || answers != self.answers {
+            self.answers = answers;
+            self.since = waiting.then_some(now);
+            return false;
+        }
+        let since = *self.since.get_or_insert(now);
+        now > since + HUNG_AFTER_MS
+    }
 }
 
 /// A message, as bytes.
@@ -251,6 +297,9 @@ impl Link {
             wakers: [const { lock::Mutex::new(None) }; SLOTS],
             dead: AtomicBool::new(false),
             next_id: AtomicU32::new(0),
+            answers_seen: AtomicU32::new(0),
+            quiet: lock::Mutex::new(Quiet::default()),
+            kill: lock::Mutex::new(None),
             look_skip: AtomicU32::new(0),
             look_backoff: AtomicU32::new(1),
         })
@@ -280,6 +329,9 @@ impl Link {
                 return 0;
             }
         };
+        if n > 0 {
+            self.answers_seen.fetch_add(n as u32, Ordering::Relaxed);
+        }
         for m in back.as_chunks::<BLOCK_MSG>().0.iter().take(n) {
             let (id, status) = decode(m);
             let slot = (id as usize) & (SLOTS - 1);
@@ -779,6 +831,52 @@ impl Link {
         }
     }
 
+    /// The process that answers on this link, and how it is ended when it
+    /// hangs.
+    fn killed_with(&self, kill: Kill) {
+        *self.kill.lock() = Some(kill);
+    }
+
+    /// Whether a request is waiting for its answer.
+    fn waiting(&self) -> bool {
+        let free = self.free.load(Ordering::Acquire);
+        (0..self.slots).any(|slot| {
+            free & (1 << slot) == 0 && self.answers[slot].load(Ordering::Acquire) == PENDING
+        })
+    }
+
+    /// The link's look every [`WATCH_EVERY`], at `now`: a driver that has
+    /// said nothing for [`HUNG_AFTER_MS`] while a request waits is hung. It
+    /// is killed and the link closed, so that what waits on it is made
+    /// again with the next driver, which init starts. Whether it was.
+    fn watch(&self, now: u64) -> bool {
+        if self.is_dead() {
+            return false;
+        }
+        // An answer still in the FIFO is an answer: the driver is not
+        // silent. It is left there for the request to read: a reply this
+        // read would leave a request that waits on the FIFO's signal asleep
+        // until something else wakes it (a 4k read took twice as long in
+        // half the runs when the watch read the replies itself).
+        let unread = self.fifo.signal().contains(Signal::READABLE);
+        let answers = self.answers_seen.load(Ordering::Relaxed);
+        let waiting = self.waiting() && !unread;
+        if !self.quiet.lock().look(now, waiting, answers) {
+            return false;
+        }
+        warn!(
+            "served disk: the driver has answered nothing for {} s while a request waits: \
+             it is killed, and what waits goes to the next",
+            HUNG_AFTER_MS / 1000
+        );
+        let kill = self.kill.lock().take();
+        if let Some(kill) = kill {
+            kill();
+        }
+        self.close();
+        true
+    }
+
     /// The driver is gone: say so to whoever sleeps on an answer.
     fn close(&self) {
         self.dead.store(true, Ordering::Release);
@@ -1192,6 +1290,13 @@ pub(super) fn block_serve(proc: &Arc<Process>, args: &[usize; 6]) -> ZxResult {
     let _ = proc.remove_handle(args[0] as u32);
     let _ = proc.remove_handle(args[1] as u32);
     let link = Arc::new(Link::new(fifo.clone(), window, args[2] as u64)?);
+    let pid = proc.id() as usize;
+    link.killed_with(Box::new(move || {
+        let kill = linux_object::signal::Signal::SIGKILL;
+        if let Err(e) = linux_object::process::send_signal_to_process(pid, kill) {
+            warn!("served disk: the hung driver {pid} was not killed: {e:?}");
+        }
+    }));
     let unit = args[3];
     let device = DISK_KINDS.iter().find_map(|(kind, _)| {
         super::device_claim::held_by(proc, kind).map(|index| (*kind, index, unit))
@@ -1246,7 +1351,7 @@ pub(super) fn block_serve(proc: &Arc<Process>, args: &[usize; 6]) -> ZxResult {
                 }
             })
             .await;
-            if gone {
+            if gone || link.watch(now_ms()) {
                 break;
             }
             link.wake_sleepers();
@@ -1298,6 +1403,92 @@ mod tests {
             .expect("no link after the dead one");
         assert!(Arc::ptr_eq(&next, &second));
         assert!(first.is_dead());
+    }
+
+    #[test]
+    fn a_driver_is_hung_only_after_its_silence_while_a_request_waits() {
+        let mut q = Quiet::default();
+        // Nothing waits: no silence is a hang, however long.
+        assert!(!q.look(0, false, 0));
+        assert!(!q.look(1_000_000, false, 0));
+        // A request waits: the count runs from the first look that saw it.
+        assert!(!q.look(1_000_000 + 1000, true, 0));
+        assert!(!q.look(1_000_000 + 1000 + HUNG_AFTER_MS, true, 0));
+        assert!(q.look(1_000_000 + 1001 + HUNG_AFTER_MS, true, 0));
+        // An answer, to that request or another, starts it again.
+        let t = 2_000_000;
+        assert!(!q.look(t, true, 1));
+        assert!(!q.look(t + HUNG_AFTER_MS, true, 1));
+        assert!(!q.look(t + HUNG_AFTER_MS + 1, true, 2));
+        // Nothing waiting between two looks forgets the silence.
+        assert!(!q.look(t + 2 * HUNG_AFTER_MS, false, 2));
+        assert!(!q.look(t + 3 * HUNG_AFTER_MS, true, 2));
+        assert!(q.look(t + 4 * HUNG_AFTER_MS + 1, true, 2));
+        // And all of it well before a request gives up by itself.
+        assert!(HUNG_AFTER_MS + WATCH_EVERY.as_millis() as u64 * 2 < REPLY_TIMEOUT_MS);
+    }
+
+    #[test]
+    fn a_hung_driver_is_killed_and_what_waits_goes_to_the_next() {
+        use core::sync::atomic::AtomicUsize;
+        let (first, _first_end) = link(64);
+        let (disk, _) = ServedDisk::new(first.clone(), DISK_KINDS[0].1);
+        let killed = Arc::new(AtomicUsize::new(0));
+        let k = killed.clone();
+        first.killed_with(Box::new(move || {
+            k.fetch_add(1, Ordering::Relaxed);
+        }));
+        // A request goes out and nothing answers it.
+        let (parts, _) = first
+            .submit(OP_READ, 0, SECTOR, &mut 0, u64::MAX, &mut |_, _, _| Ok(()))
+            .unwrap();
+        let _ = parts;
+        let sent = 1_000;
+        assert!(!first.watch(sent));
+        assert!(!first.watch(sent + HUNG_AFTER_MS));
+        assert!(!first.is_dead());
+        assert!(first.watch(sent + HUNG_AFTER_MS + 1));
+        assert_eq!(killed.load(Ordering::Relaxed), 1);
+        assert!(first.is_dead());
+        // Looked at again, it is not killed twice.
+        assert!(!first.watch(sent + 2 * HUNG_AFTER_MS));
+        assert_eq!(killed.load(Ordering::Relaxed), 1);
+        // The request that waited on it is made with the next driver.
+        disk.undrive(&first);
+        let (second, _second_end) = link(64);
+        let mut asked = 0;
+        let r = disk.retried(|link| {
+            asked += 1;
+            if asked == 1 {
+                assert!(link.is_dead());
+                disk.drive(second.clone()).unwrap();
+            }
+            link.read(1000, &mut [0u8; SECTOR])
+        });
+        assert_eq!(r, Err(DeviceError::InvalidParam));
+        assert_eq!(asked, 2);
+    }
+
+    #[test]
+    fn a_driver_that_answers_is_not_hung() {
+        let (first, first_end) = link(64);
+        first.killed_with(Box::new(|| panic!("killed a driver that answers")));
+        let (parts, _) = first
+            .submit(OP_READ, 0, SECTOR, &mut 0, u64::MAX, &mut |_, _, _| Ok(()))
+            .unwrap();
+        let sent = 1_000;
+        assert!(!first.watch(sent));
+        // The driver answers it, late but before the watch looks.
+        let mut m = [0u8; BLOCK_MSG];
+        first_end.read(BLOCK_MSG, &mut m, 1).unwrap();
+        first_end.write(BLOCK_MSG, &m, 1).unwrap();
+        assert!(!first.watch(sent + HUNG_AFTER_MS + 1));
+        assert!(!first.is_dead());
+        // The answer is left for the request to read: one that sleeps on
+        // the FIFO's signal is woken by it.
+        assert_eq!(first.verdict(&parts[..1]), None);
+        first.pump();
+        assert_eq!(first.verdict(&parts[..1]), Some(Ok(())));
     }
 
     #[test]
