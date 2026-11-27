@@ -80,8 +80,41 @@ const _: () = assert!(DMA_IDENTIFY < DMA_PRP);
 /// How long a wait looks at the completion queue before it sleeps on the
 /// interrupt (see [`Hybrid`]).
 const DEVICE_LOOK_NS: u64 = 200_000;
-/// How long the controller has to become ready, or stop being so.
+/// How long the controller has to become ready, or stop being so, at
+/// least: `CAP.TO` may say longer ([`ready_ns`]).
 const READY_NS: u64 = 5_000_000_000;
+/// How long a batch of commands may go unanswered before the controller is
+/// taken for hung: Linux's default (`nvme_core.io_timeout`). The driver
+/// then stops serving and exits; the kernel resets the controller and
+/// keeps the requests that were out for the next driver, which `init`
+/// starts and which brings the controller up from scratch.
+pub const IO_TIMEOUT_NS: u64 = 30_000_000_000;
+/// How long a sleep on the interrupt lasts at most before a look at
+/// `CSTS`: a controller that failed (`CFS`) or left the bus is told within
+/// this much, not at the end of [`IO_TIMEOUT_NS`].
+const HEALTH_LOOK_NS: u64 = 1_000_000_000;
+/// Spins between two looks at the clock in a polled wait.
+const SPINS_PER_CLOCK: u32 = 4096;
+
+/// How long to wait for `CSTS.RDY` to follow `CC.EN`: what `CAP.TO` says
+/// (in units of 500 ms), but never less than [`READY_NS`].
+pub fn ready_ns(cap: u64) -> u64 {
+    (((cap >> 24) & 0xff) * 500_000_000).max(READY_NS)
+}
+
+/// What is wrong with a controller whose `CSTS` reads `csts`, if anything
+/// that no wait will cure: all ones is a read from a function no longer
+/// on the bus (surprise removal, a link down), `CFS` a controller that
+/// says it has failed.
+pub fn broken(csts: u32) -> Option<&'static str> {
+    if csts == u32::MAX {
+        Some("is gone from the bus (CSTS reads all ones)")
+    } else if csts & CSTS_CFS != 0 {
+        Some("has failed (CSTS.CFS)")
+    } else {
+        None
+    }
+}
 
 /// One submission queue entry, as the controller reads it (§4.2).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -293,10 +326,10 @@ pub struct Nvme {
     has_flush: bool,
 }
 
-fn wait_until(what: &str, mut ok: impl FnMut() -> bool) -> Result<(), String> {
+fn wait_until(what: &str, limit: u64, mut ok: impl FnMut() -> bool) -> Result<(), String> {
     let start = now_ns();
     while !ok() {
-        if now_ns() - start > READY_NS {
+        if now_ns() - start > limit {
             return Err(format!("the controller never {what}"));
         }
         std::thread::yield_now();
@@ -322,6 +355,7 @@ impl Nvme {
         let regs = Regs(regs);
         let cap = regs.read64(CAP);
         let stride = 4usize << ((cap >> 32) & 0xf);
+        let ready = ready_ns(cap);
         let mpsmin = (cap >> 48) & 0xf;
         if mpsmin != 0 {
             return Err(format!(
@@ -337,7 +371,7 @@ impl Nvme {
         }
         // Whatever the firmware or a driver before this one left running.
         regs.write32(CC, regs.read32(CC) & !CC_EN);
-        wait_until("stopped", || regs.read32(CSTS) & CSTS_RDY == 0)?;
+        wait_until("stopped", ready, || regs.read32(CSTS) & CSTS_RDY == 0)?;
         let aqa = (ADMIN_DEPTH as u32 - 1) << 16 | (ADMIN_DEPTH as u32 - 1);
         regs.write32(AQA, aqa);
         regs.write64(ASQ, daddr + DMA_ASQ as u64);
@@ -346,7 +380,7 @@ impl Nvme {
         // while the admin queue is polled.
         regs.write32(INTMS, u32::MAX);
         regs.write32(CC, CC_ENTRY_SIZES | CC_EN);
-        wait_until("became ready", || {
+        wait_until("became ready", ready, || {
             regs.read32(CSTS) & (CSTS_RDY | CSTS_CFS) != 0
         })?;
         if regs.read32(CSTS) & CSTS_CFS != 0 {
@@ -456,10 +490,39 @@ impl Nvme {
         Command::rw(!io.is_read(), sector, (len / SECTOR) as u32, prp)
     }
 
+    /// Whether the controller can still answer: `IO`, said on the
+    /// console, when it cannot ([`broken`]).
+    fn healthy(&self) -> Result<(), Status> {
+        match broken(self.regs.read32(CSTS)) {
+            None => Ok(()),
+            Some(why) => {
+                println!("udrv-nvme: the controller {why}; giving it up");
+                Err(Status::IO)
+            }
+        }
+    }
+
+    /// Nothing answered `want` commands in [`IO_TIMEOUT_NS`]: `TIMED_OUT`,
+    /// said on the console.
+    fn hung(&self, want: usize) -> Status {
+        if self.healthy().is_err() {
+            return Status::IO;
+        }
+        println!(
+            "udrv-nvme: {want} command(s) unanswered after {} s (CSTS {:#x}); giving the controller up",
+            IO_TIMEOUT_NS / 1_000_000_000,
+            self.regs.read32(CSTS)
+        );
+        Status::TIMED_OUT
+    }
+
     /// Wait for `want` completions, a look first when looks have been
-    /// paying, then asleep on the interrupt; `on` is told each one.
+    /// paying, then asleep on the interrupt; `on` is told each one. A
+    /// controller that answers none of them in [`IO_TIMEOUT_NS`], fails or
+    /// leaves the bus ends the wait with an error, and the serving with it.
     fn reap(&mut self, mut want: usize, mut on: impl FnMut(Completion)) -> Result<(), Status> {
         let started = now_ns();
+        let deadline = started + IO_TIMEOUT_NS;
         let mut looking = self.interrupt.is_none() || self.look.try_look();
         let mut turns = 1u32;
         while want > 0 {
@@ -475,16 +538,34 @@ impl Nvme {
                 break;
             }
             match self.interrupt {
-                Some(irq) if !looking => claim::interrupt_wait(irq)?,
-                Some(_) => {
-                    if turns.is_multiple_of(4096) && now_ns() - started >= DEVICE_LOOK_NS {
-                        self.look.done(false);
-                        looking = false;
+                Some(irq) if !looking => {
+                    let now = now_ns();
+                    if now >= deadline {
+                        return Err(self.hung(want));
                     }
-                    turns += 1;
+                    match claim::interrupt_wait_for(irq, (deadline - now).min(HEALTH_LOOK_NS)) {
+                        Ok(()) => {}
+                        // A second without a word, or a signal: is it
+                        // still there?
+                        Err(Status::TIMED_OUT) | Err(Status::INTERNAL_INTR_RETRY) => {
+                            self.healthy()?
+                        }
+                        Err(e) => return Err(e),
+                    }
+                }
+                _ => {
+                    if turns.is_multiple_of(SPINS_PER_CLOCK) {
+                        let now = now_ns();
+                        if looking && self.interrupt.is_some() && now - started >= DEVICE_LOOK_NS {
+                            self.look.done(false);
+                            looking = false;
+                        } else if now >= deadline {
+                            return Err(self.hung(want));
+                        }
+                    }
+                    turns = turns.wrapping_add(1);
                     core::hint::spin_loop();
                 }
-                None => core::hint::spin_loop(),
             }
         }
         if looking && self.interrupt.is_some() {
@@ -664,6 +745,22 @@ mod tests {
             1,
             "a flush is one command"
         );
+    }
+
+    #[test]
+    fn the_ready_wait_is_what_cap_to_says_but_never_under_five_seconds() {
+        assert_eq!(ready_ns(0), READY_NS);
+        assert_eq!(ready_ns(4 << 24), READY_NS, "2 s is under the floor");
+        assert_eq!(ready_ns(0x3c << 24 | 0xffff), 30_000_000_000);
+        assert_eq!(ready_ns(0xff << 24), 127_500_000_000);
+    }
+
+    #[test]
+    fn a_controller_that_failed_or_left_the_bus_is_told_apart_from_a_slow_one() {
+        assert_eq!(broken(CSTS_RDY), None, "ready and well");
+        assert_eq!(broken(0), None, "not ready is not broken");
+        assert!(broken(CSTS_RDY | CSTS_CFS).unwrap().contains("CFS"));
+        assert!(broken(u32::MAX).unwrap().contains("bus"));
     }
 
     #[test]

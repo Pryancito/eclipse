@@ -81,6 +81,19 @@ struct InterruptInner {
     packet_id: u64,
 }
 
+/// Puts a wait that was dropped half way back to
+/// [`InterruptState::Idle`] (see [`Interrupt::wait`]).
+struct GivenUp<'a>(&'a Mutex<InterruptInner>);
+
+impl Drop for GivenUp<'_> {
+    fn drop(&mut self) {
+        let mut inner = self.0.lock();
+        if inner.state == InterruptState::Waiting {
+            inner.state = InterruptState::Idle;
+        }
+    }
+}
+
 impl Drop for Interrupt {
     fn drop(&mut self) {
         // Closing a handle has nobody to report to, and `destroy` has two
@@ -333,9 +346,18 @@ impl Interrupt {
     }
 
     /// Wait until the interrupt is triggered.
+    ///
+    /// A wait given up before the interrupt came -- its future dropped, by
+    /// a deadline (`eclipse_interrupt_wait_for`) or a signal that sends the
+    /// thread back to userspace -- leaves the interrupt as if nobody had
+    /// waited ([`InterruptState::Idle`]), not [`InterruptState::Waiting`],
+    /// which only a wait in progress may be in: the next wait would answer
+    /// `BAD_STATE` and the driver behind it would never sleep on its
+    /// device again.
     pub async fn wait(self: &Arc<Self>) -> ZxResult<i64> {
         let mut defer_unmask = false;
         let object = self.clone() as Arc<dyn KernelObject>;
+        let _given_up = GivenUp(&self.inner);
         loop {
             {
                 let mut inner = self.inner.lock();
@@ -1027,5 +1049,30 @@ mod tests {
         assert!(!line.is_masked());
         assert!(answers("a fired line", interrupt.wait()).await.is_ok());
         assert!(!line.is_masked());
+    }
+    #[async_std::test]
+    /// A wait given up before the interrupt came (a deadline, a signal)
+    /// leaves the interrupt waitable: the next wait sleeps until the next
+    /// trigger instead of answering `BAD_STATE` at once.
+    async fn a_wait_given_up_half_way_does_not_spoil_the_next() {
+        let interrupt = Interrupt::new_virtual();
+        let short = || core::time::Duration::from_millis(20);
+        for round in 0..2 {
+            // Twice: from Idle, then from NeedAck after an answer.
+            for _ in 0..2 {
+                assert!(
+                    async_std::future::timeout(short(), interrupt.wait())
+                        .await
+                        .is_err(),
+                    "round {}: a wait with nothing to answer slept",
+                    round
+                );
+            }
+            interrupt.trigger(40 + round).unwrap();
+            assert_eq!(
+                answers("a wait after some given up", interrupt.wait()).await,
+                Ok(40 + round)
+            );
+        }
     }
 }

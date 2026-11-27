@@ -597,6 +597,16 @@ pub const ECLIPSE_BLOCK_SERVE: u32 = ECLIPSE_GATEWAY_EXT + 6;
 #[cfg(feature = "zircon-gateway")]
 pub const ECLIPSE_FIFO_REPLY_WAIT: u32 = ECLIPSE_GATEWAY_EXT + 8;
 
+/// `eclipse_interrupt_wait_for(interrupt, timeout_ns, *timestamp)`:
+/// `zx_interrupt_wait` that gives up after `timeout_ns` nanoseconds with
+/// `ZX_ERR_TIMED_OUT`, leaving the interrupt as if nobody had waited on it.
+/// For a driver that must not sleep forever on a device that stopped
+/// answering (a hung NVMe controller). The handle needs `WAIT`, as for
+/// `zx_interrupt_wait`; a signal during the wait answers
+/// `ZX_ERR_INTERNAL_INTR_RETRY`.
+#[cfg(feature = "zircon-gateway")]
+pub const ECLIPSE_INTERRUPT_WAIT_FOR: u32 = ECLIPSE_GATEWAY_EXT + 30;
+
 /// `eclipse_netstack_serve(channel, max_datagram, address, prefix, gateway,
 /// mac)`: this process
 /// is a network stack, and `channel` is the end of a channel on which the
@@ -2647,6 +2657,19 @@ async fn handle_user_trap(
                         },
                     }
                 }
+                _ if zx_num == ECLIPSE_INTERRUPT_WAIT_FOR => run_with_irq_enable! {
+                    match linux_object::process::interruptible(zx.sys_interrupt_wait_for(
+                        args[0] as _,
+                        args[1] as u64,
+                        args[2].into(),
+                    ))
+                    .await
+                    {
+                        Ok(Ok(())) => 0,
+                        Ok(Err(e)) => e as isize as usize,
+                        Err(_) => zircon_object::ZxError::INTERNAL_INTR_RETRY as isize as usize,
+                    }
+                },
                 _ if zx_num >= ECLIPSE_GATEWAY_EXT => {
                     eclipse_gateway_call(thread.proc(), zx_num, &args) as usize
                 }

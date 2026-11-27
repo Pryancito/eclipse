@@ -325,6 +325,35 @@ impl Syscall<'_> {
         out.write_if_not_null(timestamp)?;
         Ok(())
     }
+
+    /// `zx_interrupt_wait` that gives up after `timeout_ns` nanoseconds:
+    /// `TIMED_OUT` then, with the interrupt left as if nobody had waited.
+    /// Eclipse's own (`eclipse_interrupt_wait_for`): a driver bounds how
+    /// long it sleeps on a device that may have stopped answering.
+    pub async fn sys_interrupt_wait_for(
+        &self,
+        interrupt: HandleValue,
+        timeout_ns: u64,
+        mut out: UserOutPtr<i64>,
+    ) -> ZxResult {
+        info!(
+            "interrupt.wait_for: handle={:?} timeout={}ns",
+            interrupt, timeout_ns
+        );
+        let proc = self.thread.proc();
+        let interrupt = proc.get_object_with_rights::<Interrupt>(interrupt, Rights::WAIT)?;
+        let future = interrupt.wait();
+        pin_mut!(future);
+        let deadline = kernel_hal::timer::timer_now()
+            .checked_add(core::time::Duration::from_nanos(timeout_ns))
+            .unwrap_or(core::time::Duration::MAX);
+        let timestamp = self
+            .thread
+            .blocking_run(future, ThreadState::BlockedInterrupt, deadline, None)
+            .await?;
+        out.write_if_not_null(timestamp)?;
+        Ok(())
+    }
 }
 
 const IOMMU_TYPE_DUMMY: u32 = 0;
