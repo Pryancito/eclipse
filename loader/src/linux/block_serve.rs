@@ -259,6 +259,16 @@ impl Link {
     /// Read whatever replies have come back and mark their slots. Returns
     /// how many there were.
     fn pump(&self) -> usize {
+        // Nothing to read, as on most looks: no lock, and no buffer to
+        // clear. Every caller that is told 0 looks again or sleeps on
+        // these same signals, so a reply landing just after is not lost.
+        if !self
+            .fifo
+            .signal()
+            .intersects(Signal::READABLE | Signal::PEER_CLOSED)
+        {
+            return 0;
+        }
         let mut back = [0u8; BLOCK_MSG * SLOTS];
         let n = match self.fifo.read(BLOCK_MSG, &mut back, SLOTS) {
             Ok(n) => n,

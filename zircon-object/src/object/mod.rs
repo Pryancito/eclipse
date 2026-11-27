@@ -242,6 +242,11 @@ pub struct KObjectBase {
     /// high monotonic ids are never fed back into the pool.
     pooled: bool,
     inner: Mutex<KObjectBaseInner>,
+    /// `inner.signal`, readable without the lock: stored under it at every
+    /// change, before anybody is told. A wait looks at the signals far more
+    /// often than they change -- a served disk's reply FIFO is looked at
+    /// half a dozen times a request -- and each look was a lock.
+    signal_now: AtomicU32,
     /// How many live [`Handle`]s refer to this object, and who asked to be
     /// told when that reaches zero. Its own lock, never taken with `inner`
     /// held: the senders go off after it is let go.
@@ -431,12 +436,63 @@ pub struct SignalWaiter {
     waker: Mutex<Option<core::task::Waker>>,
 }
 
+/// Waiters let go of whole, kept to be taken again: every sleep of a
+/// thread on a FIFO, a channel or a port takes one, and with the two sides
+/// of a served disk's request sleeping once each, two allocations and two
+/// frees a request were these. Few slots: the sleeps in a row on one CPU
+/// are what they are for.
+static SPARE_WAITERS: [AtomicPtr<SignalWaiter>; 4] =
+    [const { AtomicPtr::new(core::ptr::null_mut()) }; 4];
+
 impl SignalWaiter {
+    #[allow(unsafe_code)]
     fn new() -> Arc<Self> {
+        for slot in &SPARE_WAITERS {
+            if slot.load(Ordering::Relaxed).is_null() {
+                continue;
+            }
+            let kept = slot.swap(core::ptr::null_mut(), Ordering::Acquire);
+            if !kept.is_null() {
+                // SAFETY: put there by `keep` from `Arc::into_raw`, and
+                // taken out once, by this swap.
+                return unsafe { Arc::from_raw(kept) };
+            }
+        }
         Arc::new(SignalWaiter {
             registered: AtomicBool::new(false),
             waker: Mutex::new(None),
         })
+    }
+
+    /// The wait that held `this` is over: keep it for the next one if
+    /// nothing else can still reach it. An object's list holds only `Weak`s,
+    /// and none can be made again without a strong one, so with this the
+    /// only `Arc` and no `Weak` left, nobody will ever tell it anything.
+    #[allow(unsafe_code)]
+    fn keep(mut this: Arc<Self>) {
+        // Only ours: exactly the case where nothing can reach it, and its
+        // lock need not be taken to empty it.
+        let Some(waiter) = Arc::get_mut(&mut this) else {
+            return;
+        };
+        *waiter.registered.get_mut() = false;
+        drop(waiter.waker.get_mut().take());
+        let raw = Arc::into_raw(this) as *mut SignalWaiter;
+        for slot in &SPARE_WAITERS {
+            if slot
+                .compare_exchange(
+                    core::ptr::null_mut(),
+                    raw,
+                    Ordering::Release,
+                    Ordering::Relaxed,
+                )
+                .is_ok()
+            {
+                return;
+            }
+        }
+        // SAFETY: `raw` is the `into_raw` above, given to no slot.
+        drop(unsafe { Arc::from_raw(raw) });
     }
 
     /// What an object does with the waiter on its list when its signals
@@ -465,6 +521,7 @@ impl Default for KObjectBase {
             id: Self::new_koid(),
             pooled: false,
             inner: Default::default(),
+            signal_now: AtomicU32::new(0),
             handles: Default::default(),
         }
     }
@@ -496,6 +553,7 @@ impl KObjectBase {
                 signal,
                 ..Default::default()
             }),
+            signal_now: AtomicU32::new(signal.bits()),
             handles: Default::default(),
         };
         watch_name_if_requested(&base.inner.lock().name);
@@ -512,6 +570,7 @@ impl KObjectBase {
                 signal,
                 ..Default::default()
             }),
+            signal_now: AtomicU32::new(signal.bits()),
             handles: Default::default(),
         }
     }
@@ -531,6 +590,7 @@ impl KObjectBase {
                     name: String::from(name),
                     ..Default::default()
                 }),
+                signal_now: AtomicU32::new(0),
                 handles: Default::default(),
             };
             watch_name_if_requested(&base.inner.lock().name);
@@ -604,7 +664,7 @@ impl KObjectBase {
 
     /// Get the signal status.
     pub fn signal(&self) -> Signal {
-        self.inner.lock().signal
+        Signal::from_bits_truncate(self.signal_now.load(Ordering::Acquire))
     }
 
     /// Count one more live [`Handle`] to this object.
@@ -705,6 +765,14 @@ impl KObjectBase {
     ///
     /// All signal callbacks will be called, unless nothing changed.
     pub fn signal_change_unless(&self, clear: Signal, set: Signal, unless: Signal) {
+        // A change that changes nothing, as most are (a FIFO written to
+        // that was already readable): no lock. Taking it would order this
+        // after a change under way, which is an order the two could have
+        // come in anyway.
+        let now = self.signal();
+        if now.intersects(unless) || (now - clear) | set == now {
+            return;
+        }
         let mut inner = self.inner.lock();
         if inner.signal.intersects(unless) {
             return;
@@ -716,6 +784,7 @@ impl KObjectBase {
         if new_signal == old_signal {
             return;
         }
+        self.signal_now.store(new_signal.bits(), Ordering::Release);
         // Zircon visits the most recently registered observers first.
         inner.signal_callbacks.reverse();
         inner.signal_callbacks.retain(|f| !f.told(new_signal));
@@ -806,29 +875,42 @@ impl dyn KernelObject {
         struct SignalFuture {
             object: Arc<dyn KernelObject>,
             signal: Signal,
-            waiter: Arc<SignalWaiter>,
+            /// Made at the first poll that has to wait: a wait whose signal
+            /// is there already, as a served disk's reply often is by the
+            /// time its client looks, allocates nothing.
+            waiter: Option<Arc<SignalWaiter>>,
         }
 
         impl Future for SignalFuture {
             type Output = Signal;
 
             fn poll(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Self::Output> {
-                let current_signal = self.object.signal();
-                if !(current_signal & self.signal).is_empty() {
+                let this = self.get_mut();
+                let current_signal = this.object.signal();
+                if !(current_signal & this.signal).is_empty() {
                     return Poll::Ready(current_signal);
                 }
-                *self.waiter.waker.lock() = Some(cx.waker().clone());
-                if !self.waiter.registered.swap(true, Ordering::AcqRel) {
-                    self.object.add_signal_waiter(self.signal, &self.waiter);
+                let waiter = this.waiter.get_or_insert_with(SignalWaiter::new);
+                *waiter.waker.lock() = Some(cx.waker().clone());
+                if !waiter.registered.swap(true, Ordering::AcqRel) {
+                    this.object.add_signal_waiter(this.signal, waiter);
                 }
                 Poll::Pending
+            }
+        }
+
+        impl Drop for SignalFuture {
+            fn drop(&mut self) {
+                if let Some(waiter) = self.waiter.take() {
+                    SignalWaiter::keep(waiter);
+                }
             }
         }
 
         SignalFuture {
             object: self.clone(),
             signal,
-            waiter: SignalWaiter::new(),
+            waiter: None,
         }
     }
 
@@ -1667,6 +1749,87 @@ mod tests {
         object.signal_set(Signal::READABLE);
         assert_eq!(counter.0.load(Ordering::Relaxed), 2);
         assert_eq!(future.as_mut().poll(&mut cx), Poll::Ready(Signal::READABLE));
+    }
+
+    #[test]
+    fn a_waiter_kept_from_a_wait_that_ended_serves_the_next_and_hears_only_it() {
+        use futures::task::{waker, ArcWake};
+        struct WakeCounter(AtomicUsize);
+        impl ArcWake for WakeCounter {
+            fn wake_by_ref(arc: &Arc<Self>) {
+                arc.0.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+        let first = Arc::new(WakeCounter(AtomicUsize::new(0)));
+        let second = Arc::new(WakeCounter(AtomicUsize::new(0)));
+        let (w1, w2) = (waker(first.clone()), waker(second.clone()));
+        let a = DummyObject::new() as Arc<dyn KernelObject>;
+        let b = DummyObject::new() as Arc<dyn KernelObject>;
+        {
+            let wait = a.wait_signal(Signal::READABLE);
+            futures::pin_mut!(wait);
+            assert!(wait
+                .as_mut()
+                .poll(&mut Context::from_waker(&w1))
+                .is_pending());
+            a.signal_set(Signal::READABLE);
+            assert_eq!(
+                wait.as_mut().poll(&mut Context::from_waker(&w1)),
+                Poll::Ready(Signal::READABLE)
+            );
+        }
+        // A wait dropped while still on an object's list is not kept: that
+        // object could still reach it.
+        {
+            let wait = b.wait_signal(Signal::WRITABLE);
+            futures::pin_mut!(wait);
+            assert!(wait
+                .as_mut()
+                .poll(&mut Context::from_waker(&w1))
+                .is_pending());
+        }
+        let wait = b.wait_signal(Signal::READABLE);
+        futures::pin_mut!(wait);
+        assert!(wait
+            .as_mut()
+            .poll(&mut Context::from_waker(&w2))
+            .is_pending());
+        // What the first wait waited on, again: the waiter that came back
+        // is nobody's on `a`.
+        a.signal_clear(Signal::READABLE);
+        a.signal_set(Signal::READABLE);
+        b.signal_set(Signal::WRITABLE);
+        assert_eq!(first.0.load(Ordering::Relaxed), 1);
+        assert_eq!(second.0.load(Ordering::Relaxed), 0);
+        b.signal_set(Signal::READABLE);
+        assert_eq!(second.0.load(Ordering::Relaxed), 1);
+        assert!(wait.as_mut().poll(&mut Context::from_waker(&w2)).is_ready());
+    }
+
+    #[test]
+    fn the_signals_read_without_the_lock_are_the_last_change() {
+        let base = KObjectBase::with_signal(Signal::WRITABLE);
+        assert_eq!(base.signal(), Signal::WRITABLE);
+        base.signal_change(Signal::WRITABLE, Signal::READABLE | Signal::USER_SIGNAL_7);
+        assert_eq!(base.signal(), Signal::READABLE | Signal::USER_SIGNAL_7);
+        assert_eq!(base.inner.lock().signal, base.signal());
+        // A change that changes nothing tells nobody.
+        let told = Arc::new(AtomicUsize::new(0));
+        base.add_signal_callback(Box::new({
+            let told = told.clone();
+            move |_| {
+                told.fetch_add(1, Ordering::SeqCst);
+                false
+            }
+        }));
+        let before = told.load(Ordering::SeqCst);
+        base.signal_set(Signal::READABLE);
+        base.signal_clear(Signal::PEER_CLOSED);
+        assert_eq!(told.load(Ordering::SeqCst), before);
+        base.signal_clear(Signal::READABLE);
+        assert_eq!(told.load(Ordering::SeqCst), before + 1);
+        assert_eq!(base.signal(), Signal::USER_SIGNAL_7);
+        assert_eq!(KObjectBase::with_name_pooled("p").signal(), Signal::empty());
     }
 
     #[async_std::test]
