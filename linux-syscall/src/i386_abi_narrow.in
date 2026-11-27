@@ -176,3 +176,14 @@ execveat
 // offsets, and the zero extension of the `sival_ptr` that `compat_ptr()` is,
 // are in `crate::narrow::sigevent`.
 timer_create
+
+// The POSIX message queues: a `struct mq_attr` (eight `long`s, so halved),
+// an old 32-bit `timespec` for the deadline, and a `struct sigevent` read
+// the way `timer_create` reads it. The handlers ask the process for its
+// width (`crate::ipc::mq`); `mq_unlink` passes only a name and is in the
+// other list. Their `_time64` twins (418, 419) are in `compat32::time64`.
+mq_open
+mq_timedsend
+mq_timedreceive
+mq_notify
+mq_getsetattr

@@ -78,6 +78,7 @@ mkdirat
 rmdir
 unlink
 unlinkat
+mq_unlink
 rename
 renameat
 renameat2

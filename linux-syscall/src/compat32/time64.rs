@@ -135,6 +135,10 @@ pub(super) const I386_TIMER_SETTIME64: u32 = 409;
 pub(super) const I386_PSELECT6_TIME64: u32 = 413;
 /// i386's number for `rt_sigtimedwait_time64`.
 pub(super) const I386_RT_SIGTIMEDWAIT_TIME64: u32 = 421;
+/// i386's number for `mq_timedsend_time64`.
+pub(super) const I386_MQ_TIMEDSEND_TIME64: u32 = 418;
+/// i386's number for `mq_timedreceive_time64`.
+pub(super) const I386_MQ_TIMEDRECEIVE_TIME64: u32 = 419;
 
 impl Syscall<'_> {
     /// `clock_gettime64` (403): the native call, writing a

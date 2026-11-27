@@ -864,6 +864,14 @@ impl Syscall<'_> {
             Sys::MSGRCV => self.sys_msgrcv(a0, a1, a2, a3 as isize, a4).await,
             Sys::MSGCTL => self.sys_msgctl(a0, a1, a2),
 
+            // POSIX message queues
+            Sys::MQ_OPEN => self.sys_mq_open(a0, a1, a2, a3),
+            Sys::MQ_UNLINK => self.sys_mq_unlink(a0),
+            Sys::MQ_TIMEDSEND => self.sys_mq_timedsend(a0, a1, a2, a3, a4, false).await,
+            Sys::MQ_TIMEDRECEIVE => self.sys_mq_timedreceive(a0, a1, a2, a3, a4, false).await,
+            Sys::MQ_NOTIFY => self.sys_mq_notify(a0, a1),
+            Sys::MQ_GETSETATTR => self.sys_mq_getsetattr(a0, a1, a2),
+
             // sem
             #[cfg(not(target_arch = "mips"))]
             Sys::SEMGET => self.sys_semget(a0, a1, a2),

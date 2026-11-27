@@ -191,9 +191,10 @@ use tls::I386_CLONE;
 /// a property of the CALL and not of the process. See [`time64`].
 use time64::{
     I386_CLOCK_GETRES_TIME64, I386_CLOCK_GETTIME64, I386_CLOCK_NANOSLEEP_TIME64,
-    I386_CLOCK_SETTIME64, I386_FUTEX_TIME64, I386_PPOLL_TIME64, I386_PSELECT6_TIME64,
-    I386_RT_SIGTIMEDWAIT_TIME64, I386_SCHED_RR_GET_INTERVAL_TIME64, I386_TIMERFD_GETTIME64,
-    I386_TIMERFD_SETTIME64, I386_TIMER_GETTIME64, I386_TIMER_SETTIME64, I386_UTIMENSAT_TIME64,
+    I386_CLOCK_SETTIME64, I386_FUTEX_TIME64, I386_MQ_TIMEDRECEIVE_TIME64, I386_MQ_TIMEDSEND_TIME64,
+    I386_PPOLL_TIME64, I386_PSELECT6_TIME64, I386_RT_SIGTIMEDWAIT_TIME64,
+    I386_SCHED_RR_GET_INTERVAL_TIME64, I386_TIMERFD_GETTIME64, I386_TIMERFD_SETTIME64,
+    I386_TIMER_GETTIME64, I386_TIMER_SETTIME64, I386_UTIMENSAT_TIME64,
 };
 
 /// And `ipc`, the eleven System V calls behind one number --- where the
@@ -403,6 +404,14 @@ impl Syscall<'_> {
                 return syscall_ret(self.sys_sched_rr_get_interval_time64(a0, a1.into()));
             }
             I386_TIMER_GETTIME64 => return syscall_ret(self.sys_timer_gettime64(a0, a1)),
+            // A `struct __kernel_timespec` deadline: the native call with a
+            // native `timespec`, which is what `wide` says.
+            I386_MQ_TIMEDSEND_TIME64 => {
+                return syscall_ret(self.sys_mq_timedsend(a0, a1, a2, a3, a4, true).await);
+            }
+            I386_MQ_TIMEDRECEIVE_TIME64 => {
+                return syscall_ret(self.sys_mq_timedreceive(a0, a1, a2, a3, a4, true).await);
+            }
             I386_TIMER_SETTIME64 => {
                 return syscall_ret(self.sys_timer_settime64(a0, a1, a2.into(), a3.into()));
             }

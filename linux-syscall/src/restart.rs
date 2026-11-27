@@ -84,6 +84,9 @@ pub fn restarts_after_handler(num: u32, args: &[usize; 6]) -> bool {
         | Sys::RECVMSG
         | Sys::SENDTO
         | Sys::SENDMSG
+        // `wq_sleep` answers `-ERESTARTSYS`, and the timeout is absolute.
+        | Sys::MQ_TIMEDSEND
+        | Sys::MQ_TIMEDRECEIVE
         | Sys::FLOCK => true,
         Sys::FCNTL => matches!(args[1], F_SETLKW | F_OFD_SETLKW),
         // `__futex_wait()` answers `-ERESTARTSYS`, and only `futex_wait()`
