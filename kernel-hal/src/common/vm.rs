@@ -81,6 +81,19 @@ pub trait GenericPageTable: Sync + Send {
     /// Unmap the page of `vaddr`.
     fn unmap(&mut self, vaddr: VirtAddr) -> PagingResult<(PhysAddr, PageSize)>;
 
+    /// [`map`](Self::map) each `(vaddr, paddr, flags)` of `pages` as a 4 KiB
+    /// page, in order, stopping at the first that fails. An implementation
+    /// may walk the tables once for all the entries of one leaf table and
+    /// flush once at the end: what `fork` needs to install a child's pages
+    /// (`VmMapping::map_committed`), where a walk from the root and a TLB
+    /// flush per page were a quarter of the time.
+    fn map_pages(&mut self, pages: &[(VirtAddr, PhysAddr, MMUFlags)]) -> PagingResult {
+        for &(vaddr, paddr, flags) in pages {
+            self.map(Page::new_aligned(vaddr, PageSize::Size4K), paddr, flags)?;
+        }
+        Ok(())
+    }
+
     /// Change the `flags` of the page of `vaddr`.
     fn update(
         &mut self,

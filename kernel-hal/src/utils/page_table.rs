@@ -295,6 +295,24 @@ impl<L: PageTableLevel, PTE: GenericPTE> PageTableImpl<L, PTE> {
         Ok(())
     }
 
+    /// The table of 4 KiB entries for `vaddr`, made (with the tables above
+    /// it) when there is none. `AlreadyMapped` when a huge leaf covers it.
+    fn p1_table_or_create<'a>(&mut self, vaddr: VirtAddr) -> PagingResult<&'a mut [PTE]> {
+        let p3 = if L::LEVEL == 3 {
+            table_of_mut::<PTE>(self.table_phys())
+        } else if L::LEVEL == 4 {
+            let p4 = table_of_mut::<PTE>(self.table_phys());
+            let p4e = &mut p4[p4_index(vaddr)];
+            next_table_mut_or_create(p4e, || self.alloc_intrm_table())?
+        } else {
+            unreachable!()
+        };
+        let p3e = &mut p3[p3_index(vaddr)];
+        let p2 = next_table_mut_or_create(p3e, || self.alloc_intrm_table())?;
+        let p2e = &mut p2[p2_index(vaddr)];
+        next_table_mut_or_create(p2e, || self.alloc_intrm_table())
+    }
+
     fn get_entry_mut_or_create(&mut self, page: Page) -> PagingResult<&mut PTE> {
         let vaddr = page.vaddr;
         let p3 = if L::LEVEL == 3 {
@@ -581,6 +599,49 @@ impl<L: PageTableLevel, PTE: GenericPTE> GenericPageTable for PageTableImpl<L, P
         Ok(())
     }
 
+    /// One walk per table of 4 KiB entries rather than one per page, and
+    /// the local TLB flushed once at the end (the whole of it past
+    /// [`MAP_PAGES_FLUSH_ONE_BY_ONE`] pages) rather than once per page: the
+    /// same entries, flags and counts as [`map`](Self::map) of each.
+    fn map_pages(&mut self, pages: &[(VirtAddr, PhysAddr, MMUFlags)]) -> PagingResult {
+        let mut table: Option<(VirtAddr, &mut [PTE])> = None;
+        let mut done = 0;
+        let mut result = Ok(());
+        for &(vaddr, paddr, flags) in pages {
+            let base = vaddr & !(PageSize::Size2M as usize - 1);
+            let p1 = match &mut table {
+                Some((at, p1)) if *at == base => p1,
+                _ => match self.p1_table_or_create(vaddr) {
+                    Ok(p1) => &mut table.insert((base, p1)).1,
+                    Err(e) => {
+                        result = Err(e);
+                        break;
+                    }
+                },
+            };
+            let entry = &mut p1[p1_index(vaddr)];
+            if !entry.is_unused() {
+                result = Err(PagingError::AlreadyMapped);
+                break;
+            }
+            entry.set_special(flags.contains(MMUFlags::SPECIAL));
+            entry.set_addr(PageSize::Size4K.align_down(paddr));
+            entry.set_flags(flags, false);
+            if !entry.is_special() {
+                self.resident.add(PageSize::Size4K as usize);
+            }
+            done += 1;
+        }
+        if done > MAP_PAGES_FLUSH_ONE_BY_ONE {
+            crate::vm::flush_tlb(None);
+        } else {
+            for &(vaddr, _, _) in &pages[..done] {
+                crate::vm::flush_tlb(Some(vaddr));
+            }
+        }
+        result
+    }
+
     fn unmap(&mut self, vaddr: VirtAddr) -> PagingResult<(PhysAddr, PageSize)> {
         let ret = self.unmap_no_shootdown(vaddr)?;
         // Removing a mapping leaves stale TLB entries on the other CPUs that
@@ -858,6 +919,10 @@ const fn p3_index(vaddr: usize) -> usize {
     (vaddr >> (12 + 18)) & (ENTRY_COUNT - 1)
 }
 
+/// Up to this many pages [`PageTableImpl::map_pages`] flushes one by one;
+/// past it, the whole local TLB once.
+const MAP_PAGES_FLUSH_ONE_BY_ONE: usize = 32;
+
 const fn p2_index(vaddr: usize) -> usize {
     (vaddr >> (12 + 9)) & (ENTRY_COUNT - 1)
 }
@@ -1111,6 +1176,75 @@ mod walker_tests {
     }
 
     // ── map / query / unmap ────────────────────────────────────────────────
+
+    /// `map_pages` leaves the tree exactly as `map` of each page would:
+    /// same frames, flags, sizes and resident count, across leaf tables
+    /// (and on both tree depths), with holes and a run that crosses into
+    /// the next 2 MiB and the next 1 GiB.
+    fn map_pages_is_map_of_each<L: PageTableLevel>() {
+        let base = 0x10_0000_0000 + G - 3 * M - 5 * K;
+        let mut pages = Vec::new();
+        for i in 0..2000usize {
+            if i % 7 == 3 || (600..900).contains(&i) {
+                continue; // holes: a fork maps only what is committed
+            }
+            let flags = if i % 5 == 0 { MMUFlags::READ } else { rw() };
+            pages.push((base + i * K, 0x4000_0000 + (i * 31 % 997) * K, flags));
+        }
+        let mut one = a_table::<L>();
+        for &(v, p, f) in &pages {
+            one.map(Page::new_aligned(v, PageSize::Size4K), p, f)
+                .unwrap();
+        }
+        let mut many = a_table::<L>();
+        many.map_pages(&pages).unwrap();
+        for i in 0..2000usize {
+            let v = base + i * K;
+            match (one.query(v), many.query(v)) {
+                (Ok(a), Ok(b)) => assert_eq!(a, b, "page {}", i),
+                (Err(_), Err(_)) => {}
+                (a, b) => panic!("page {}: {:?} vs {:?}", i, a.is_ok(), b.is_ok()),
+            }
+        }
+        assert_eq!(one.resident_bytes(), many.resident_bytes());
+        assert_eq!(many.resident_bytes(), pages.len() * K);
+    }
+
+    #[test]
+    fn mapping_many_pages_at_once_is_mapping_each_on_four_levels() {
+        map_pages_is_map_of_each::<PageTableLevel4>();
+    }
+
+    #[test]
+    fn mapping_many_pages_at_once_is_mapping_each_on_three_levels() {
+        map_pages_is_map_of_each::<PageTableLevel3>();
+    }
+
+    /// A page already mapped stops the run there, as `map` would answer
+    /// for it: the ones before stay mapped, the ones after are not touched.
+    #[test]
+    fn mapping_many_stops_at_a_page_already_mapped() {
+        let mut pt = a_table::<PageTableLevel4>();
+        let base = 0x2000_0000_0000;
+        pt.map(
+            Page::new_aligned(base + 2 * K, PageSize::Size4K),
+            0x7000,
+            rw(),
+        )
+        .unwrap();
+        let pages: Vec<_> = (0..4)
+            .map(|i| (base + i * K, 0x10_000 + i * K, rw()))
+            .collect();
+        assert!(matches!(
+            pt.map_pages(&pages),
+            Err(PagingError::AlreadyMapped)
+        ));
+        assert_eq!(pt.query(base).unwrap().0, 0x10_000);
+        assert_eq!(pt.query(base + K).unwrap().0, 0x11_000);
+        assert_eq!(pt.query(base + 2 * K).unwrap().0, 0x7000, "left as it was");
+        assert!(pt.query(base + 3 * K).is_err());
+        assert_eq!(pt.resident_bytes(), 3 * K);
+    }
 
     #[test]
     fn a_mapped_page_is_found_again_with_its_frame_its_flags_and_its_size() {
