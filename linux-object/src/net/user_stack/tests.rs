@@ -1995,3 +1995,37 @@ fn empty_datagrams_fill_a_queue_too() {
     assert_eq!(queued, RX_QUEUE_BYTES / DATAGRAM_COST);
     while stack.told().is_some() {}
 }
+
+#[test]
+fn a_ping_goes_past_any_backlog_and_its_answer_is_only_heard() {
+    let _l = LOCK.lock();
+    let link = StackLink::new();
+    let (kernel, end) = Channel::create();
+    let serving = link
+        .attach(kernel, MAX_FOR_TESTS, STACK_ADDR)
+        .expect("no stack before");
+    // A backlog the stack has not read: a ping goes all the same.
+    for _ in 0..SEND_BACKLOG {
+        let packet = MessagePacket {
+            data: header(OP_HEAR, 7, 0),
+            handles: Vec::new(),
+        };
+        serving.channel().write(packet).unwrap();
+    }
+    assert!(serving.ping());
+    let mut last = None;
+    while let Ok(m) = end.read() {
+        last = Some(m.data);
+    }
+    let ping = last.expect("the ping was sent");
+    assert_eq!(parse_header(&ping), Some((OP_PING, 0)));
+    assert_eq!(ping.len(), HEADER_LEN);
+    // The same back is heard, and changes nothing.
+    end.write(MessagePacket {
+        data: ping,
+        handles: Vec::new(),
+    })
+    .unwrap();
+    serving.pump();
+    assert!(end.read().is_err(), "the kernel answers no ping");
+}

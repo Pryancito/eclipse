@@ -150,21 +150,32 @@ struct Link {
 /// What ends a driver that hangs.
 type Kill = Box<dyn Fn() + Send + Sync>;
 
-/// What a link's watch knows of its driver's silence: how many answers it
+/// What a link's watch knows of its server's silence: how many answers it
 /// had seen, and since when (`now_ms`) a request has waited with no answer
-/// coming, to it or any other.
-#[derive(Clone, Copy, Default, PartialEq, Debug)]
+/// coming, to it or any other. A served disk's driver here; the network
+/// stack's process in `netstack_serve`.
+#[derive(Clone, Copy, PartialEq, Debug)]
 pub(super) struct Quiet {
     answers: u32,
     since: Option<u64>,
+    /// How long a silence while a request waits is a hang.
+    after_ms: u64,
 }
 
 impl Quiet {
+    pub(super) const fn new(after_ms: u64) -> Self {
+        Self {
+            answers: 0,
+            since: None,
+            after_ms,
+        }
+    }
+
     /// The look at `now`: `waiting` whether a request waits for an answer,
     /// `answers` how many have come back so far. The silence is counted from
     /// the first look that found a request waiting and nothing answered since
     /// the look before, so a second late at most. Whether the driver is
-    /// hung: silent for [`HUNG_AFTER_MS`] while a request waited.
+    /// hung: silent for `after_ms` while a request waited.
     pub(super) fn look(&mut self, now: u64, waiting: bool, answers: u32) -> bool {
         if !waiting || answers != self.answers {
             self.answers = answers;
@@ -172,7 +183,7 @@ impl Quiet {
             return false;
         }
         let since = *self.since.get_or_insert(now);
-        now > since + HUNG_AFTER_MS
+        now > since + self.after_ms
     }
 }
 
@@ -264,7 +275,7 @@ fn open_interrupt_window() {
     }
 }
 
-fn now_ms() -> u64 {
+pub(super) fn now_ms() -> u64 {
     kernel_hal::timer::timer_now().as_millis() as u64
 }
 
@@ -298,7 +309,7 @@ impl Link {
             dead: AtomicBool::new(false),
             next_id: AtomicU32::new(0),
             answers_seen: AtomicU32::new(0),
-            quiet: lock::Mutex::new(Quiet::default()),
+            quiet: lock::Mutex::new(Quiet::new(HUNG_AFTER_MS)),
             kill: lock::Mutex::new(None),
             look_skip: AtomicU32::new(0),
             look_backoff: AtomicU32::new(1),
@@ -1407,7 +1418,7 @@ mod tests {
 
     #[test]
     fn a_driver_is_hung_only_after_its_silence_while_a_request_waits() {
-        let mut q = Quiet::default();
+        let mut q = Quiet::new(HUNG_AFTER_MS);
         // Nothing waits: no silence is a hang, however long.
         assert!(!q.look(0, false, 0));
         assert!(!q.look(1_000_000, false, 0));

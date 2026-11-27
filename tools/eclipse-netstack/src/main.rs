@@ -104,7 +104,7 @@ use netstack::socks::more;
 use netstack::socks::neigh;
 use netstack::socks::six::Sixes;
 use netstack::socks::tcp::OP_WRITE;
-use netstack::socks::{parse_header, Arrived, Stack, MESSAGE_MAX, OP_FRAMES, OP_SEND};
+use netstack::socks::{parse_header, Arrived, Stack, MESSAGE_MAX, OP_FRAMES, OP_PING, OP_SEND};
 use smoltcp::iface::{InterfaceBuilder, NeighborCache, Routes};
 use smoltcp::time::Instant;
 use smoltcp::wire::{EthernetAddress, IpCidr, Ipv4Address, Ipv4Cidr};
@@ -1030,6 +1030,21 @@ fn serve_sockets(kernel: Arc<Kernel>) {
         let (mut sends, mut answers) = (0u32, 0u32);
         for done in 1.. {
             let said = &message[..len];
+            // The kernel's watch asking whether this thread still reads:
+            // the same back at once, from the thread it asks of.
+            if matches!(parse_header(said), Some((OP_PING, _))) {
+                let _ = kernel.channel.write(said, &[]);
+                if done == BURST {
+                    break;
+                }
+                match kernel.channel.try_read(&mut message) {
+                    Ok(Some(next)) => {
+                        len = next;
+                        continue;
+                    }
+                    _ => break,
+                }
+            }
             let wished = more::wished(said).map(|wish| wish.and_then(grant));
             let wished = wished.or_else(|| neigh::wished(said).map(|wish| wish.and_then(befriend)));
             let asked = match (

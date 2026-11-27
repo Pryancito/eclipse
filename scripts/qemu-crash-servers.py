@@ -122,7 +122,7 @@ class Guest:
                 self.run(f"cat >> {dst}.b64 <<'EOF'\n{chunk}\nEOF", 60)
             self.run(f"base64 -d {dst}.b64 > {dst}; chmod 755 {dst}; rm -f {dst}.b64", 120)
             self.send(f"echo PUSHSUM $(sha256sum < {dst})\n")
-            m = self.expect(r"^PUSHSUM ([0-9a-f]{64})", 60)
+            m = self.expect(r"PUSHSUM ([0-9a-f]{64})", 60)
             if m and m.group(1) == want:
                 return
             print(f"push of {src}: the guest's copy differs; trying again", file=sys.stderr)
