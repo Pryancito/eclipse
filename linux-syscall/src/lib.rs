@@ -2089,7 +2089,9 @@ mod unknown_syscall_tests {
 
     #[test]
     fn numbers_past_the_bitmap_share_its_last_bit() {
-        assert!(first_report_of_unknown(u32::MAX));
+        // Whether this is the first report of the last bit depends on which
+        // test of this binary got there first: only what follows is known.
+        let _ = first_report_of_unknown(u32::MAX);
         assert!(!first_report_of_unknown(5000));
         assert!(!first_report_of_unknown(UNKNOWN_REPORT_BITS as u32 - 1));
     }
