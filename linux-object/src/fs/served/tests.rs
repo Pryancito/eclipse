@@ -575,6 +575,74 @@ fn a_server_that_comes_after_the_wait_still_finds_the_mount() {
     assert_eq!(root.find("docs").unwrap().get_entry(2).unwrap(), "file-000");
 }
 
+/// A fake mount helper on a thread that answers one `OP_ADOPT` by having
+/// the next server of `mount` take it over, and gives back the mount and
+/// what it was asked: the names and the options.
+fn adopting_helper(mut mount: Mount) -> thread::JoinHandle<(Mount, String, String)> {
+    let (ours, theirs) = Fifo::create(SLOTS, MSG);
+    let window = VmObject::new_paged((SLOTS * SLOT_LEN).div_ceil(4096));
+    let link = Arc::new(Link::new(ours, window.clone()).unwrap());
+    let installed = helper::install(link);
+    thread::spawn(move || {
+        let mut m = [0u8; MSG];
+        while theirs.read(MSG, &mut m, 1).is_err() {
+            thread::yield_now();
+        }
+        assert_eq!(
+            u32::from_ne_bytes([m[0], m[1], m[2], m[3]]),
+            helper::OP_ADOPT
+        );
+        let request = wire::decode(&m);
+        let names = u32::from_ne_bytes([m[20], m[21], m[22], m[23]]) as usize;
+        let slot = (request.reqid as usize & (SLOTS - 1)) * SLOT_LEN;
+        let mut path = vec![0u8; names];
+        window.read(slot, &mut path).unwrap();
+        let mut data = vec![0u8; request.b as usize];
+        window.read(slot + NAME_AREA, &mut data).unwrap();
+        // The server it starts takes the mount over before the answer.
+        assert!(mount.next_server());
+        m[24..32].copy_from_slice(&0i64.to_ne_bytes());
+        theirs.write(MSG, &m, 1).unwrap();
+        installed.left();
+        (
+            mount,
+            String::from_utf8(path).unwrap(),
+            String::from_utf8(data).unwrap(),
+        )
+    })
+}
+
+#[test]
+fn a_mount_whose_watcher_died_too_gets_its_next_server_from_the_helper() {
+    let _one = helper::TEST_LOCK.lock();
+    let at = "/served-test/adopted";
+    let mut mount = Mount::new();
+    mount.fs.adopt_after_ms.store(20, Ordering::Relaxed);
+    mount.fs.grace_ms.store(5_000, Ordering::Relaxed);
+    *mount.fs.shown.lock() = (String::from("/dev/vdb1"), String::from("vfat"), 0);
+    MOUNTS.lock().push((String::from(at), mount.fs.clone()));
+    made_with_options(at, "utf8");
+    let fs = mount.fs.clone();
+    let readme = mount.root().find("Readme.TXT").unwrap();
+    // The server dies, and no watcher starts another: the helper is asked
+    // for one, and the request waits for it.
+    mount.kill_server();
+    let helper = adopting_helper(mount);
+    let mut buf = [0u8; 100];
+    assert_eq!(readme.read_at(5000, &mut buf), Ok(100));
+    assert_eq!(buf[..], content(5000, 100)[..]);
+    let (mut mount, names, options) = helper.join().unwrap();
+    assert_eq!(names, "/dev/vdb1\0/served-test/adopted\0vfat");
+    assert_eq!(options, "utf8");
+
+    // Its server dies again at once: the helper is not asked again so soon,
+    // and once the wait is over the request fails.
+    fs.grace_ms.store(100, Ordering::Relaxed);
+    mount.kill_server();
+    assert!(readme.read_at(0, &mut buf).is_err());
+    MOUNTS.lock().retain(|(place, _)| place != at);
+}
+
 #[test]
 fn a_write_the_server_died_under_is_written_by_the_next() {
     for done_first in [false, true] {

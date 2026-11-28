@@ -347,22 +347,33 @@ pub fn main<F: Tree>(command: &'static str) -> ! {
             .position(|a| a == flag);
         at.map(|at| args.remove(at)).is_some()
     };
-    let (foreground, read_only) = (flag("-f"), flag("-r"));
+    let (foreground, read_only, take_over) = (flag("-f"), flag("-r"), flag("-t"));
     let [device, dir] = args.as_slice() else {
         eprintln!(
-            "usage: {} [-f] [-r] DEVICE DIR\n\
+            "usage: {} [-f] [-r] [-t] DEVICE DIR\n\
              Mount the {} volume on DEVICE at DIR, served by this process.\n\
              -f: stay in the foreground, with nothing to start the server again.\n\
-             -r: read-only.",
+             -r: read-only.\n\
+             -t: take over the mount at DIR, which has no server (the mount helper\n\
+                 asks for it when the process that started its servers is gone).",
             name(),
             F::NAME
         );
         exit(2)
     };
-    let dir = std::fs::canonicalize(dir).unwrap_or_else(|e| die(format_args!("{dir}: {e}")));
+    // The mount a server takes over is where the kernel said, and looking
+    // the place up would ask that mount, which has no server to answer.
+    let dir = if take_over {
+        if !dir.starts_with('/') {
+            die(format_args!("{dir}: not an absolute path"));
+        }
+        std::path::PathBuf::from(dir)
+    } else {
+        std::fs::canonicalize(dir).unwrap_or_else(|e| die(format_args!("{dir}: {e}")))
+    };
     let dir = dir.to_str().unwrap_or_else(|| die("DIR is not text"));
     if foreground {
-        serve::<F>(device, dir, read_only, false, None);
+        serve::<F>(device, dir, read_only, take_over, None);
     }
 
     // The servers are children of a child, and this waits for its word
@@ -378,7 +389,7 @@ pub fn main<F: Tree>(command: &'static str) -> ! {
             // what ends the mount.
             // SAFETY: no pointers.
             unsafe { libc::setsid() };
-            watch::<F>(device, dir, read_only, tell)
+            watch::<F>(device, dir, read_only, take_over, tell)
         }
         _ => {
             drop(tell);
@@ -409,12 +420,13 @@ const QUICK_DEATHS: u32 = 5;
 const LIVED: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// Start the server of the mount, and another each time one dies, until
-/// the mount is gone. `mounted` is told when the first has made the mount.
+/// the mount is gone. `mounted` is told when the first has made the mount,
+/// or with `take_over` has taken over the one that is there.
 ///
 /// The pauses between the servers of a mount that keeps losing them add up
 /// to less than the kernel waits for the next (ten seconds), so whoever
 /// uses the mount meanwhile waits and does not fail.
-fn watch<F: Tree>(device: &str, dir: &str, read_only: bool, mounted: File) -> ! {
+fn watch<F: Tree>(device: &str, dir: &str, read_only: bool, take_over: bool, mounted: File) -> ! {
     let mut mounted = Some(mounted);
     let mut quick = 0;
     loop {
@@ -427,7 +439,7 @@ fn watch<F: Tree>(device: &str, dir: &str, read_only: bool, mounted: File) -> ! 
             0 => {
                 drop(told);
                 drop(mounted);
-                serve::<F>(device, dir, read_only, !first, Some(tell))
+                serve::<F>(device, dir, read_only, !first || take_over, Some(tell))
             }
             server => server,
         };
