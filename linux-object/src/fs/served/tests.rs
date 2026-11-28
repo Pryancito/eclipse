@@ -1102,7 +1102,7 @@ fn an_open_file_reads_what_was_written_from_its_pages() {
 }
 
 #[test]
-fn a_removed_files_pages_are_forgotten() {
+fn a_removed_file_that_is_open_keeps_its_pages_and_bytes() {
     use crate::fs::{File, FileLike, OpenFlags};
     use async_std::task::block_on;
     let _registry = crate::fs::file::REGISTRY_TEST_LOCK.lock();
@@ -1118,10 +1118,14 @@ fn a_removed_files_pages_are_forgotten() {
     assert_eq!(block_on(FileLike::read_at(&*file, 0, &mut buf)), Ok(100));
     let (kept, _) = crate::fs::file::shared_file_vmo_stats();
     root.unlink("Readme.TXT").unwrap();
-    assert_eq!(crate::fs::file::shared_file_vmo_stats().0, kept - 1);
-    // The open file has nothing to read, and keeps no pages for it.
-    assert!(block_on(FileLike::read_at(&*file, 0, &mut buf)).is_err());
-    assert_eq!(crate::fs::file::shared_file_vmo_stats().0, kept - 1);
+    assert_eq!(crate::fs::file::shared_file_vmo_stats().0, kept);
+    // The open file reads and writes what it had, past what was kept too.
+    assert_eq!(block_on(FileLike::read_at(&*file, 0, &mut buf)), Ok(100));
+    assert_eq!(buf[..], content(0, 100)[..]);
+    assert_eq!(FileLike::write_at(&*file, 9000, b"end"), Ok(3));
+    let mut tail = [0u8; 3];
+    assert_eq!(block_on(FileLike::read_at(&*file, 9000, &mut tail)), Ok(3));
+    assert_eq!(&tail, b"end");
 }
 
 /// A POSIX record: [`wire::RECORD_HEAD_POSIX`] bytes, then the name.
@@ -1308,4 +1312,198 @@ fn a_mount_that_is_not_posix_is_files_and_directories_of_roots() {
     // Nothing is asked of the top.
     m.root().metadata().unwrap();
     assert_eq!(m.asked(OP_STAT), 0);
+}
+
+/// The open file whose lock [`serve_watching`] looks at while it answers,
+/// and how many of its answers found it held.
+static WATCHED: std::sync::Mutex<Option<Arc<crate::fs::File>>> = std::sync::Mutex::new(None);
+static ANSWERED_UNDER_THE_LOCK: AtomicUsize = AtomicUsize::new(0);
+
+/// [`serve`], noting each answer given while the watched file's lock is
+/// held: a request asked with it held.
+fn serve_watching(
+    tree: &mut Tree,
+    op: u32,
+    names: &str,
+    a: u64,
+    b: usize,
+    data: &[u8],
+) -> (i64, u64, Vec<u8>) {
+    if let Some(file) = WATCHED.lock().unwrap().as_ref() {
+        if !file.lock_is_free() {
+            ANSWERED_UNDER_THE_LOCK.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+    serve(tree, op, names, a, b, data)
+}
+
+impl Mount {
+    /// A mount of the usual tree whose server answers with `answers`.
+    fn answering(answers: Answers) -> Self {
+        let tree = Arc::new(std::sync::Mutex::new(tree()));
+        let asked = Arc::new([const { AtomicUsize::new(0) }; 16]);
+        let (link, server) = server_with(&tree, &asked, None, answers);
+        let fs = ServedFs::new(link, true, false);
+        fs.mounted.store(true, Ordering::Release);
+        Mount {
+            fs,
+            tree,
+            asked,
+            servers: vec![server],
+        }
+    }
+}
+
+/// The server is asked with the open file's lock let go. In the kernel the
+/// wait for its answer gives the CPU to other tasks, and one of them that
+/// wrote to the same open file spun on that lock under the wait that held
+/// it: `make -j4`, whose jobs all write to one `t.out`, stopped the machine.
+#[test]
+fn the_server_is_asked_with_the_open_files_lock_let_go() {
+    use crate::fs::{File, FileLike, OpenFlags};
+    let _registry = crate::fs::file::REGISTRY_TEST_LOCK.lock();
+    let mount = Mount::answering(serve_watching);
+    let root = mount.root();
+    let watch = |file: &Arc<File>| *WATCHED.lock().unwrap() = Some(file.clone());
+
+    let out = File::new(
+        root.find("big.bin").unwrap(),
+        OpenFlags::RDWR,
+        String::from("/mnt/big.bin"),
+    );
+    watch(&out);
+    assert_eq!(FileLike::write(&*out, b"one"), Ok(3));
+    assert_eq!(FileLike::write_at(&*out, 10, b"two"), Ok(3));
+    out.set_len(50).unwrap();
+    assert_eq!(
+        &mount.on_server("big.bin").unwrap()[..13],
+        b"one\x03\x04\x05\x06\x07\x08\x09two"
+    );
+    assert_eq!(mount.on_server("big.bin").unwrap().len(), 50);
+    // The offset is the file's still: the next write goes on from the last.
+    assert_eq!(FileLike::write(&*out, b"three"), Ok(5));
+    assert_eq!(&mount.on_server("big.bin").unwrap()[3..8], b"three");
+    out.sync_data().unwrap();
+    out.sync_all().unwrap();
+
+    let docs = File::new(
+        root.find("docs").unwrap(),
+        OpenFlags::RDONLY,
+        String::from("/mnt/docs"),
+    );
+    watch(&docs);
+    let mut names = Vec::new();
+    while let Ok((_, name)) = docs.read_entry_with_metadata() {
+        names.push(name);
+    }
+    assert_eq!(names.len(), 302);
+    mount.fs.dirs.lock().listed.clear();
+    assert!(docs.lookup_follow("file-007", 1).is_ok());
+    *WATCHED.lock().unwrap() = None;
+
+    assert!(mount.asked(OP_WRITE) >= 3 && mount.asked(OP_LIST) >= 2);
+    assert!(mount.asked(OP_SYNC) >= 2);
+    assert_eq!(ANSWERED_UNDER_THE_LOCK.load(Ordering::SeqCst), 0);
+}
+
+/// Two writers of one open file, each `write(2)` with its turn as the
+/// syscall takes it: every byte lands, none over another's.
+#[test]
+fn two_writers_of_one_served_file_take_turns_and_lose_nothing() {
+    use crate::fs::{File, FileLike, OpenFlags};
+    use async_std::task::block_on;
+    let _registry = crate::fs::file::REGISTRY_TEST_LOCK.lock();
+    let mount = Mount::new();
+    let file = File::new(
+        mount.root().find("full.bin").unwrap(),
+        OpenFlags::WRONLY,
+        String::from("/mnt/full.bin"),
+    );
+    let writers: Vec<_> = [b'a', b'b']
+        .iter()
+        .map(|&byte| {
+            let file = file.clone();
+            thread::spawn(move || {
+                for _ in 0..200 {
+                    block_on(async {
+                        let _turn = file.served_write_turn().await;
+                        assert!(_turn.is_some());
+                        assert_eq!(FileLike::write(&*file, &[byte; 7]), Ok(7));
+                    });
+                }
+            })
+        })
+        .collect();
+    for writer in writers {
+        writer.join().unwrap();
+    }
+    let bytes = mount.on_server("full.bin").unwrap();
+    assert_eq!(bytes.len(), 2 * 200 * 7);
+    assert_eq!(bytes.iter().filter(|b| **b == b'a').count(), 200 * 7);
+    for record in bytes.chunks(7) {
+        assert!(record.iter().all(|b| *b == record[0]));
+    }
+}
+
+/// The temporary file of SQLite, `tmpfile(3)` and the like: made, removed
+/// at once, and used open. Its bytes are under a name no listing shows, and
+/// the server removes it once the last who has it let go.
+#[test]
+fn a_file_removed_while_open_is_hidden_and_removed_after_its_last_close() {
+    use crate::fs::{File, FileLike, OpenFlags};
+    use async_std::task::block_on;
+    let _registry = crate::fs::file::REGISTRY_TEST_LOCK.lock();
+    let mount = Mount::new();
+    let root = mount.root();
+    let tmp = File::new(
+        root.create("etilqs_1", FileType::File, 0o600).unwrap(),
+        OpenFlags::RDWR,
+        String::from("/mnt/etilqs_1"),
+    );
+    let removes = mount.asked(OP_REMOVE);
+    root.unlink("etilqs_1").unwrap();
+    assert_eq!(mount.asked(OP_REMOVE), removes);
+    let hidden: Vec<String> = mount
+        .tree
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|(p, _, _)| p.clone())
+        .filter(|p| p.starts_with(HIDDEN))
+        .collect();
+    assert_eq!(hidden.len(), 1);
+    assert_eq!(tmp.inode().metadata().unwrap().nlinks, 0);
+    assert_eq!(FileLike::write_at(&*tmp, 0, &[7; 5000]), Ok(5000));
+    let mut back = [0u8; 5000];
+    assert_eq!(block_on(FileLike::read_at(&*tmp, 0, &mut back)), Ok(5000));
+    assert!(back.iter().all(|b| *b == 7));
+    assert_eq!(mount.on_server(&hidden[0]).unwrap().len(), 5000);
+    // No listing has it, this mount's or the next one's.
+    mount.fs.dirs.lock().listed.clear();
+    assert!(Mount::names_from(&root, 2)
+        .iter()
+        .all(|n| !n.starts_with(HIDDEN)));
+    // The last close; the next change to a directory removes it.
+    drop(tmp);
+    assert!(mount.on_server(&hidden[0]).is_some());
+    root.create("other", FileType::File, 0o600).unwrap();
+    assert_eq!(mount.on_server(&hidden[0]), None);
+    assert_eq!(mount.asked(OP_REMOVE), removes + 1);
+}
+
+/// A hidden file an earlier mount left (it went down with the file still
+/// open) is removed by this one when it lists the directory.
+#[test]
+fn a_hidden_file_an_earlier_mount_left_is_removed() {
+    let mount = Mount::new();
+    let stale = alloc::format!("{HIDDEN}12345-7");
+    mount
+        .tree
+        .lock()
+        .unwrap()
+        .push((stale.clone(), false, content(0, 10)));
+    let root = mount.root();
+    assert!(Mount::names_from(&root, 2).iter().all(|n| *n != stale));
+    root.create("other", FileType::File, 0o600).unwrap();
+    assert_eq!(mount.on_server(&stale), None);
 }

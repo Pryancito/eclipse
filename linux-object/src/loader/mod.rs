@@ -159,6 +159,32 @@ fn detect_abi(data: &[u8], _elf: &ElfFile) -> Abi {
     Abi::Linux
 }
 
+/// The protection of a new process's main stack, from its `PT_GNU_STACK`.
+///
+/// A program whose `PT_GNU_STACK` asks for `PF_X` gets an executable stack,
+/// as Linux gives it (`EXSTACK_ENABLE_X` in `fs/binfmt_elf.c`). GCC marks a
+/// binary that way when it builds a trampoline on the stack -- a nested
+/// function whose address is taken, as in `pthread_create(.., nested, ..)`
+/// or `signal(SIGUSR1, nested)` -- and the trampoline is code on the stack.
+/// With a read/write stack such a program died with SIGSEGV on its first
+/// call through the pointer (an EXECUTE fault at an address in the stack).
+/// A missing header, or one without `PF_X`, keeps the stack non-executable,
+/// which on x86_64 is also what Linux does for a 64-bit image.
+fn stack_mmu_flags(elf: &ElfFile) -> MMUFlags {
+    /// `PT_GNU_STACK`, from `elf.h`; xmas-elf files it under `OsSpecific`.
+    const PT_GNU_STACK: u32 = 0x6474_e551;
+    let exec = elf.program_iter().any(|ph| {
+        ph.get_type() == Ok(xmas_elf::program::Type::OsSpecific(PT_GNU_STACK))
+            && ph.flags().is_execute()
+    });
+    let rw = MMUFlags::READ | MMUFlags::WRITE | MMUFlags::USER;
+    if exec {
+        rw | MMUFlags::EXECUTE
+    } else {
+        rw
+    }
+}
+
 /// Split a shebang line into the interpreter and its single optional argument.
 ///
 /// POSIX splits on ASCII space/tab only, and passes everything after the first
@@ -801,7 +827,7 @@ impl LinuxElfLoader {
             zircon_object::vm::KERNEL_ASPACE.unmap(interp_virt, interp_size_aligned)?;
 
             let stack_vmo = VmObject::new_paged(self.stack_pages);
-            let stack_flags = MMUFlags::READ | MMUFlags::WRITE | MMUFlags::USER;
+            let stack_flags = stack_mmu_flags(&elf);
             let (stack_bottom, stack_top) = stack_placement(vmar.end_addr(), self.stack_pages, abi);
             // map_range=false: don't commit the stack eagerly on every exec —
             // the argv/env/auxv tail is committed by the `stack_vmo.write`
@@ -980,7 +1006,7 @@ impl LinuxElfLoader {
         }
 
         let stack_vmo = VmObject::new_paged(self.stack_pages);
-        let flags = MMUFlags::READ | MMUFlags::WRITE | MMUFlags::USER;
+        let flags = stack_mmu_flags(&elf);
         let (stack_bottom, stack_top) = stack_placement(vmar.end_addr(), self.stack_pages, abi);
         // map_range=false: lazy stack, same rationale as the interpreter path
         // above — the init_stack tail is committed by `stack_vmo.write` below,
@@ -1613,6 +1639,41 @@ mod elf_bounds_tests {
         let parsed = parse_checked_elf(&image).unwrap();
         let vmar = VmAddressRegion::new_root();
         assert!(vmar.load_from_elf(&parsed).is_ok());
+    }
+
+    /// `PT_GNU_STACK` with `PF_X` is the one thing that makes the main stack
+    /// executable: GCC asks for it when a nested function's trampoline lives
+    /// on the stack, and the call through that trampoline faulted.
+    #[test]
+    fn the_stack_is_executable_only_when_pt_gnu_stack_asks_for_it() {
+        const PT_GNU_STACK: u32 = 0x6474_e551;
+        let with = |flags: Option<u32>| {
+            let mut elf = Elf::new().phdr(Phdr {
+                p_type: 1,
+                flags: 5,
+                offset: payload_at(if flags.is_some() { 2 } else { 1 }),
+                file_size: 4,
+                mem_size: 0x1000,
+                ..Default::default()
+            });
+            if let Some(flags) = flags {
+                elf = elf.phdr(Phdr {
+                    p_type: PT_GNU_STACK,
+                    flags,
+                    ..Default::default()
+                });
+            }
+            elf.payload = vec![0x90u8; 4];
+            let image = elf.build();
+            let parsed = parse_checked_elf(&image).unwrap();
+            stack_mmu_flags(&parsed)
+        };
+        assert!(with(Some(7)).contains(MMUFlags::EXECUTE));
+        assert!(!with(Some(6)).contains(MMUFlags::EXECUTE));
+        assert!(!with(None).contains(MMUFlags::EXECUTE));
+        for flags in [with(Some(7)), with(Some(6)), with(None)] {
+            assert!(flags.contains(MMUFlags::READ | MMUFlags::WRITE | MMUFlags::USER));
+        }
     }
 
     /// A one-page image of type `e_type`, its segment at vaddr 0 as a

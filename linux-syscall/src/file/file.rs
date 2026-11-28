@@ -418,6 +418,9 @@ impl Syscall<'_> {
         let disk = file_like
             .downcast_ref::<linux_object::fs::File>()
             .filter(|file| file.is_block_dev());
+        // A file served from userspace is written a turn at a time, see
+        // `File::served_write_turn`.
+        let _turn = served_write_turn(&file_like).await;
         // The bytes are copied into kernel memory before the file sees them;
         // see `Staging` for the deadlock that a raw user slice caused here.
         let mut staging = Staging::new(chunk_size)?;
@@ -758,6 +761,7 @@ impl Syscall<'_> {
         let disk = file_like
             .downcast_ref::<linux_object::fs::File>()
             .filter(|file| file.is_block_dev());
+        let _turn = served_write_turn(&file_like).await;
         let mut buf = crate::try_zeroed_buf(total.min(super::SYSCALL_IO_MAX))?;
         let mut written = 0usize;
         while written < total {
@@ -3976,3 +3980,15 @@ mod memfd_seal_rule_tests;
 /// `/dev/full`: zeros to read, `ENOSPC` to every write.
 #[cfg(test)]
 mod dev_full_tests;
+
+/// The turn a `write(2)`/`writev(2)` to `file_like` waits for, asleep, and
+/// holds while it writes: one for a file served from userspace (see
+/// `File::served_write_turn`), none for anything else.
+async fn served_write_turn(
+    file_like: &Arc<dyn FileLike>,
+) -> Option<linux_object::sync::TurnGuard<'_>> {
+    match file_like.downcast_ref::<linux_object::fs::File>() {
+        Some(file) => file.served_write_turn().await,
+        None => None,
+    }
+}

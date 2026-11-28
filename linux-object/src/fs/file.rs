@@ -290,6 +290,11 @@ pub struct File {
     path: String,
     /// file inner mut data
     inner: RwLock<FileInner>,
+    /// The turn of a `write(2)` to a file served from userspace, which is
+    /// made with `inner` let go (see [`File::write`]): what keeps two
+    /// writers of this open file from taking the same offset, as Linux's
+    /// `f_pos_lock` does.
+    served_write: TurnGate,
 }
 
 impl_kobject!(File);
@@ -302,6 +307,7 @@ impl Drop for File {
     fn drop(&mut self) {
         crate::fs::flock::release_owner(self as *const File as usize);
         crate::fs::record_lock::release_description(self as *const File as usize);
+        super::served::closed(&*self.inner.get_mut().inode);
     }
 }
 
@@ -1145,39 +1151,53 @@ impl FileInner {
     }
 
     fn write_at_limited(&mut self, offset: u64, buf: &[u8], limited: bool) -> LxResult<usize> {
-        if !self.flags.writable() {
-            return Err(LxError::EBADF);
-        }
-        let buf = if limited {
-            &buf[..fsize::fsize_room(&self.inode, offset, buf.len())?]
-        } else {
-            buf
-        };
-        // A memfd sealed against writes refuses them here, at the one
-        // chokepoint every write(2)/pwrite(2)/writev(2) passes through
-        // (fcntl(2), F_SEAL_WRITE / F_SEAL_FUTURE_WRITE).
-        if !crate::fs::memfd_write_allowed(&self.inode) {
-            return Err(LxError::EPERM);
-        }
-        // And one sealed against growing refuses a write past its end
-        // (`shmem_write_begin`), which used to grow it.
-        if !buf.is_empty() && !crate::fs::memfd_grow_allowed(&self.inode, offset + buf.len() as u64)
-        {
-            return Err(LxError::EPERM);
-        }
-        // `/dev/dsp`: the OSS write needs the fd's O_NONBLOCK, which the
-        // `INode::write_at` contract cannot carry (the same reason the ALSA
-        // PCM ioctl is routed with its flags in `File::ioctl`).
-        use super::devfs::DspDev;
-        let n = if let Some(dsp) = self.inode.downcast_ref::<DspDev>() {
-            dsp.write_pcm(buf, self.flags.non_block())
-        } else {
-            self.inode.write_at(offset as usize, buf)
-        }
-        .map_err(|e| fs_grow_error(&self.inode, e))?;
-        cache_overlay_write(&self.inode, offset as usize, &buf[..n]);
-        Ok(n)
+        write_to_inode(&self.inode, self.flags, offset, buf, limited)
     }
+}
+
+/// The write of `buf` at `offset` into `inode`, opened with `flags`: what
+/// every write(2)/pwrite(2)/writev(2) of a [`File`] comes down to, with
+/// `RLIMIT_FSIZE` (`limited`), the memfd seals and `/dev/dsp` seen to. It
+/// takes no lock of the open file, so a write that waits (a file served from
+/// userspace, see [`File::write`]) can be made with that lock let go.
+fn write_to_inode(
+    inode: &Arc<dyn INode>,
+    flags: OpenFlags,
+    offset: u64,
+    buf: &[u8],
+    limited: bool,
+) -> LxResult<usize> {
+    if !flags.writable() {
+        return Err(LxError::EBADF);
+    }
+    let buf = if limited {
+        &buf[..fsize::fsize_room(inode, offset, buf.len())?]
+    } else {
+        buf
+    };
+    // A memfd sealed against writes refuses them here, at the one
+    // chokepoint every write(2)/pwrite(2)/writev(2) passes through
+    // (fcntl(2), F_SEAL_WRITE / F_SEAL_FUTURE_WRITE).
+    if !crate::fs::memfd_write_allowed(inode) {
+        return Err(LxError::EPERM);
+    }
+    // And one sealed against growing refuses a write past its end
+    // (`shmem_write_begin`), which used to grow it.
+    if !buf.is_empty() && !crate::fs::memfd_grow_allowed(inode, offset + buf.len() as u64) {
+        return Err(LxError::EPERM);
+    }
+    // `/dev/dsp`: the OSS write needs the fd's O_NONBLOCK, which the
+    // `INode::write_at` contract cannot carry (the same reason the ALSA
+    // PCM ioctl is routed with its flags in `File::ioctl`).
+    use super::devfs::DspDev;
+    let n = if let Some(dsp) = inode.downcast_ref::<DspDev>() {
+        dsp.write_pcm(buf, flags.non_block())
+    } else {
+        inode.write_at(offset as usize, buf)
+    }
+    .map_err(|e| fs_grow_error(inode, e))?;
+    cache_overlay_write(inode, offset as usize, &buf[..n]);
+    Ok(n)
 }
 
 /// Errno for a failed write/resize. A regular file that cannot grow is
@@ -1286,6 +1306,7 @@ impl File {
 
     /// create a file struct
     pub fn new(inode: Arc<dyn INode>, flags: OpenFlags, path: String) -> Arc<Self> {
+        super::served::opened(&*inode);
         Arc::new(File {
             base: KObjectBase::new(),
             path,
@@ -1296,6 +1317,7 @@ impl File {
                 seq: None,
                 not_seq: false,
             }),
+            served_write: TurnGate::new(),
         })
     }
 
@@ -1354,27 +1376,55 @@ impl File {
 
     /// resize the file
     pub fn set_len(&self, len: u64) -> LxResult {
-        let inner = self.inner.write();
-        if !inner.flags.writable() {
+        // Resized with no lock held: a file served from userspace waits for
+        // its server, see `write`.
+        let (flags, inode) = {
+            let inner = self.inner.read();
+            (inner.flags, inner.inode.clone())
+        };
+        if !flags.writable() {
             return Err(LxError::EBADF);
         }
-        inner
-            .inode
+        inode
             .resize(len as usize)
-            .map_err(|e| fs_grow_error(&inner.inode, e))?;
-        cache_truncate(&inner.inode, len as usize);
+            .map_err(|e| fs_grow_error(&inode, e))?;
+        cache_truncate(&inode, len as usize);
         Ok(())
+    }
+
+    /// Whether nobody holds this open file's lock: what a fake server in
+    /// the tests asks while it answers.
+    #[cfg(test)]
+    pub(crate) fn lock_is_free(&self) -> bool {
+        self.inner.try_write().is_some()
+    }
+
+    /// The turn [`write`](FileLike::write) of a file served from userspace
+    /// needs, taken asleep for the whole `write(2)`: its offset is read and
+    /// set again with the lock let go, and a second writer of this open file
+    /// between the two would write at the same place. `None` for every
+    /// other file, whose write holds the lock throughout.
+    pub async fn served_write_turn(&self) -> Option<TurnGuard<'_>> {
+        let served = super::served::is_file(&*self.inner.read().inode);
+        match served {
+            true => Some(self.served_write.turn().await),
+            false => None,
+        }
     }
 
     /// Sync all data and metadata
     pub fn sync_all(&self) -> LxResult {
-        self.inner.read().inode.sync_all()?;
+        // With the lock let go: a served filesystem waits for its server,
+        // see `write`.
+        let inode = self.inner.read().inode.clone();
+        inode.sync_all()?;
         Ok(())
     }
 
     /// Sync data (not include metadata)
     pub fn sync_data(&self) -> LxResult {
-        self.inner.read().inode.sync_data()?;
+        let inode = self.inner.read().inode.clone();
+        inode.sync_data()?;
         Ok(())
     }
 
@@ -1397,7 +1447,9 @@ impl File {
 
     /// lookup the file following the link
     pub fn lookup_follow(&self, path: &str, max_follow: usize) -> LxResult<Arc<dyn INode>> {
-        Ok(self.inner.read().inode.lookup_follow(path, max_follow)?)
+        // With the lock let go: a served directory may ask its server.
+        let inode = self.inner.read().inode.clone();
+        Ok(inode.lookup_follow(path, max_follow)?)
     }
 
     /// get the name of dir entry
@@ -1481,18 +1533,23 @@ impl File {
 
     /// get the next directory entry and its metadata
     pub fn read_entry_with_metadata(&self) -> LxResult<(Metadata, String)> {
-        let mut inner = self.inner.write();
-        if !inner.flags.readable() {
+        // A served directory is read by places, which stay where they are
+        // while its entries are removed; and with no lock held, because its
+        // listing may be the server's to give (see `write`).
+        let (flags, inode, offset) = {
+            let inner = self.inner.read();
+            (inner.flags, inner.inode.clone(), inner.offset as usize)
+        };
+        if !flags.readable() {
             return Err(LxError::EBADF);
         }
-        let offset = inner.offset as usize;
-        // A served directory is read by places, which stay where they are
-        // while its entries are removed.
-        if let Some(entry) = super::served::entry_at(&*inner.inode, offset) {
+        if let Some(entry) = super::served::entry_at(&*inode, offset) {
             let (meta, name, next) = entry?;
-            inner.offset = next as u64;
+            self.inner.write().offset = next as u64;
             return Ok((meta, name));
         }
+        let mut inner = self.inner.write();
+        let offset = inner.offset as usize;
         match inner.inode.get_entry_with_metadata(offset) {
             Ok(entry) => {
                 inner.offset += 1;
@@ -1787,6 +1844,35 @@ impl FileLike for File {
             inner.offset += n as u64;
             return Ok(n);
         }
+        // A file served from userspace is written with the lock let go. The
+        // server answers while this CPU gives itself to other tasks turn by
+        // turn (`SyncWait`), and one of them writing to this same open file
+        // (the `make -j4` whose jobs all have one `t.out` as stdout) spun on
+        // the lock under the very wait that held it: the CPU never got back
+        // to the holder. Two writers' offsets are kept apart by
+        // `served_write_turn` instead, which `write(2)` takes asleep.
+        if super::served::is_file(&*inner.inode) {
+            let (flags, inode) = (inner.flags, inner.inode.clone());
+            let offset = if flags.is_append() {
+                inode
+                    .metadata()
+                    .map(|m| m.size as u64)
+                    .unwrap_or(inner.offset)
+            } else {
+                inner.offset
+            };
+            drop(inner);
+            let r = write_to_inode(&inode, flags, offset, buf, true);
+            match r {
+                Ok(n) => self.inner.write().offset = offset + n as u64,
+                Err(LxError::ENOSPC) => {
+                    let size = inode.metadata().ok().map(|m| m.size as u64);
+                    report_enospc(&self.path, offset, buf.len(), size);
+                }
+                Err(_) => {}
+            }
+            return r;
+        }
         // The offset `FileInner::write` will actually try (O_APPEND writes at
         // the current end, not at `inner.offset`).
         let offset = if inner.flags.is_append() {
@@ -1885,7 +1971,19 @@ impl FileLike for File {
             return Err(LxError::ESPIPE);
         }
         let mut inner = self.inner.write();
-        let r = inner.write_at(offset, buf);
+        // Served from userspace: with the lock let go, as in `write`.
+        let r = if super::served::is_file(&*inner.inode) {
+            let (flags, inode) = (inner.flags, inner.inode.clone());
+            drop(inner);
+            let r = write_to_inode(&inode, flags, offset, buf, true);
+            if matches!(r, Err(LxError::ENOSPC)) {
+                let size = inode.metadata().ok().map(|m| m.size as u64);
+                report_enospc(&self.path, offset, buf.len(), size);
+            }
+            return r;
+        } else {
+            inner.write_at(offset, buf)
+        };
         if matches!(r, Err(LxError::ENOSPC)) {
             let size = inner.inode.metadata().ok().map(|m| m.size as u64);
             report_enospc(&self.path, offset, buf.len(), size);
@@ -2461,212 +2559,7 @@ mod pipe_seek_tests {
 }
 
 #[cfg(test)]
-mod seek_tests {
-    //! `lseek(2)` is arithmetic on a number userspace chose, and the result
-    //! becomes the offset every later read and write uses. A relative seek
-    //! that goes below zero, or one that overflows, has to be `EINVAL`: if
-    //! it wraps instead, the file position lands somewhere near 2^64 and the
-    //! next read or write is aimed at an offset the filesystem was never
-    //! asked about.
-
-    use super::*;
-    use rcore_fs::vfs::FileSystem;
-    use rcore_fs_ramfs::RamFS;
-
-    /// A writable file of `len` bytes on a fresh ramfs.
-    fn file(len: usize) -> Arc<File> {
-        let fs = RamFS::new();
-        let root = fs.root_inode();
-        let inode = root.create("f", FileType::File, 0o644).unwrap();
-        if len > 0 {
-            inode.write_at(0, &alloc::vec![0u8; len]).unwrap();
-        }
-        File::new(inode, OpenFlags::RDWR, String::from("/f"))
-    }
-
-    /// A directory with `names` in it, open for reading.
-    fn dir(names: &[&str]) -> Arc<File> {
-        let fs = RamFS::new();
-        let root = fs.root_inode();
-        for name in names {
-            root.create(name, FileType::File, 0o644).unwrap();
-        }
-        File::new(root, OpenFlags::RDONLY, String::from("/"))
-    }
-
-    #[test]
-    fn an_unread_entry_comes_out_again() {
-        let d = dir(&["a", "b", "c"]);
-        let first = d.read_entry().unwrap();
-        let second = d.read_entry().unwrap();
-        let third = d.read_entry().unwrap();
-        d.unread_entry();
-        assert_eq!(d.read_entry().unwrap(), third);
-        d.unread_entry();
-        d.unread_entry();
-        assert_eq!(d.read_entry().unwrap(), second);
-        // Reading on from there is the rest of the directory, once each.
-        let mut rest = alloc::vec![d.read_entry().unwrap()];
-        while let Ok(name) = d.read_entry() {
-            rest.push(name);
-        }
-        assert_eq!(rest.len() + 2, 5, "\".\", \"..\", a, b and c: {:?}", rest);
-        assert!(!rest.contains(&first) && !rest.contains(&second));
-    }
-
-    #[test]
-    fn the_directory_position_is_where_a_seek_resumes() {
-        let d = dir(&["a", "b", "c"]);
-        let first = d.read_entry().unwrap();
-        let second = d.read_entry().unwrap();
-        let after_second = d.dir_position();
-        let third = d.read_entry().unwrap();
-        assert_ne!(
-            after_second, 0,
-            "the position after an entry is never the start"
-        );
-        // Seeking to the position reported after the second entry lands on
-        // the third, which is the contract `d_off` and `seekdir` rest on.
-        File::seek(&d, SeekFrom::Start(after_second)).unwrap();
-        assert_eq!(d.read_entry().unwrap(), third);
-        // And the positions climb with the entries.
-        File::seek(&d, SeekFrom::Start(0)).unwrap();
-        assert_eq!(d.read_entry().unwrap(), first);
-        let after_first = d.dir_position();
-        assert!(after_first < after_second);
-        File::seek(&d, SeekFrom::Start(after_first)).unwrap();
-        assert_eq!(d.read_entry().unwrap(), second);
-    }
-
-    #[test]
-    fn unreading_at_the_start_stays_at_the_start() {
-        let d = dir(&["a"]);
-        let first = d.read_entry().unwrap();
-        d.unread_entry();
-        d.unread_entry();
-        assert_eq!(d.read_entry().unwrap(), first);
-    }
-
-    #[test]
-    fn an_absolute_seek_lands_where_it_was_told() {
-        let f = file(100);
-        assert_eq!(File::seek(&f, SeekFrom::Start(0)).unwrap(), 0);
-        assert_eq!(File::seek(&f, SeekFrom::Start(42)).unwrap(), 42);
-    }
-
-    #[test]
-    fn seeking_past_the_end_is_allowed() {
-        // POSIX says so, and it is how every sparse-file writer works: seek
-        // out past the end, write, and the hole in between reads as zeroes.
-        let f = file(10);
-        assert_eq!(
-            File::seek(&f, SeekFrom::Start(1_000_000)).unwrap(),
-            1_000_000
-        );
-    }
-
-    #[test]
-    fn a_relative_seek_starts_from_where_the_file_is() {
-        let f = file(100);
-        File::seek(&f, SeekFrom::Start(30)).unwrap();
-        assert_eq!(File::seek(&f, SeekFrom::Current(10)).unwrap(), 40);
-        assert_eq!(File::seek(&f, SeekFrom::Current(-15)).unwrap(), 25);
-    }
-
-    #[test]
-    fn a_seek_from_the_end_counts_backwards() {
-        // `SeekFrom::End(0)` is how a program asks for the file's size, and
-        // a negative offset is the normal way to read a trailer.
-        let f = file(100);
-        assert_eq!(File::seek(&f, SeekFrom::End(0)).unwrap(), 100);
-        assert_eq!(File::seek(&f, SeekFrom::End(-20)).unwrap(), 80);
-    }
-
-    #[test]
-    fn a_relative_seek_below_zero_is_refused_rather_than_wrapped() {
-        // This is the one that matters: without the check the position
-        // becomes something near 2^64 and every later read and write is
-        // aimed at an offset nobody asked for.
-        let f = file(100);
-        File::seek(&f, SeekFrom::Start(10)).unwrap();
-        assert!(matches!(
-            File::seek(&f, SeekFrom::Current(-11)),
-            Err(LxError::EINVAL)
-        ));
-        assert_eq!(
-            File::seek(&f, SeekFrom::Current(0)).unwrap(),
-            10,
-            "a refused seek must not have moved the position"
-        );
-    }
-
-    #[test]
-    fn a_seek_before_the_start_of_the_file_is_refused() {
-        let f = file(100);
-        assert!(matches!(
-            File::seek(&f, SeekFrom::End(-101)),
-            Err(LxError::EINVAL)
-        ));
-    }
-
-    #[test]
-    fn a_negative_absolute_seek_is_refused() {
-        // `lseek(fd, -1, SEEK_SET)`. The offset is signed in the uAPI and
-        // arrives here as an enormous `u64`.
-        let f = file(100);
-        assert!(matches!(
-            File::seek(&f, SeekFrom::Start(u64::MAX)),
-            Err(LxError::EINVAL)
-        ));
-        assert!(matches!(
-            File::seek(&f, SeekFrom::Start(1 << 63)),
-            Err(LxError::EINVAL)
-        ));
-    }
-
-    #[test]
-    fn a_seek_that_would_overflow_is_refused() {
-        // Adding to a position near the top of the range.
-        //
-        // The `checked_add` in `seek` is belt and braces here rather than
-        // the thing doing the work: both operands are non-negative (the
-        // stored offset can never have its sign bit set, because this very
-        // function refuses one), so a wrap always lands negative and the
-        // `new_offset < 0` test below catches it either way. Replacing the
-        // `checked_add` with a `wrapping_add` therefore changes nothing
-        // observable -- worth knowing before anyone goes looking for a test
-        // that tells the two apart.
-        let f = file(100);
-        File::seek(&f, SeekFrom::Start(i64::MAX as u64)).unwrap();
-        assert!(matches!(
-            File::seek(&f, SeekFrom::Current(1)),
-            Err(LxError::EINVAL)
-        ));
-        assert!(matches!(
-            File::seek(&f, SeekFrom::Current(i64::MAX)),
-            Err(LxError::EINVAL)
-        ));
-    }
-
-    #[test]
-    fn the_largest_offset_an_off_t_can_name_is_still_a_valid_position() {
-        let f = file(0);
-        assert_eq!(
-            File::seek(&f, SeekFrom::Start(i64::MAX as u64)).unwrap(),
-            i64::MAX as u64
-        );
-    }
-
-    #[test]
-    fn a_seek_of_zero_reports_the_position_without_moving_it() {
-        // `lseek(fd, 0, SEEK_CUR)` is how every program asks "where am I",
-        // and it must not disturb anything.
-        let f = file(100);
-        File::seek(&f, SeekFrom::Start(37)).unwrap();
-        assert_eq!(File::seek(&f, SeekFrom::Current(0)).unwrap(), 37);
-        assert_eq!(File::seek(&f, SeekFrom::Current(0)).unwrap(), 37);
-    }
-}
+mod seek_tests;
 
 #[cfg(test)]
 mod setfl_tests {

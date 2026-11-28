@@ -129,6 +129,35 @@ const FATFS: [&str; 3] = ["eclipse-fatfs", "eclipse-fs-bench", "eclipse-mountd"]
 const FATFS_USES: [&str; 1] = ["tools/eclipse-udrivers/src"];
 /// How many virtio disks get a driver service of their own (`ublk`,
 /// `ublk2`, ...): the ones the kernel leaves beyond these have none.
+/// The lines of a disk driver's wrapper that make its disks' names the same
+/// on every boot: the driver of the Nth device waits for the one of the
+/// N-1th to have served its disks before it serves its own.
+///
+/// The kernel names a served disk by when it arrives (`/dev/sda` is the
+/// first SATA disk any driver hands it), and the drivers of two devices of
+/// a kind start side by side. Which `sdX` a disk got was a race: with the
+/// boot ESP on one AHCI controller and a data disk on another, `/dev/sdb`
+/// was the data disk on one boot and the ESP on the next (measured in QEMU,
+/// two `ich9-ahci`: three boots of four). Linux names them in PCI order.
+///
+/// Each driver writes a byte to its `REPORT_FD` once its disks are the
+/// kernel's; the wrapper points that at `/run/eclipse-SERVICE.N.ready`, and
+/// the next one waits for the file to have that byte, ten seconds at most so
+/// that a driver that never reports (a device that fails) costs a boot ten
+/// seconds and not its disks. `/run` is emptied at every boot, and a driver
+/// started again finds the byte of its first start: a disk keeps its node.
+fn disk_order_gate(service: &str) -> String {
+    format!(
+        "# The Nth driver serves its disks after the N-1th: the same names\n\
+         # on every boot (see disk_order_gate in xtask/src/linux/udriver.rs).\n\
+         ready=/run/eclipse-{service}.$nth.ready\n\
+         if [ \"$nth\" -gt 1 ]; then\n\
+         \x20   i=0\n\
+         \x20   while [ ! -s \"/run/eclipse-{service}.$((nth - 1)).ready\" ] && [ $i -lt 100 ]; do sleep 0.1; i=$((i + 1)); done\n\
+         fi\n"
+    )
+}
+
 const UBLK_DISKS: usize = 4;
 /// The same for NVMe and AHCI controllers (`unvme`, `unvme2`, `uahci`,
 /// `uahci2`).
@@ -307,8 +336,12 @@ pub(super) fn write_services(localbin: &Path, svc_dir: &Path) {
           [ -n \"$n\" ] || { echo \"eclipse-ublk: the kernel left no virtio disk number $nth to userspace\" >&2; sleep 5; exit 1; }\n\
           # The driver is the Rust one and only that one: the C tool's own\n\
           # driver is for checking and timing, never the system's.\n\
-          [ -x /bin/udrv-virtio-blk ] || { echo 'eclipse-ublk: /bin/udrv-virtio-blk is not in this image (its build failed: see the image log)' >&2; sleep 5; exit 127; }\n\
-          exec /bin/udrv-virtio-blk \"$n\"\n",
+          [ -x /bin/udrv-virtio-blk ] || { echo 'eclipse-ublk: /bin/udrv-virtio-blk is not in this image (its build failed: see the image log)' >&2; sleep 5; exit 127; }\n"
+            .iter()
+            .copied()
+            .chain(disk_order_gate("ublk").into_bytes())
+            .chain(*b"exec /bin/udrv-virtio-blk \"$n\" 3 3>>\"$ready\"\n")
+            .collect::<Vec<u8>>(),
     )
     .unwrap();
 
@@ -358,7 +391,9 @@ pub(super) fn write_services(localbin: &Path, svc_dir: &Path) {
                  n=$(sed -n 's/^{kind}@//p' /proc/udrivers | sed -n \"${{nth}}p\")\n\
                  [ -n \"$n\" ] || {{ echo \"eclipse-{service}: the kernel left no {kind} number $nth to userspace\" >&2; sleep 5; exit 1; }}\n\
                  [ -x /bin/{driver} ] || {{ echo 'eclipse-{service}: /bin/{driver} is not in this image (its build failed: see the image log)' >&2; sleep 5; exit 127; }}\n\
-                 exec /bin/{driver} \"$n\"\n"
+                 {gate}\
+                 exec /bin/{driver} \"$n\" 3 3>>\"$ready\"\n",
+                gate = disk_order_gate(service),
             ),
         )
         .unwrap();
