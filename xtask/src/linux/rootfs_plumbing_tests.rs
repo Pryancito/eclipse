@@ -3234,3 +3234,74 @@ fn a_kept_rootfs_loses_silversurfer() {
     assert!(!mime.exists());
     let _ = fs::remove_dir_all(&root);
 }
+
+/// The driver of the second disk device of a kind serves its disks after
+/// the first one's (`disk_order_gate`): otherwise which `/dev/sdX` a disk
+/// got changed from one boot to the next. Each disk wrapper has the gate
+/// and hands its driver the file the next one waits on; and the gate's own
+/// lines, run here, wait for the previous driver's byte and only for it.
+#[test]
+fn the_disk_drivers_serve_their_disks_in_the_kernels_order() {
+    let rootfs = init_rootfs("disk-order");
+    for (service, driver) in [
+        ("ublk", "udrv-virtio-blk"),
+        ("unvme", "udrv-nvme"),
+        ("uahci", "udrv-ahci"),
+    ] {
+        let wrapper =
+            fs::read_to_string(rootfs.join(format!("usr/local/bin/eclipse-{service}"))).unwrap();
+        assert!(
+            wrapper.contains(&format!("ready=/run/eclipse-{service}.$nth.ready"))
+                && wrapper.contains(&format!(
+                    "exec /bin/{driver} \"$n\" 3 3>>\"$ready\""
+                )),
+            "{service}: no order gate:\n{wrapper}"
+        );
+        // The gate comes before the driver starts.
+        let gate = wrapper.find("ready=").unwrap();
+        let exec = wrapper.find(&format!("exec /bin/{driver}")).unwrap();
+        assert!(gate < exec, "{service}:\n{wrapper}");
+    }
+    let wrapper = fs::read_to_string(rootfs.join("usr/local/bin/eclipse-uahci")).unwrap();
+    let lines: Vec<&str> = wrapper.lines().collect();
+    let from = lines.iter().position(|l| l.starts_with("ready=")).unwrap();
+    let to = from + lines[from..].iter().position(|l| *l == "fi").unwrap();
+    // `scratch` names its directory after the thread (`ThreadId(N)`), and
+    // the gate's paths are unquoted words: a directory of its own.
+    let dir = std::env::temp_dir().join(format!("eclipse-disk-order-{}", std::process::id()));
+    let _ = fs::remove_dir_all(&dir);
+    fs::create_dir_all(&dir).unwrap();
+    let gate = lines[from..=to]
+        .join("\n")
+        .replace("/run/", &format!("{}/", dir.display()));
+    let run = |nth: u32| {
+        let started = std::time::Instant::now();
+        let out = std::process::Command::new("sh")
+            .arg("-c")
+            .arg(format!("nth={nth}\n{gate}\necho \"$ready\""))
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+        (String::from_utf8(out.stdout).unwrap(), started.elapsed())
+    };
+    // The first does not wait, and is told where its byte goes.
+    let (ready, took) = run(1);
+    assert_eq!(ready.trim(), format!("{}/eclipse-uahci.1.ready", dir.display()));
+    assert!(took < std::time::Duration::from_secs(2), "{took:?}");
+    // The second goes as soon as the first has said its disks are served.
+    fs::write(dir.join("eclipse-uahci.1.ready"), "u").unwrap();
+    let (_, took) = run(2);
+    assert!(took < std::time::Duration::from_secs(2), "{took:?}");
+    // An empty file is a driver that has not said it yet: the gate waits
+    // (here, for a byte written while it does).
+    fs::write(dir.join("eclipse-uahci.2.ready"), "").unwrap();
+    let late = dir.join("eclipse-uahci.2.ready");
+    let writer = std::thread::spawn(move || {
+        std::thread::sleep(std::time::Duration::from_millis(700));
+        fs::write(late, "u").unwrap();
+    });
+    let (_, took) = run(3);
+    writer.join().unwrap();
+    assert!(took >= std::time::Duration::from_millis(600), "{took:?}");
+    assert!(took < std::time::Duration::from_secs(5), "{took:?}");
+}

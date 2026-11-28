@@ -29,6 +29,21 @@ use udrivers::zx::{self, nr, Status};
 
 const NAME: &str = "udrv-ahci";
 
+/// Write the byte of `REPORT_FD`, if there is one: every disk is the
+/// kernel's.
+fn tell(report: Option<i32>) {
+    if let Some(fd) = report {
+        // SAFETY: one byte of a static string to a descriptor the parent
+        // passed for this.
+        unsafe {
+            if libc::write(fd, b"u".as_ptr().cast(), 1) != 1 {
+                die("write (report)");
+            }
+            libc::close(fd);
+        }
+    }
+}
+
 fn die(what: impl std::fmt::Display) -> ! {
     println!("{NAME}: {what}");
     exit(1);
@@ -69,6 +84,10 @@ fn main() {
     }
     let ports = regs.disks();
     if ports.is_empty() {
+        // Every disk it has is the kernel's, all none of them: the driver
+        // of the next controller, which waits for this word (see
+        // `disk_order_gate` in xtask), need not wait out its ten seconds.
+        tell(report);
         die("no SATA disk on the controller");
     }
     let wakes: Vec<(usize, Arc<Wake>)> = ports
@@ -163,16 +182,7 @@ fn main() {
     if serving.is_empty() {
         die("no disk could be served");
     }
-    if let Some(fd) = report {
-        // SAFETY: one byte of a static string to a descriptor the parent
-        // passed for this.
-        unsafe {
-            if libc::write(fd, b"u".as_ptr().cast(), 1) != 1 {
-                die("write (report)");
-            }
-            libc::close(fd);
-        }
-    }
+    tell(report);
     for t in serving {
         let _ = t.join();
     }
