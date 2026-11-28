@@ -8,6 +8,7 @@ use linux_object::fs::*;
 mod dir;
 mod drm_prime;
 mod fd;
+mod fown;
 mod hunter_gate;
 /// The `struct itimerspec` of the `timerfd` calls, shared with the i386
 /// compat layer: `timerfd_gettime64`/`timerfd_settime64` pass the SAME

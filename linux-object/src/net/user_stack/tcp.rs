@@ -59,6 +59,9 @@ struct Inner {
     spare: Option<Vec<u8>>,
     /// The bytes in `chunks` not read yet.
     queued: usize,
+    /// What `listen(2)` was told: how many connections the stack is asked
+    /// to have ready to take at once.
+    backlog: u16,
     /// The bytes read since the stack was last told (`WINDOW`).
     unsaid: usize,
     /// The bytes the stack still takes.
@@ -119,6 +122,7 @@ impl Inner {
             read_at: 0,
             spare: None,
             queued: 0,
+            backlog: LISTEN_BACKLOG,
             unsaid: 0,
             credit: 0,
             eof: false,
@@ -389,7 +393,7 @@ impl Stream {
             (Takes::Both, _) => listen6_message,
             (Takes::Six, _) => listen6only_message,
         };
-        let mut m = message(sock, port, LISTEN_BACKLOG, STREAM_WINDOW as u32);
+        let mut m = message(sock, port, inner.backlog, STREAM_WINDOW as u32);
         match inner.bound {
             Some(IpAddress::Ipv4(at)) => m.extend_from_slice(&at.0),
             Some(IpAddress::Ipv6(at)) => m.extend_from_slice(&at.0),
@@ -1265,6 +1269,21 @@ impl Socket for ServedTcpSocket {
         Ok(0)
     }
 
+    /// The stack keeps a socket ready for each connection it is to take at
+    /// once (`LISTEN`'s backlog), and a SYN that finds none is not answered:
+    /// its peer tries again a second later or more. A fixed 8 made a burst
+    /// of 16 connections to nginx (backlog 511) wait 1 to 5 s for half of
+    /// them.
+    fn listen_backlog(&self, backlog: u16) -> SysResult {
+        {
+            let mut inner = self.stream.inner.lock();
+            if inner.phase == Phase::Fresh {
+                inner.backlog = backlog.max(1);
+            }
+        }
+        self.listen()
+    }
+
     fn listen(&self) -> SysResult {
         let _telling = self.link.telling.lock();
         let port = {
@@ -1670,6 +1689,17 @@ impl FileLike for ServedTcpSocket {
         Some(self.stream.inner.lock().queued)
     }
 
+    /// `tcp_poll`'s `RCV_SHUTDOWN`: the peer sent its end, this end shut
+    /// down reading, or the connection is over (a reset shuts both).
+    fn read_hangup(&self) -> bool {
+        let inner = self.stream.inner.lock();
+        match inner.phase {
+            Phase::Open => inner.eof || inner.read_closed,
+            Phase::Over => true,
+            _ => false,
+        }
+    }
+
     fn as_socket(&self) -> LxResult<&dyn Socket> {
         Ok(self)
     }
@@ -1981,11 +2011,14 @@ mod tests {
         assert_eq!(read(&s, &mut buf), Err(LxError::EAGAIN));
         assert!(!status(&s).read);
 
-        // The end: readable for ever, and every read is 0.
+        // The end: readable for ever, and every read is 0. It is
+        // `EPOLLRDHUP` too, from the moment it is said, bytes or not.
+        assert!(!FileLike::read_hangup(&s));
         events(
             &stack,
             &[(sock, EV_BYTES, 0, b"fin"), (sock, EV_EOF, 0, &[])],
         );
+        assert!(FileLike::read_hangup(&s));
         assert_eq!(read(&s, &mut buf), Ok(3));
         assert!(status(&s).read);
         assert_eq!(read(&s, &mut buf), Ok(0));
@@ -2230,6 +2263,28 @@ mod tests {
                 },
             ]
         );
+    }
+
+    #[test]
+    fn a_listener_asks_the_stack_for_the_backlog_listen_was_told() {
+        // nginx listens with 511: the stack is asked for that many ready,
+        // and holds it to its own most. A fixed 8 left half of a burst of
+        // 16 connections unanswered for a second or more.
+        let _lock = LOCK.lock();
+        let stack = stack();
+        let l = stream(&stack);
+        assert_eq!(Socket::bind(&l, any(8090)), Ok(0));
+        assert_eq!(Socket::listen_backlog(&l, 511), Ok(0));
+        let told = stack.told().unwrap();
+        let (_, sock) = parse_header(&told).unwrap();
+        assert_eq!(told, listen_message(sock, 8090, 511, STREAM_WINDOW as u32));
+        // `listen(fd, 0)` still takes one, as Linux does.
+        let z = stream(&stack);
+        assert_eq!(Socket::bind(&z, any(8091)), Ok(0));
+        assert_eq!(Socket::listen_backlog(&z, 0), Ok(0));
+        let told = stack.told().unwrap();
+        let (_, sock) = parse_header(&told).unwrap();
+        assert_eq!(told, listen_message(sock, 8091, 1, STREAM_WINDOW as u32));
     }
 
     #[test]

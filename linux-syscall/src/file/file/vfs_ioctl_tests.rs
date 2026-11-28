@@ -623,3 +623,58 @@ fn an_ioctl_refuses_a_descriptor_nobody_has_before_it_reads_anything() {
         })
     });
 }
+
+#[test]
+fn an_owner_set_with_f_setown_is_given_back_and_shared_by_a_dup() {
+    // nginx's master does `F_SETOWN` on each worker's channel and gives up
+    // on the worker when it fails; it used to be `EINVAL`. The owner is the
+    // description's, so a `dup` sees it, and a pid that names nobody is
+    // `ESRCH`, as `f_setown` answers.
+    const F_SETOWN: usize = 8;
+    const F_GETOWN: usize = 9;
+    let pid: KoID = 48_300;
+    let proc = a_process(pid, "vfs-fcntl-owner", "owner");
+    on_a_thread(&proc, move |sys| {
+        Box::pin(async move {
+            let lp = sys.linux_process();
+            let fd = FileDesc::from(a_file_with(&lp, "/owner", TEN_DIGITS) as i32);
+            assert_eq!(
+                sys.sys_fcntl(fd, F_GETOWN, 0).await,
+                Ok(0),
+                "an owner from nowhere"
+            );
+            assert_eq!(sys.sys_fcntl(fd, F_SETOWN, pid as usize).await, Ok(0));
+            assert_eq!(sys.sys_fcntl(fd, F_GETOWN, 0).await, Ok(pid as usize));
+
+            let copy = sys.sys_dup(fd).unwrap();
+            let copy = FileDesc::from(copy as i32);
+            assert_eq!(
+                sys.sys_fcntl(copy, F_GETOWN, 0).await,
+                Ok(pid as usize),
+                "a dup did not share the description's owner"
+            );
+
+            assert_eq!(
+                sys.sys_fcntl(fd, F_SETOWN, 0x7fff_fff0).await,
+                errno(LxError::ESRCH),
+                "a pid that names nobody was taken"
+            );
+            assert_eq!(
+                sys.sys_fcntl(fd, F_SETOWN, i32::MIN as u32 as usize).await,
+                errno(LxError::EINVAL)
+            );
+            assert_eq!(
+                sys.sys_fcntl(fd, F_GETOWN, 0).await,
+                Ok(pid as usize),
+                "a refused owner replaced the one there"
+            );
+
+            assert_eq!(sys.sys_fcntl(fd, F_SETOWN, 0).await, Ok(0));
+            assert_eq!(
+                sys.sys_fcntl(copy, F_GETOWN, 0).await,
+                Ok(0),
+                "0 did not clear the owner"
+            );
+        })
+    });
+}

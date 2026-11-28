@@ -1156,6 +1156,9 @@ impl Epoll {
                     }
                 };
                 let mut ready = ready_events(event.events, &status);
+                if event.events & PollEvents::RDHUP.bits() as u32 != 0 && file.read_hangup() {
+                    ready |= PollEvents::RDHUP.bits() as u32;
+                }
                 if !edge_triggered {
                     // Armed only when the poll found nothing, since only a
                     // quiet entry is ever passed, and AFTER the poll: the bus
@@ -3467,5 +3470,92 @@ mod nested_cover_tests {
         }
         let (_, waker) = counting_waker();
         assert!(top.subscribe_readiness(PollEvents::IN, &waker).is_none());
+    }
+}
+
+#[cfg(test)]
+mod rdhup_tests {
+    //! `EPOLLRDHUP`, as nginx asks for it.
+    use super::*;
+    use crate::net::UnixSocketState;
+    use core::future::Future;
+    use core::task::{Context, Poll, Waker};
+
+    struct Nop;
+
+    impl alloc::task::Wake for Nop {
+        fn wake(self: Arc<Self>) {}
+    }
+
+    fn wait_now(ep: &Epoll) -> Vec<u32> {
+        let waker = Waker::from(Arc::new(Nop));
+        let mut cx = Context::from_waker(&waker);
+        let mut fut = alloc::boxed::Box::pin(ep.wait(4, 0));
+        match fut.as_mut().poll(&mut cx) {
+            Poll::Ready(r) => r.unwrap().iter().map(|e| e.events).collect(),
+            Poll::Pending => panic!("a zero-timeout wait finishes at once"),
+        }
+    }
+
+    const ET_IN_RDHUP: u32 =
+        EPOLLET | PollEvents::IN.bits() as u32 | PollEvents::RDHUP.bits() as u32;
+
+    #[test]
+    fn the_end_of_a_socketpair_whose_other_end_closed_says_rdhup() {
+        // `ngx_epoll_test_rdhup`, step by step. Without `EPOLLRDHUP` in
+        // the answer nginx falls back to reading every connection until
+        // `EAGAIN`, and a keepalive connection whose next request is
+        // already there is served again and again while the others wait.
+        let a = UnixSocketState::new();
+        let b = UnixSocketState::new();
+        UnixSocketState::connect_pair(&a, &b);
+        let ep = Epoll::new(OpenFlags::empty());
+        let file: Arc<dyn FileLike> = a.clone();
+        ep.ctl(
+            EPOLL_CTL_ADD,
+            FileDesc::from(5),
+            EpollEvent {
+                events: ET_IN_RDHUP,
+                data: 0,
+            },
+            Some(file),
+        )
+        .unwrap();
+        assert!(wait_now(&ep).is_empty(), "nothing has happened yet");
+        drop(b);
+        let got = wait_now(&ep);
+        assert_eq!(got.len(), 1);
+        assert_ne!(got[0] & PollEvents::RDHUP.bits() as u32, 0, "{:#x}", got[0]);
+        assert_ne!(got[0] & PollEvents::IN.bits() as u32, 0, "{:#x}", got[0]);
+    }
+
+    #[test]
+    fn rdhup_is_reported_only_to_who_asks_and_only_at_the_end() {
+        let a = UnixSocketState::new();
+        let b = UnixSocketState::new();
+        UnixSocketState::connect_pair(&a, &b);
+        let ep = Epoll::new(OpenFlags::empty());
+        let in_only = PollEvents::IN.bits() as u32;
+        let fa: Arc<dyn FileLike> = a.clone();
+        ep.ctl(
+            EPOLL_CTL_ADD,
+            FileDesc::from(5),
+            EpollEvent {
+                events: in_only,
+                data: 0,
+            },
+            Some(fa),
+        )
+        .unwrap();
+        // Bytes are not the end.
+        crate::net::Socket::write(&*b, b"hola", None).unwrap();
+        let got = wait_now(&ep);
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0] & PollEvents::RDHUP.bits() as u32, 0);
+        // The end, to an entry that did not ask: no RDHUP.
+        crate::net::Socket::shutdown(&*b, 1).unwrap();
+        assert!(FileLike::read_hangup(&*a));
+        let got = wait_now(&ep);
+        assert_eq!(got[0] & PollEvents::RDHUP.bits() as u32, 0);
     }
 }

@@ -583,6 +583,9 @@ impl Syscall<'_> {
                         // when set, even if the caller did not list them in
                         // `events`; the rest is what the caller asked for.
                         poll.revents = PE::revents(&status, poll.events);
+                        if poll.events.contains(PE::RDHUP) && file_like.read_hangup() {
+                            poll.revents |= PE::RDHUP;
+                        }
                         // Linux poll(2): return value is the number of fds with
                         // nonzero revents, not the number of event bits set.
                         if !poll.revents.is_empty() {

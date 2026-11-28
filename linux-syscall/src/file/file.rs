@@ -2707,6 +2707,18 @@ impl Syscall<'_> {
         }
         // Pipe capacity (fcntl(2), F_SETPIPE_SZ/F_GETPIPE_SZ): valid only on
         // pipe fds — Linux answers EBADF for other fd kinds.
+        // The owner of the description, for `SIGIO`: kept and given back
+        // (`fown`), which nginx needs to start a worker.
+        if cmd == super::fown::F_GETOWN {
+            return Ok(super::fown::owner(&file_like) as isize as usize);
+        }
+        if cmd == super::fown::F_SETOWN {
+            return super::fown::set_owner(&file_like, arg as i32, |id| {
+                linux_object::process::find_task(id).is_some()
+                    || linux_object::process::find_thread(id).is_some()
+            })
+            .map(|_| 0);
+        }
         if cmd == F_SETPIPE_SZ || cmd == F_GETPIPE_SZ {
             let file = file_like.downcast_ref::<File>().ok_or(LxError::EBADF)?;
             let inode = file.inode();
