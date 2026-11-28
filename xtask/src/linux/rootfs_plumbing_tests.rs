@@ -3252,9 +3252,7 @@ fn the_disk_drivers_serve_their_disks_in_the_kernels_order() {
             fs::read_to_string(rootfs.join(format!("usr/local/bin/eclipse-{service}"))).unwrap();
         assert!(
             wrapper.contains(&format!("ready=/run/eclipse-{service}.$nth.ready"))
-                && wrapper.contains(&format!(
-                    "exec /bin/{driver} \"$n\" 3 3>>\"$ready\""
-                )),
+                && wrapper.contains(&format!("exec /bin/{driver} \"$n\" 3 3>>\"$ready\"")),
             "{service}: no order gate:\n{wrapper}"
         );
         // The gate comes before the driver starts.
@@ -3281,12 +3279,19 @@ fn the_disk_drivers_serve_their_disks_in_the_kernels_order() {
             .arg(format!("nth={nth}\n{gate}\necho \"$ready\""))
             .output()
             .unwrap();
-        assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
         (String::from_utf8(out.stdout).unwrap(), started.elapsed())
     };
     // The first does not wait, and is told where its byte goes.
     let (ready, took) = run(1);
-    assert_eq!(ready.trim(), format!("{}/eclipse-uahci.1.ready", dir.display()));
+    assert_eq!(
+        ready.trim(),
+        format!("{}/eclipse-uahci.1.ready", dir.display())
+    );
     assert!(took < std::time::Duration::from_secs(2), "{took:?}");
     // The second goes as soon as the first has said its disks are served.
     fs::write(dir.join("eclipse-uahci.1.ready"), "u").unwrap();

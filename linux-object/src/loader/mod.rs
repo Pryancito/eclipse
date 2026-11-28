@@ -174,7 +174,8 @@ fn stack_mmu_flags(elf: &ElfFile) -> MMUFlags {
     /// `PT_GNU_STACK`, from `elf.h`; xmas-elf files it under `OsSpecific`.
     const PT_GNU_STACK: u32 = 0x6474_e551;
     let exec = elf.program_iter().any(|ph| {
-        ph.get_type() == Ok(xmas_elf::program::Type::OsSpecific(PT_GNU_STACK)) && ph.flags().is_execute()
+        ph.get_type() == Ok(xmas_elf::program::Type::OsSpecific(PT_GNU_STACK))
+            && ph.flags().is_execute()
     });
     let rw = MMUFlags::READ | MMUFlags::WRITE | MMUFlags::USER;
     if exec {
@@ -1656,7 +1657,11 @@ mod elf_bounds_tests {
                 ..Default::default()
             });
             if let Some(flags) = flags {
-                elf = elf.phdr(Phdr { p_type: PT_GNU_STACK, flags, ..Default::default() });
+                elf = elf.phdr(Phdr {
+                    p_type: PT_GNU_STACK,
+                    flags,
+                    ..Default::default()
+                });
             }
             elf.payload = vec![0x90u8; 4];
             let image = elf.build();
