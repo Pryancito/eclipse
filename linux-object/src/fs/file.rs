@@ -184,6 +184,12 @@ bitflags::bitflags! {
         const WRNORM = 0x0100;
         /// Priority data may be written. Never reported.
         const WRBAND = 0x0200;
+        /// The peer of a stream socket will send no more: it closed, or shut
+        /// down its writing half, or this end shut down reading
+        /// (`POLLRDHUP` / `EPOLLRDHUP`, Linux's `RCV_SHUTDOWN`). Reported
+        /// only when asked for, and only by the files that know
+        /// ([`FileLike::read_hangup`](super::FileLike::read_hangup)).
+        const RDHUP = 0x2000;
     }
 }
 

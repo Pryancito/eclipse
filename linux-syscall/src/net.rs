@@ -1681,11 +1681,12 @@ impl Syscall<'_> {
     /// that is, as a socket that will be used to accept incoming connection
     pub fn sys_listen(&mut self, sockfd: usize, backlog: usize) -> SysResult {
         info!("sys_listen: fd:{}, backlog:{}", sockfd, backlog);
-        // smoltcp tcp sockets do not support backlog
-        // open multiple sockets for each connection
+        // `__sys_listen`: the backlog is an `int` taken as unsigned and
+        // clamped to `somaxconn`, so a negative one is the most.
+        let backlog = (backlog as u32).min(SOMAXCONN) as u16;
         let file_like = self.linux_process().get_file_like(sockfd.into())?;
         let socket = file_like.as_socket()?;
-        let ret = socket.listen()?;
+        let ret = socket.listen_backlog(backlog)?;
         // hunter's network monitor hears of the listener now, not at the next
         // read of `/proc/hunter_net`. It only watches: the call has succeeded.
         linux_object::net::netmon::on_listen(self.zircon_process(), socket);
@@ -3369,3 +3370,6 @@ mod control_and_batch_bounds_tests {
         assert_eq!(MMSG_MAX * stride, 4096, "one page of entries");
     }
 }
+
+/// `net.core.somaxconn`: the most a `listen(2)` backlog is taken as.
+const SOMAXCONN: u32 = 4096;

@@ -1664,6 +1664,12 @@ pub trait Socket: Send + Sync + Debug + downcast_rs::DowncastSync {
     fn listen(&self) -> SysResult {
         Err(LxError::EOPNOTSUPP)
     }
+    /// `listen(2)` with the backlog it was given, already clamped to
+    /// `somaxconn` as `__sys_listen` does. A socket that keeps no queue of
+    /// its own for it listens as [`listen`](Self::listen) does.
+    fn listen_backlog(&self, _backlog: u16) -> SysResult {
+        self.listen()
+    }
     /// Whether this socket is a passive listener (`SIOCINQ`/`FIONREAD` is
     /// `EINVAL` on one, per unix(7) / tcp(7)).
     fn is_listening(&self) -> bool {

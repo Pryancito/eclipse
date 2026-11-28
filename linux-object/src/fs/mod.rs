@@ -1421,6 +1421,19 @@ pub trait FileLike: KernelObject + downcast_rs::DowncastSync {
     fn readable_bytes(&self) -> Option<usize> {
         None
     }
+    /// Whether the peer will send no more: what `EPOLLRDHUP` / `POLLRDHUP`
+    /// report (`sk_shutdown & RCV_SHUTDOWN` in Linux's `tcp_poll` and
+    /// `unix_poll`). Only stream sockets know; everything else says no, as
+    /// a pipe does in Linux.
+    ///
+    /// nginx tests for it at start (`ngx_epoll_test_rdhup`, a socketpair
+    /// whose other end is closed) and, without it, reads every connection
+    /// until `EAGAIN`: a keepalive connection whose next request is already
+    /// there is served again and again from nginx's posted-event queue, and
+    /// the others wait for it with their requests unread.
+    fn read_hangup(&self) -> bool {
+        false
+    }
     /// Returns the [`VmObject`] representing the file with given `offset` and `len`.
     fn get_vmo(&self, _offset: usize, _len: usize) -> LxResult<Arc<VmObject>> {
         Err(LxError::ENOSYS)

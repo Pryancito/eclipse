@@ -420,8 +420,10 @@ pub const ACCEPTED6_LEN: usize = 44;
 pub const STREAM_WINDOW: usize = 256 * 1024;
 /// The most bytes of one `WRITE`: what fits a channel message.
 pub const WRITE_MAX: usize = 65536 - HEADER_LEN;
-/// The connections a listener asks the stack to have ready to take. The
-/// `Socket` trait does not carry what `listen(2)` was told.
+/// The connections a listener asks the stack to have ready to take when
+/// `listen(2)` did not say ([`Socket::listen`](crate::net::Socket::listen)
+/// without [`listen_backlog`](crate::net::Socket::listen_backlog)). The
+/// stack holds it to a most of its own.
 pub const LISTEN_BACKLOG: u16 = 8;
 
 /// What every message starts with.

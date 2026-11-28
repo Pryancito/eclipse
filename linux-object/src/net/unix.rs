@@ -1754,6 +1754,13 @@ impl FileLike for UnixSocketState {
         Some(self.inner.lock().buffer.len())
     }
 
+    /// The peer closed or shut down writing, or this end shut down reading:
+    /// `unix_poll`'s `RCV_SHUTDOWN`.
+    fn read_hangup(&self) -> bool {
+        let inner = self.inner.lock();
+        inner.peer_closed || inner.read_closed
+    }
+
     fn as_socket(&self) -> LxResult<&dyn Socket> {
         Ok(self)
     }
