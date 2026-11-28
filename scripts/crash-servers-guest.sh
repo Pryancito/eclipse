@@ -68,6 +68,16 @@ back() {
 
 # done_within PID SECONDS: wait for a background client to end; 1 if it
 # is still there (it is left: a client stuck in the kernel cannot be killed).
+# said_hung NAME CHECK: init's state file says NAME's last run was killed by
+# the kernel for hanging (its `cause`, from /proc/hung); reported as CHECK.
+said_hung() {
+    cause=$(field "$1" 11)
+    case $cause in
+        hung:*) report "$2" ok ;;
+        *) report "$2" "init says its last run ended with \"${cause:--}\", not hung" ;;
+    esac
+}
+
 done_within() {
     i=0; n=$(( $2 * 2 ))
     while [ $i -lt $n ]; do
@@ -147,6 +157,7 @@ disk_checks() {
         fi
         kill -CONT "$p" 2>/dev/null
         back "$svc" "$p" > /dev/null
+        wanted "disk.$svc.frozen.cause" && said_hung "$svc" "disk.$svc.frozen.cause"
     fi
     umount $m 2>/dev/null
 }
@@ -243,6 +254,7 @@ net_checks() {
         fi
         kill -CONT "$p" 2>/dev/null
         sleep 3
+        wanted net.frozen.cause && said_hung $svc net.frozen.cause
     fi
 }
 
@@ -277,7 +289,9 @@ chardev_checks() {
         client=$!
         sleep 1
         p=$(pid_of "$svc"); kill -STOP "$p"
-        if new=$(back "$svc" "$p" 40); then report "$fam.frozen" ok
+        if new=$(back "$svc" "$p" 40); then
+            report "$fam.frozen" ok
+            wanted "$fam.frozen.cause" && said_hung "$svc" "$fam.frozen.cause"
         else report "$fam.frozen" "the frozen $svc was not replaced in 40 s"; fi
         kill -CONT "$p" 2>/dev/null
         kill $client 2>/dev/null

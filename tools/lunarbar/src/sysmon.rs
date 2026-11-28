@@ -230,6 +230,39 @@ pub struct Svc {
     /// The device a driver service drives (`virtio-blk@1`): the ninth
     /// column, which an older init does not write.
     pub udriver: Option<String>,
+    /// How its last run this boot ended: the wall-clock second and init's
+    /// cause (`exit 1`, `signal 9`, `hung: served disk`), the tenth and
+    /// eleventh columns.
+    pub died: Option<u64>,
+    pub cause: Option<String>,
+}
+
+/// Init's `cause` of a death, as `lang` says it.
+pub fn death_text(cause: &str, lang: Lang) -> String {
+    use crate::i18n::Key;
+    let (key, rest) = if let Some(what) = cause.strip_prefix("hung: ") {
+        (Key::mon_death_hung, what)
+    } else if let Some(n) = cause.strip_prefix("signal ") {
+        (Key::mon_death_signal, n)
+    } else if let Some(n) = cause.strip_prefix("exit ") {
+        (Key::mon_death_exit, n)
+    } else {
+        return cause.to_string();
+    };
+    lang.s(key).replace("{}", rest)
+}
+
+/// The line that says how and when `svc` last died, at `now` (wall-clock
+/// seconds): `None` while it has not.
+pub fn last_death(died: Option<u64>, cause: Option<&str>, now: u64, lang: Lang) -> Option<String> {
+    let cause = death_text(cause?, lang);
+    Some(match died {
+        Some(at) => {
+            let ago = lang.s(crate::i18n::Key::mon_death_ago).replace("{}", &fmt_secs(now.saturating_sub(at)));
+            format!("{cause} · {ago}")
+        }
+        None => cause,
+    })
 }
 
 pub fn parse_services(text: &str) -> Vec<Svc> {
@@ -251,6 +284,8 @@ pub fn parse_services(text: &str) -> Vec<Svc> {
                 log: opt(f[6]),
                 exec: f[7].to_string(),
                 udriver: f.get(8).and_then(|d| opt(d)),
+                died: f.get(9).and_then(|d| d.parse().ok()),
+                cause: f.get(10).and_then(|d| opt(d)),
             })
         })
         .collect()
@@ -418,6 +453,26 @@ mod tests {
         assert_eq!((s[1].pid, s[1].log.clone(), s[1].exec.as_str()), (None, None, "/bin/mount -a"));
         assert_eq!(state_word("given-up", crate::i18n::Lang::Es), ("abandonado", true));
         assert_eq!(state_word("given-up", crate::i18n::Lang::En), ("given up", true));
+    }
+
+    #[test]
+    fn a_death_is_said_in_the_readers_language_with_how_long_ago() {
+        let text = "# h\n\
+            ublk\trespawn\trunning\t231\t2\t100\t-\t/bin/u\tvirtio-blk@1\t40\thung: served disk\n\
+            ntpd\trespawn\trunning\t455\t1\t100\t-\t/bin/n\t-\n";
+        let s = parse_services(text);
+        assert_eq!((s[0].died, s[0].cause.as_deref()), (Some(40), Some("hung: served disk")));
+        assert_eq!((s[1].died, s[1].cause.as_deref()), (None, None), "an older init");
+        assert_eq!(
+            last_death(s[0].died, s[0].cause.as_deref(), 220, Lang::Es).unwrap(),
+            "colgado (served disk): lo mató el núcleo · fue hace 3 min"
+        );
+        assert_eq!(
+            last_death(Some(10), Some("signal 9"), 15, Lang::En).unwrap(),
+            "signal 9 · 5 s ago"
+        );
+        assert_eq!(death_text("exit 1", Lang::Es), "salió con 1");
+        assert_eq!(last_death(None, None, 0, Lang::Es), None);
     }
 
     #[test]

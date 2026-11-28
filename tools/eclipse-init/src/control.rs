@@ -6,9 +6,9 @@
 //! wakes: one line per service, tab-separated,
 //!
 //! ```text
-//! name  kind  state  pid  starts  started  log  exec  udriver
-//! ntpd  respawn  running  455  1  1793865120  /tmp/ntpd.log  /usr/local/bin/eclipse-ntpd  -
-//! ublk  respawn  running  231  2  1793865101  /tmp/ublk.log  /usr/local/bin/eclipse-ublk  virtio-blk@1
+//! name  kind  state  pid  starts  started  log  exec  udriver  died  cause
+//! ntpd  respawn  running  455  1  1793865120  /tmp/ntpd.log  /usr/local/bin/eclipse-ntpd  -  -  -
+//! ublk  respawn  running  231  2  1793865101  /tmp/ublk.log  /usr/local/bin/eclipse-ublk  virtio-blk@1  1793865100  hung: served disk
 //! ```
 //!
 //! `state` is `running`, `waiting` (a restart is due after its backoff),
@@ -17,8 +17,12 @@
 //! wall-clock second the current run began) are `-` when there is none;
 //! `starts` counts the starts of this boot. `udriver` is the device a
 //! driver service drives (its `udriver =` key, as the kernel command line
-//! names it), `-` for any other service. A reader that knows only the first
-//! eight columns reads the file as before.
+//! names it), `-` for any other service. `died` (the wall-clock second)
+//! and `cause` say how its last run this boot ended: `exit N`, `signal N`,
+//! or `hung: WHAT` for a server the kernel killed because it stopped
+//! answering (`/proc/hung` names it, [`hung_of`]); `-` for one that has not
+//! died. A reader that knows only the first eight columns reads the file as
+//! before.
 //!
 //! **Requests.** A file `/run/eclipse-init/ctl/<verb>.<name>`, then SIGHUP to
 //! PID 1. `verb` is `start`, `stop` or `restart`; only `respawn` services take
@@ -103,7 +107,9 @@ pub(crate) fn render_state(
     now: Instant,
     wall: u64,
 ) -> String {
-    let mut s = String::from("# name\tkind\tstate\tpid\tstarts\tstarted\tlog\texec\tudriver\n");
+    let mut s = String::from(
+        "# name\tkind\tstate\tpid\tstarts\tstarted\tlog\texec\tudriver\tdied\tcause\n",
+    );
     for svc in services.values() {
         let kind = match svc.kind {
             Kind::Oneshot => "oneshot",
@@ -116,8 +122,12 @@ pub(crate) fn render_state(
                 .to_string(),
             _ => "-".into(),
         };
+        let (died, cause) = match &svc.last_death {
+            Some((at, cause)) => (at.to_string(), field(cause)),
+            None => ("-".into(), "-".into()),
+        };
         s += &format!(
-            "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\n",
+            "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\n",
             field(&svc.name),
             kind,
             state_of(svc, now),
@@ -127,6 +137,8 @@ pub(crate) fn render_state(
             field(svc.log.as_deref().unwrap_or("")),
             field(&svc.exec.join(" ")),
             field(svc.udriver.as_deref().unwrap_or("")),
+            died,
+            cause,
         );
     }
     s
@@ -147,6 +159,57 @@ pub(crate) fn write_state(services: &BTreeMap<String, Service>) {
     let tmp = format!("{STATE_FILE}.tmp");
     if fs::write(&tmp, text).is_ok() {
         let _ = fs::rename(&tmp, STATE_FILE);
+    }
+}
+
+/// The kernel's list of the servers it killed for hanging: one line a kill,
+/// `pid`, milliseconds since boot, and what it served, tab-separated.
+pub(crate) const HUNG_FILE: &str = "/proc/hung";
+
+/// What `/proc/hung`'s `text` says the kernel killed `pid` for, if it
+/// killed it at `since_ms` (milliseconds since boot) or later: a pid of an
+/// earlier run, killed and given again since, is not this one.
+pub(crate) fn hung_serving(text: &str, pid: i32, since_ms: u64) -> Option<String> {
+    text.lines().rev().find_map(|l| {
+        let mut f = l.splitn(3, '\t');
+        let (p, at, what) = (f.next()?, f.next()?, f.next()?);
+        (p.parse::<i32>().ok()? == pid && at.parse::<u64>().ok()? >= since_ms)
+            .then(|| what.trim().to_string())
+    })
+}
+
+/// [`hung_serving`] for a child killed by `SIGKILL` that started at
+/// `started` (by init's clock, which is the kernel's monotonic one).
+pub(crate) fn hung_of(pid: i32, started: Option<Instant>) -> Option<String> {
+    let text = fs::read_to_string(HUNG_FILE).ok()?;
+    let mut ts = libc::timespec {
+        tv_sec: 0,
+        tv_nsec: 0,
+    };
+    // SAFETY: a valid out-pointer.
+    unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut ts) };
+    let now_ms = ts.tv_sec as u64 * 1000 + ts.tv_nsec as u64 / 1_000_000;
+    let ran_ms = started.map_or(u64::MAX, |t| t.elapsed().as_millis() as u64);
+    // A second of slack for the two clocks' reading.
+    hung_serving(
+        &text,
+        pid,
+        now_ms.saturating_sub(ran_ms).saturating_sub(1000),
+    )
+}
+
+/// How a run that ended with `status` ended, for the state file's `cause`:
+/// `hung: WHAT` when the kernel killed it for hanging (`hung`).
+pub(crate) fn death_cause(status: i32, hung: Option<&str>) -> String {
+    if libc::WIFEXITED(status) {
+        format!("exit {}", libc::WEXITSTATUS(status))
+    } else if libc::WIFSIGNALED(status) {
+        match hung {
+            Some(what) if libc::WTERMSIG(status) == libc::SIGKILL => format!("hung: {what}"),
+            _ => format!("signal {}", libc::WTERMSIG(status)),
+        }
+    } else {
+        format!("status {status:#x}")
     }
 }
 
@@ -332,6 +395,7 @@ mod tests {
         map.insert("ntpd".to_string(), a);
         let mut b = respawn("portal");
         b.restart_at = Some(now + Duration::from_secs(4));
+        b.last_death = Some((999_990, "hung: served disk".into()));
         map.insert("portal".to_string(), b);
         let text = render_state(&map, now, 1_000_000);
         let lines: Vec<Vec<&str>> = text
@@ -350,11 +414,28 @@ mod tests {
                 "999970",
                 "/tmp/x.log",
                 "/bin/foo",
-                "virtio-net@0"
+                "virtio-net@0",
+                "-",
+                "-"
             ]
         );
         assert_eq!(&lines[1][..4], &["portal", "respawn", "waiting", "-"]);
         assert_eq!(lines[1][8], "-");
+        assert_eq!(&lines[1][9..], &["999990", "hung: served disk"]);
         assert!(text.starts_with('#'));
+    }
+
+    #[test]
+    fn a_kill_for_hanging_is_told_from_a_kill_9_by_the_kernels_list() {
+        let text = "40\t1000\tserved disk\n41\t5000\t/dev/dsp\n41\t9000\t/dev/dsp1\n";
+        assert_eq!(hung_serving(text, 41, 6000).as_deref(), Some("/dev/dsp1"));
+        // An earlier run's kill under the same pid is not this run's.
+        assert_eq!(hung_serving(text, 40, 2000), None);
+        assert_eq!(hung_serving(text, 42, 0), None);
+        let killed = 9; // WIFSIGNALED, SIGKILL
+        assert_eq!(death_cause(killed, Some("/dev/dsp")), "hung: /dev/dsp");
+        assert_eq!(death_cause(killed, None), "signal 9");
+        assert_eq!(death_cause(15, Some("x")), "signal 15");
+        assert_eq!(death_cause(1 << 8, None), "exit 1");
     }
 }

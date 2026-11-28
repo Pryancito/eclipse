@@ -116,8 +116,7 @@ fn serve(proc: &Arc<Process>, args: &[usize; 6]) -> Result<u32, ZxError> {
     fs.server_killed_with(
         turn,
         alloc::boxed::Box::new(move || {
-            let kill = linux_object::signal::Signal::SIGKILL;
-            if let Err(e) = linux_object::process::send_signal_to_process(pid, kill) {
+            if let Err(e) = linux_object::process::kill_hung(pid, "served file system") {
                 warn!("served fs: the hung server {pid} was not killed: {e:?}");
             }
         }),

@@ -1303,8 +1303,7 @@ pub(super) fn block_serve(proc: &Arc<Process>, args: &[usize; 6]) -> ZxResult {
     let link = Arc::new(Link::new(fifo.clone(), window, args[2] as u64)?);
     let pid = proc.id() as usize;
     link.killed_with(Box::new(move || {
-        let kill = linux_object::signal::Signal::SIGKILL;
-        if let Err(e) = linux_object::process::send_signal_to_process(pid, kill) {
+        if let Err(e) = linux_object::process::kill_hung(pid, "served disk") {
             warn!("served disk: the hung driver {pid} was not killed: {e:?}");
         }
     }));

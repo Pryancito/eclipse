@@ -1084,20 +1084,22 @@ fn draw_svcs(cv: &mut Canvas, w: i32, h: i32, m: &Mon) {
             .map(|r| format!("{} · {}", pct(r.cpu, m.lang), sysmon::fmt_kib(r.mem_kib, m.lang)))
             .unwrap_or("—".into());
         let kind = if s.kind == "respawn" { m.lang.s(Key::mon_respawn_restarted_when_it_ends) } else { m.lang.s(Key::mon_once_at_boot) };
-        for (k, (a, b)) in [
+        let death = sysmon::last_death(s.died, s.cause.as_deref(), m.now_wall, m.lang);
+        let mut lines = vec![
             (m.lang.s(Key::mon_runs), s.exec.as_str()),
             (m.lang.s(Key::mon_kind_2), kind),
             (m.lang.s(Key::mon_log), s.log.as_deref().unwrap_or("—")),
             (m.lang.s(Key::mon_cpu_memory), proc_cost.as_str()),
-        ]
-        .iter()
-        .enumerate()
-        {
+        ];
+        if let Some(d) = &death {
+            lines.push((m.lang.s(Key::mon_last_death), d.as_str()));
+        }
+        for (k, (a, b)) in lines.iter().enumerate() {
             let ly = y + (k as i32 + 1) * line + 4;
             cv.text(a, dx, ly, ink().muted);
             cv.text(&fit(b, dw - lab), dx + lab, ly, ink().text);
         }
-        let ly = y + 5 * line + 12;
+        let ly = y + (lines.len() as i32 + 1) * line + 12;
         cv.text(m.lang.s(Key::mon_last_lines_of_the_log), dx, ly, ink().muted);
         cv.hline(dx, ly + GLYPH_H + 4, dw, ink().hairline, 1.0);
         let lb = (dx, ly + GLYPH_H + 12, dw, h - FOOT_H - PAD - (ly + GLYPH_H + 12));
@@ -1242,6 +1244,9 @@ fn draw_servers(cv: &mut Canvas, w: i32, h: i32, m: &Mon) {
         lines.push((m.lang.s(Key::mon_restarts_by_init), s.init_restarts.to_string()));
         if matches!(s.gives, Gives::Stack(..)) {
             lines.push((m.lang.s(Key::mon_restarts_by_stack), s.driver_restarts.to_string()));
+        }
+        if let Some(d) = sysmon::last_death(s.died, s.cause.as_deref(), m.now_wall, m.lang) {
+            lines.push((m.lang.s(Key::mon_last_death), d));
         }
         for (k, (a, b)) in lines.iter().enumerate() {
             let ly = y + (k as i32 + 1) * line + 4;
