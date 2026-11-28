@@ -61,6 +61,14 @@ pub const FRAGMENT: usize = 4096;
 /// How long a stream with nothing to play keeps running.
 pub const IDLE_NS: u64 = 2_000_000_000;
 
+/// Whether `cmd` sets the open up ([`crate::served::Device::keeps`]).
+pub fn keeps(cmd: u32) -> bool {
+    matches!(
+        cmd,
+        SNDCTL_DSP_SPEED | SNDCTL_DSP_SETFMT | SNDCTL_DSP_CHANNELS | SNDCTL_DSP_STEREO
+    )
+}
+
 /// The node's own state: the open that plays, and how it said to.
 pub struct Dsp {
     open: Option<u32>,
@@ -354,6 +362,12 @@ impl<O: Output> Device for DspNode<'_, O> {
         let r = self.dsp.control(self.stream, cmd, data);
         self.dsp.tell(self.stream, Some(node));
         r
+    }
+
+    /// The open's setup: its rate, format and channels, which the next
+    /// driver is told again should this one die.
+    fn keeps(&self, cmd: u32) -> bool {
+        keeps(cmd)
     }
 }
 
