@@ -81,6 +81,29 @@ pub fn walk(
     path
 }
 
+/// Whether the leaf of each sample keeps its instruction address instead of
+/// being folded to the start of its function (`KTOPADDR=1` on the kernel
+/// command line).
+///
+/// A function that the compiler built by inlining a dozen others -- an async
+/// body such as `handle_user_trap::{closure#0}` -- shows up as one row that
+/// says nothing about which of them the time is in. With the address, SELF
+/// lists `function+offset` rows, and `addr2line -f -i -e zcore <address>`
+/// where the kernel was built names the inlined chain. The callers are still
+/// folded, so the TOTAL and PATHS views read as before.
+///
+/// One thing the address makes plain: the sample is taken by the tick, and a
+/// tick that comes due while interrupts are off is taken at the `sti` that
+/// turns them back on. A row right after an `sti` is the whole stretch that
+/// ran with interrupts off before it, not that one instruction.
+static LEAF_ADDRESSES: core::sync::atomic::AtomicBool = core::sync::atomic::AtomicBool::new(false);
+
+/// Keep instruction addresses for the leaf of every sample from now on; see
+/// [`LEAF_ADDRESSES`].
+pub fn set_leaf_addresses(on: bool) {
+    LEAF_ADDRESSES.store(on, Relaxed);
+}
+
 /// Fold every address of `path` to the start of its function.
 ///
 /// A return address points just *after* its `call`, which for a call that is
@@ -274,7 +297,11 @@ pub fn note_kernel_tick(rip: u64, rbp: u64) {
     // kernel address on a present page.
     let read = |a: u64| unsafe { core::ptr::read_volatile(a as *const u64) };
     let path = walk(rip, rbp, readable, read, crate::kaddr::is_kernel_text);
-    let path = fold(&path, |a| crate::ksyms::lookup(a).map(|(_, off)| a - off));
+    let leaf = path[0];
+    let mut path = fold(&path, |a| crate::ksyms::lookup(a).map(|(_, off)| a - off));
+    if LEAF_ADDRESSES.load(Relaxed) {
+        path[0] = leaf;
+    }
     match PROFILE.try_lock() {
         Some(mut p) => p.add(path),
         None => {

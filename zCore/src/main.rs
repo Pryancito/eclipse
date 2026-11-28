@@ -595,6 +595,11 @@ fn primary_main(config: kernel_hal::KernelConfig) {
         // NOT a switch to set on real hardware that declines to advertise an
         // invariant TSC, because there the counter may genuinely drift between
         // sockets and userspace has no way to notice.
+        // `KTOPADDR=1`: `/proc/perf/ktop` keeps the instruction address of
+        // each sample's leaf, for `addr2line -i` (see `ktop::set_leaf_addresses`).
+        if kernel_hal::cmdline::flag(&options.cmdline, "KTOPADDR") {
+            kernel_hal::ktop::set_leaf_addresses(true);
+        }
         if kernel_hal::cmdline::flag(&options.cmdline, "VDSOFORCE") {
             kernel_hal::timer::set_force_tsc_invariant(true);
             klog_info!("Eclipse: vDSO forced on despite CPUID (VDSOFORCE=1)");
