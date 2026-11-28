@@ -379,6 +379,10 @@ pub const OP_LISTEN6: u32 = 20;
 pub const OP_ICMP6: u32 = 21;
 pub const OP_HEAR6: u32 = 22;
 pub const OP_LISTEN6ONLY: u32 = 23;
+/// `PING` (kernel to stack, then the same back): the kernel's watch asks it
+/// of a stack that has said nothing for a while, to tell a quiet stack from
+/// a hung one ([`Serving::ping`]).
+pub const OP_PING: u32 = 41;
 
 /// The socket of a `DATA` record that is an IPv4 packet of ICMP, or of a
 /// `DATA6` record that is an IPv6 packet of ICMPv6, for whichever sockets
@@ -1790,6 +1794,11 @@ impl Serving {
         &self.channel
     }
 
+    /// Its turn: what [`StackLink::give_up_redials`] is told.
+    pub fn turn(&self) -> u64 {
+        self.turn
+    }
+
     /// Whether the process is gone.
     pub fn is_over(&self) -> bool {
         !self.link.serves(self.turn)
@@ -1799,6 +1808,16 @@ impl Serving {
     /// socket.
     pub fn pump(&self) {
         self.link.pump_on(&self.channel, self.turn);
+    }
+
+    /// Ask the stack for a `PING` back, past any backlog: what a stack that
+    /// still reads its channel answers at once. Whether it was sent.
+    pub fn ping(&self) -> bool {
+        let msg = MessagePacket {
+            data: header(OP_PING, 0, 0),
+            handles: Vec::new(),
+        };
+        self.channel.write(msg).is_ok()
     }
 }
 
@@ -2062,6 +2081,17 @@ impl StackLink {
                 let _ = self.tell(stream.listen_message(sock, port), true);
             }
         }
+        // The connections the last stack died while making: this one is
+        // asked to make them.
+        let stranded: Vec<Arc<tcp::Stream>> = {
+            let table = self.table.lock();
+            table.streams.values().filter_map(Weak::upgrade).collect()
+        };
+        for stream in stranded {
+            if let Some(connect) = stream.redial_now() {
+                let _ = self.tell(connect, true);
+            }
+        }
         for group in self.groups() {
             let _ = self.tell(join_message(group.0), true);
         }
@@ -2079,6 +2109,22 @@ impl StackLink {
             channel,
             turn,
         })
+    }
+
+    /// The stack of turn `turn` died and no other came after it: the
+    /// connections it died while making fail now (`ENETDOWN`). What its
+    /// task calls once the wait for the next stack is over.
+    pub fn give_up_redials(&self, turn: u64) {
+        if !self.is_down() || self.turns.load(Ordering::Acquire) != turn {
+            return;
+        }
+        let streams: Vec<Arc<tcp::Stream>> = {
+            let table = self.table.lock();
+            table.streams.values().filter_map(Weak::upgrade).collect()
+        };
+        for stream in streams {
+            stream.give_up_redial();
+        }
     }
 
     /// Whether no stack serves now: what leaves the machine has nowhere
@@ -2154,6 +2200,8 @@ impl StackLink {
 
     fn take(&self, m: &[u8]) {
         match parse_header(m) {
+            // What the watch hears is any message: this one says no more.
+            Some((OP_PING, _)) => {}
             Some((OP_DATA, _)) => self.take_datagrams(&m[HEADER_LEN..]),
             Some((OP_DATA6, _)) => self.take_datagrams6(&m[HEADER_LEN..]),
             Some((OP_EVENTS, _)) => self.take_events(&m[HEADER_LEN..]),

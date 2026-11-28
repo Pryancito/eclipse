@@ -102,6 +102,13 @@ struct Inner {
     /// The connections that arrived and nobody accepted yet.
     waiting: VecDeque<(u64, Arc<Stream>)>,
     patience: Patience,
+    /// The `CONNECT` the stack was sent, while it is `Connecting` through
+    /// the stack: what the next stack is told when this one dies first.
+    redial: Option<Vec<u8>>,
+    /// The stack died while the connection was being made: it waits for
+    /// the next, which is told `redial` ([`Stream::redial_now`]), or is
+    /// given up when none comes ([`Stream::give_up_redial`]).
+    stranded: bool,
 }
 
 impl Inner {
@@ -131,6 +138,8 @@ impl Inner {
             write_closed: false,
             waiting: VecDeque::new(),
             patience: Patience::default(),
+            redial: None,
+            stranded: false,
         }
     }
 
@@ -295,9 +304,18 @@ impl Stream {
     /// waits on it is woken to find out; a connection between two
     /// programs of this machine, a listener and a socket that is neither
     /// yet were never the stack's to lose.
+    ///
+    /// A connection being made is not over: it waits for the next stack,
+    /// which is asked to make it, as a program's `connect` would wait for a
+    /// SYN that got no answer. Only when no stack comes in time does it
+    /// fail ([`give_up_redial`](Self::give_up_redial)).
     pub(super) fn lose(&self) {
         let mut inner = self.inner.lock();
         if inner.local.is_some() {
+            return;
+        }
+        if inner.phase == Phase::Connecting && inner.redial.is_some() {
+            inner.stranded = true;
             return;
         }
         match inner.phase {
@@ -311,6 +329,36 @@ impl Stream {
         inner.credit = 0;
         inner.error = Some(LxError::ENETDOWN);
         self.sync(&inner, Event::READABLE | Event::WRITABLE | Event::ERROR);
+    }
+
+    /// The `CONNECT` to tell a stack that starts to serve, for a
+    /// connection the last one died while making ([`lose`](Self::lose)).
+    pub(super) fn redial_now(&self) -> Option<Vec<u8>> {
+        let mut inner = self.inner.lock();
+        if !inner.stranded || inner.phase != Phase::Connecting {
+            inner.stranded = false;
+            return None;
+        }
+        inner.stranded = false;
+        inner.redial.clone()
+    }
+
+    /// No stack came for a connection the last one died while making: it
+    /// fails as it would have at once (`ENETDOWN`), for who waits on it too.
+    pub(super) fn give_up_redial(&self) {
+        let mut inner = self.inner.lock();
+        if !inner.stranded {
+            return;
+        }
+        inner.stranded = false;
+        inner.redial = None;
+        if inner.phase == Phase::Connecting {
+            inner.phase = Phase::Fresh;
+            inner.remote = None;
+            inner.credit = 0;
+            inner.error = Some(LxError::ENETDOWN);
+            self.sync(&inner, Event::READABLE | Event::WRITABLE | Event::ERROR);
+        }
     }
 
     /// Whether it listens for what the card hears, and not only for the
@@ -440,6 +488,7 @@ impl StackLink {
             match (what, inner.phase) {
                 (EV_CONNECTED, Phase::Connecting) => {
                     inner.phase = Phase::Open;
+                    inner.redial = None;
                     inner.credit = (number as usize).min(CREDIT_MAX);
                     inner.error = None;
                     // Of IPv6, from which of the card's addresses.
@@ -448,6 +497,7 @@ impl StackLink {
                     stream.sync(&inner, Event::WRITABLE);
                 }
                 (EV_FAILED, Phase::Connecting | Phase::Open) => {
+                    inner.redial = None;
                     if inner.phase == Phase::Connecting {
                         inner.phase = Phase::Fresh;
                         inner.remote = None;
@@ -1104,6 +1154,9 @@ impl Socket for ServedTcpSocket {
                 Some(IpAddress::Ipv6(from)) => connect.extend_from_slice(&from.0),
                 _ => {}
             }
+            // Kept for the next stack, should this one die before it
+            // answers.
+            self.stream.inner.lock().redial = Some(connect.clone());
             // No stack, no way out of the machine: `ENETDOWN`, here and
             // not once more on what the socket does next.
             if let Err(e) = self.link.tell(connect, true) {
@@ -1111,6 +1164,7 @@ impl Socket for ServedTcpSocket {
                 inner.phase = Phase::Fresh;
                 inner.remote = None;
                 inner.error = None;
+                inner.redial = None;
                 self.stream.sync(&inner, Event::empty());
                 return Err(e);
             }
@@ -3327,6 +3381,41 @@ mod tests {
     }
 
     #[test]
+    fn a_connection_being_made_when_the_stack_dies_is_made_by_the_next() {
+        let _lock = LOCK.lock();
+        let stack = stack();
+        let s = stream(&stack);
+        assert_eq!(connect(&s, at(HOST, 80)), Err(LxError::EINPROGRESS));
+        let first = stack.told().unwrap();
+        let (op, sock) = parse_header(&first).unwrap();
+        assert_eq!(op, OP_CONNECT);
+        let Stack { link, end } = stack;
+        drop(end);
+        link.pump();
+        assert!(link.is_down());
+        // Still under way: nobody was told of the death.
+        let now = status(&s);
+        assert!(!now.write && !now.error);
+        // The next stack is asked for the same connection, the same
+        // bytes, and its answer is the socket's.
+        let next = stack_of(&link);
+        let mut again = None;
+        while let Some(m) = next.told() {
+            if parse_header(&m).map(|(op, _)| op) == Some(OP_CONNECT) {
+                again = Some(m);
+            }
+        }
+        assert_eq!(again.as_deref(), Some(&first[..]));
+        events(&next, &[(sock, EV_CONNECTED, 100, &[])]);
+        assert!(status(&s).write);
+        assert!(!status(&s).error);
+        assert_eq!(Socket::write(&s, b"x", None), Ok(1));
+        // And the give-up of the first stack's wait does nothing to it.
+        link.give_up_redials(link.turns.load(Ordering::Acquire) - 1);
+        assert!(!status(&s).error);
+    }
+
+    #[test]
     fn a_stack_that_dies_takes_its_connections_and_leaves_the_rest() {
         let _lock = LOCK.lock();
         let stack = stack();
@@ -3387,8 +3476,12 @@ mod tests {
         assert_eq!(read(&open, &mut buf), Ok(0));
         assert_eq!(Socket::write(&open, b"x", None), Err(LxError::EPIPE));
         assert_eq!(Socket::write(&*came, b"x", None), Err(LxError::ENETDOWN));
-        // One being made is not made, and the socket can try again:
+        // One being made waits for the next stack, unnoticed; when none
+        // comes in time it is not made, and the socket can try again:
         // which, with no stack, is refused there and then.
+        let now = status(&connecting);
+        assert!(!now.write && !now.error);
+        link.give_up_redials(link.turns.load(Ordering::Acquire));
         let now = status(&connecting);
         assert!(now.write && now.error);
         assert_eq!(

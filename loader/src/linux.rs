@@ -711,13 +711,76 @@ fn netstack_serve(proc: &Arc<Process>, args: &[usize; 6]) -> ZxResult {
     // The stack's interrupt, in effect: sleep on the channel and put what
     // arrives on its sockets, which wake whoever reads them. Until this
     // process is gone: the next one's channel has its own task.
+    //
+    // And its watch: once a second, whether the stack still reads what it
+    // is sent. A stack that has said nothing for [`STACK_PING_AFTER_MS`] is
+    // sent a `PING`, which a live one answers at once; one that leaves it,
+    // or anything else, unanswered for [`STACK_HUNG_AFTER_MS`] is hung
+    // (frozen, deadlocked): it is killed, init starts the next, and the
+    // sockets wait for it as when a stack dies. Not what is unread alone: a
+    // stack frozen in its read takes the one message it was reading.
+    let pid = proc.id() as usize;
     kernel_hal::thread::spawn(async move {
+        use core::future::Future;
+        use core::task::Poll;
         let wire: Arc<dyn KernelObject> = serving.channel().clone();
+        let mut quiet = block_serve::Quiet::new(STACK_HUNG_AFTER_MS);
+        let mut heard: u32 = 0;
+        // What the last tick had heard, since when, and whether a `PING`
+        // has gone since.
+        let (mut seen, mut since, mut pinged) = (0u32, block_serve::now_ms(), false);
+        let mut killed = false;
+        // One timer at a time, made again only when it has gone off: not
+        // one for every wake of the channel, which is every burst of frames.
+        let tick = || {
+            kernel_hal::thread::sleep_until(kernel_hal::timer::timer_now() + STACK_WATCH_EVERY)
+        };
+        let mut timer = alloc::boxed::Box::pin(tick());
         while !serving.is_over() {
-            wire.wait_signal(Signal::READABLE | Signal::PEER_CLOSED)
-                .await;
-            serving.pump();
+            let mut said = core::pin::pin!(wire.wait_signal(Signal::READABLE | Signal::PEER_CLOSED));
+            let woke = core::future::poll_fn(|cx| {
+                if said.as_mut().poll(cx).is_ready() {
+                    Poll::Ready(true)
+                } else if timer.as_mut().poll(cx).is_ready() {
+                    Poll::Ready(false)
+                } else {
+                    Poll::Pending
+                }
+            })
+            .await;
+            if woke {
+                heard = heard.wrapping_add(1);
+                serving.pump();
+                continue;
+            }
+            timer = alloc::boxed::Box::pin(tick());
+            let now = block_serve::now_ms();
+            if heard != seen {
+                (seen, since, pinged) = (heard, now, false);
+            } else if !pinged && now >= since + STACK_PING_AFTER_MS {
+                pinged = serving.ping();
+            }
+            let waiting = pinged || serving.channel().peer_pending() > 0;
+            if !killed && quiet.look(now, waiting, heard) {
+                warn!(
+                    "network stack: process {pid} has read nothing it was sent for {} s: \
+                     it is killed, and its sockets wait for the next",
+                    STACK_HUNG_AFTER_MS / 1000
+                );
+                let kill = linux_object::signal::Signal::SIGKILL;
+                if let Err(e) = linux_object::process::send_signal_to_process(pid, kill) {
+                    warn!("network stack: the hung process {pid} was not killed: {e:?}");
+                }
+                killed = true;
+            }
         }
+        // A connection it died while making waits for the next stack, as
+        // long as the disks wait for their next driver; then it fails.
+        let (link, turn) = (serving.link().clone(), serving.turn());
+        kernel_hal::thread::spawn(async move {
+            kernel_hal::thread::sleep_until(kernel_hal::timer::timer_now() + STACK_GRACE).await;
+            link.give_up_redials(turn);
+        });
         // No stack, no card: the next one says its own.
         if let Some(card) = card {
             let gone = kernel_hal::drivers::prelude::Device::Net(card);
@@ -728,6 +791,28 @@ fn netstack_serve(proc: &Arc<Process>, args: &[usize; 6]) -> ZxResult {
     });
     Ok(())
 }
+
+/// How long the network stack's process may leave what it was sent unread,
+/// saying nothing, before it is taken for hung and killed. A stack reads its
+/// channel in the loop that does everything else, so a live one, however
+/// busy, reads within milliseconds; ten seconds is what a served device node
+/// gives its server too.
+#[cfg(feature = "zircon-gateway")]
+const STACK_HUNG_AFTER_MS: u64 = 10_000;
+
+/// How long a stack may say nothing before the watch asks it for a `PING`:
+/// one small message for each such while on an idle machine, none on a busy
+/// one, whose stack is heard from all the time.
+const STACK_PING_AFTER_MS: u64 = 5_000;
+
+/// How long a connection the stack died while making waits for the next
+/// stack: longer than init's longest pause between two starts (8 s).
+#[cfg(feature = "zircon-gateway")]
+const STACK_GRACE: core::time::Duration = core::time::Duration::from_secs(10);
+
+/// How often the stack's watch looks.
+#[cfg(feature = "zircon-gateway")]
+const STACK_WATCH_EVERY: core::time::Duration = core::time::Duration::from_secs(1);
 
 /// The name the stack's card is shown under: the first stack's, kept for
 /// the ones after it, so a stack that starts again is the same `ethN`.

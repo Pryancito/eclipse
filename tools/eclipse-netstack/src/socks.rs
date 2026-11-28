@@ -133,6 +133,10 @@ pub const OP_DATA6: u32 = 18;
 pub const OP_TAP: u32 = 26;
 pub const OP_FRAME: u32 = 27;
 pub const OP_FRAMES: u32 = 28;
+/// `PING` (kernel to stack, then the same back): asked by the kernel's
+/// watch of a stack that has said nothing for a while, to tell a quiet one
+/// from a hung one (frozen, deadlocked), which it kills.
+pub const OP_PING: u32 = 41;
 
 /// The socket of a `DATA` record that is an IPv4 packet of ICMP, or of a
 /// `DATA6` record that is an IPv6 packet of ICMPv6, for whichever sockets
