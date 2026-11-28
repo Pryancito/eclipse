@@ -83,7 +83,7 @@ pub fn caps(id: usize) -> Option<Caps> {
 
 /// The `N` of `eventN` for a node at `name` with device number `rdev`, when
 /// it is an evdev node.
-fn event_id(name: &str, rdev: usize) -> Option<usize> {
+pub(super) fn event_id(name: &str, rdev: usize) -> Option<usize> {
     let n: usize = name.strip_prefix("input/event")?.parse().ok()?;
     let (major, minor) = ((rdev >> 8) & 0xfff, rdev & 0xff);
     (major == EVDEV_MAJOR && minor == EVENT_MINOR_BASE + n).then_some(n)

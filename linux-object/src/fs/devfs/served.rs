@@ -48,7 +48,9 @@ use alloc::vec::Vec;
 use core::any::Any;
 use core::future::Future;
 use core::pin::Pin;
+use core::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 
+use kernel_hal::thread::SyncWait;
 use lock::Mutex;
 use rcore_fs::vfs::{FileType, FsError, INode, Metadata, PollStatus, Result, Timespec};
 use zircon_object::ipc::Fifo;
@@ -84,16 +86,34 @@ pub struct ServedNode(Arc<Core>);
 /// server may map. The loader gives it, knowing the server's process.
 pub type VmoOf = alloc::boxed::Box<dyn Fn(u64) -> Option<(Arc<VmObject>, bool)> + Send + Sync>;
 
+/// How long a node whose server died waits for the next one, with what
+/// is open of it, before it goes ([`Core::keeps`]): as long as a served
+/// disk or mount waits, longer than init's longest pause between two
+/// starts of a service that keeps dying (8 s).
+const SERVER_GRACE_MS: u64 = 10_000;
+
 /// What the node and its opens share.
 struct Core {
-    link: Arc<Link>,
+    /// The link to the server of the moment.
+    link: Mutex<Arc<Link>>,
+    /// Whether the node outlives its server: it stays in `/dev`, what is
+    /// open of it waits for the next server for [`SERVER_GRACE_MS`], and
+    /// the next server, serving the same name and number, takes it over
+    /// and is asked to open again each open of it. An evdev node only: an
+    /// open of one is a stream of events and nothing more, so another open
+    /// of the next server is the same open to its reader.
+    keeps: bool,
+    /// How many servers it has had: the turn each open's `fh` is of.
+    turn: AtomicU64,
+    /// While it waits for its next server: until when (`link::now_ms`).
+    until: AtomicU64,
     /// Its path under `/dev`.
     name: String,
     inode_id: usize,
     rdev: usize,
     mode: u32,
     /// The opens of it, by the server's name for each.
-    opens: Mutex<BTreeMap<u32, Weak<Mutex<EventBus>>>>,
+    opens: Mutex<BTreeMap<u32, Weak<Open>>>,
     /// Readiness said of opens not in `opens` yet.
     early: Mutex<Vec<(u32, u64)>>,
     /// The server's VMOs, for its answers to an `mmap`: none, and the node
@@ -174,7 +194,10 @@ fn events_of(mask: u64) -> Event {
 impl ServedNode {
     fn new(link: Arc<Link>, name: &str, rdev: usize, mode: u32) -> Arc<Self> {
         let node = Arc::new(Core {
-            link: link.clone(),
+            link: Mutex::new(link.clone()),
+            keeps: input::event_id(name, rdev).is_some(),
+            turn: AtomicU64::new(1),
+            until: AtomicU64::new(0),
             name: String::from(name),
             inode_id: rcore_fs_devfs::DevFS::new_inode_id(),
             rdev,
@@ -183,12 +206,7 @@ impl ServedNode {
             early: Mutex::new(Vec::new()),
             vmos: Mutex::new(None),
         });
-        let weak = Arc::downgrade(&node);
-        link.ready_to(alloc::boxed::Box::new(move |fh, mask| {
-            if let Some(node) = weak.upgrade() {
-                node.ready(fh, mask);
-            }
-        }));
+        node.hear(&link);
         Arc::new(ServedNode(node))
     }
 
@@ -207,17 +225,58 @@ impl ServedNode {
         self.0.server_left()
     }
 
+    /// The server is gone. A node that [`keeps`](Core::keeps) waits for the
+    /// next: its turn now, which [`ServedNode::taken_over_since`] is asked
+    /// about once the wait is over. `None` for one that does not wait, and
+    /// whose opens have hung up.
+    pub fn server_went(&self) -> Option<u64> {
+        let core = &self.0;
+        if !core.keeps {
+            core.server_left();
+            return None;
+        }
+        core.link().close();
+        core.until
+            .store(link::now_ms() + SERVER_GRACE_MS, Ordering::Release);
+        info!("served dev: /dev/{} waits for its next server", core.name);
+        Some(core.turn.load(Ordering::Acquire))
+    }
+
+    /// How long a node waits for its next server.
+    pub const GRACE_MS: u64 = SERVER_GRACE_MS;
+
+    /// Whether a next server took the node over since turn `turn`. When
+    /// none did, the wait is over: its opens hang up.
+    pub fn taken_over_since(&self, turn: u64) -> bool {
+        let core = &self.0;
+        if core.turn.load(Ordering::Acquire) != turn {
+            return true;
+        }
+        core.until.store(0, Ordering::Release);
+        core.server_left();
+        false
+    }
+
     /// Read whatever the server has written, while no request does: its
     /// readiness, or its going. Whether the server is still there.
     pub fn look(&self) -> bool {
-        self.0.link.pump();
-        !self.0.link.is_dead()
+        let link = self.0.link();
+        link.pump();
+        !link.is_dead()
+    }
+
+    /// The watch's look, once a second, at a server that may have frozen:
+    /// see [`Link::look_quiet`]. Only while something is open of the node:
+    /// a server nobody waits on is nobody's to find hung.
+    pub fn look_quiet(&self) {
+        let open = self.0.opens.lock().values().any(|o| o.strong_count() > 0);
+        self.0.link().look_quiet(link::now_ms(), open);
     }
 
     /// The process that serves the node (`server`, its id), and how it is
     /// ended when it hangs.
     pub fn killed_with(&self, server: u64, kill: alloc::boxed::Box<dyn Fn() + Send + Sync>) {
-        self.0.link.killed_with(server, kill);
+        self.0.link().killed_with(server, kill);
     }
 
     /// Where the VMOs the server answers an `mmap` with are found.
@@ -227,9 +286,123 @@ impl ServedNode {
 }
 
 impl Core {
+    /// The link to the server of the moment.
+    fn link(&self) -> Arc<Link> {
+        self.link.lock().clone()
+    }
+
+    /// Where the readiness `link`'s server says goes: to this node's opens.
+    fn hear(self: &Arc<Self>, link: &Link) {
+        let weak = Arc::downgrade(self);
+        link.ready_to(alloc::boxed::Box::new(move |fh, mask| {
+            if let Some(node) = weak.upgrade() {
+                node.ready(fh, mask);
+            }
+        }));
+    }
+
+    /// Whether a request that found the server gone waits for the next:
+    /// the node [`keeps`](Self::keeps), and its wait is not over.
+    fn waits(&self) -> bool {
+        self.keeps && link::now_ms() <= self.until.load(Ordering::Acquire)
+    }
+
+    /// Ask with `ask` on the link of the moment and the name the server has
+    /// for `open` there (none for a new open), and that server's turn. A request that finds the
+    /// server gone, on a node that waits for the next, is asked again of the
+    /// next once it has opened `open` again; one whose open it could not
+    /// open again is `Gone`.
+    fn asking<T>(
+        &self,
+        open: Option<&Open>,
+        mut ask: impl FnMut(&Arc<Link>, u32, u64) -> core::result::Result<T, Fail>,
+    ) -> core::result::Result<T, Fail> {
+        let mut away = SyncWait::new();
+        loop {
+            if open.is_some_and(|o| o.lost.load(Ordering::Acquire)) {
+                return Err(Fail::Gone);
+            }
+            // The two together: the turn changes with the link, under its lock.
+            let (link, turn) = {
+                let link = self.link.lock();
+                (link.clone(), self.turn.load(Ordering::Acquire))
+            };
+            // An open not opened again on this server yet has no name there.
+            let fh = match open {
+                Some(open) if open.turn.load(Ordering::Acquire) != turn => None,
+                Some(open) => Some(open.fh.load(Ordering::Acquire)),
+                None => Some(0),
+            };
+            if let Some(fh) = fh {
+                match ask(&link, fh, turn) {
+                    Err(Fail::Gone) if self.waits() => {}
+                    done => return done,
+                }
+            } else if !self.waits() {
+                return Err(Fail::Gone);
+            }
+            crate::fs::served::between_looks(&mut away);
+        }
+    }
+
+    /// The next server took the node over, on `link`: each open of it is
+    /// opened again there, and has the readiness the server says of it.
+    /// One the server will not open again hangs up. Not from the call that
+    /// serves the node: the server answers nothing until it is back.
+    fn take_over(self: &Arc<Self>, link: Arc<Link>) {
+        // What waits, waits until the opens are opened again.
+        self.until
+            .fetch_max(link::now_ms() + SERVER_GRACE_MS, Ordering::AcqRel);
+        self.hear(&link);
+        let opens: Vec<Arc<Open>> = {
+            let mut held = self.link.lock();
+            *held = link.clone();
+            // The names were the dead server's: the next one's may be the
+            // same numbers for other opens.
+            let opens = core::mem::take(&mut *self.opens.lock())
+                .into_values()
+                .filter_map(|o| o.upgrade())
+                .collect();
+            self.turn.fetch_add(1, Ordering::AcqRel);
+            opens
+        };
+        let turn = self.turn.load(Ordering::Acquire);
+        let core = self.clone();
+        kernel_hal::thread::spawn(async move {
+            for open in opens {
+                match link.call(OP_OPEN, 0, 0, open.flags as u64, 0, &[]) {
+                    Ok(answer) => {
+                        let (fh, mut mask) = (answer.fh, answer.a);
+                        drop(answer);
+                        core.opens.lock().insert(fh, Arc::downgrade(&open));
+                        if let Some(at) = core.early.lock().iter().position(|(f, _)| *f == fh) {
+                            mask = core.early.lock().remove(at).1;
+                        }
+                        open.fh.store(fh, Ordering::Release);
+                        open.turn.store(turn, Ordering::Release);
+                        open.bus.lock().change(READINESS, events_of(mask));
+                    }
+                    Err(_) => {
+                        open.lost.store(true, Ordering::Release);
+                        open.bus
+                            .lock()
+                            .change(READINESS, Event::ERROR | Event::CLOSED);
+                    }
+                }
+            }
+            core.until.store(0, Ordering::Release);
+            info!("served dev: /dev/{} has a server again", core.name);
+        });
+    }
+
     /// The server said open `fh` is now as `mask` says.
     fn ready(&self, fh: u32, mask: u64) {
-        let bus = self.opens.lock().get(&fh).and_then(Weak::upgrade);
+        let bus = self
+            .opens
+            .lock()
+            .get(&fh)
+            .and_then(Weak::upgrade)
+            .map(|open| open.bus.clone());
         match bus {
             Some(bus) => bus.lock().change(READINESS, events_of(mask)),
             None => {
@@ -244,17 +417,26 @@ impl Core {
     }
 
     fn open_client(self: &Arc<Self>, flags: usize) -> LxResult<Arc<dyn INode>> {
-        let answer = self
-            .link
-            .call(OP_OPEN, 0, 0, flags as u64, 0, &[])
+        let (answer, turn) = self
+            .asking(None, |link, _, turn| {
+                link.call(OP_OPEN, 0, 0, flags as u64, 0, &[])
+                    .map(|answer| (answer, turn))
+            })
             .map_err(lx_of)?;
         let (fh, mut mask) = (answer.fh, answer.a);
         drop(answer);
         let bus = EventBus::new();
+        let open = Arc::new(Open {
+            fh: AtomicU32::new(fh),
+            turn: AtomicU64::new(turn),
+            flags,
+            bus: bus.clone(),
+            lost: AtomicBool::new(false),
+        });
         {
             let mut opens = self.opens.lock();
-            opens.retain(|_, b| b.strong_count() > 0);
-            opens.insert(fh, Arc::downgrade(&bus));
+            opens.retain(|_, o| o.strong_count() > 0);
+            opens.insert(fh, Arc::downgrade(&open));
         }
         {
             let mut early = self.early.lock();
@@ -262,7 +444,7 @@ impl Core {
                 mask = early.remove(at).1;
             }
         }
-        let gone = self.link.is_dead();
+        let gone = self.link().is_dead() && !self.waits();
         bus.lock().change(
             READINESS,
             if gone {
@@ -273,21 +455,22 @@ impl Core {
         );
         Ok(Arc::new(ServedOpen {
             node: self.clone(),
-            fh,
-            bus,
+            open,
         }))
     }
 
     fn server_left(&self) {
-        self.link.close();
+        self.link().close();
         let opens: Vec<_> = self
             .opens
             .lock()
             .values()
             .filter_map(Weak::upgrade)
             .collect();
-        for bus in opens {
-            bus.lock().change(READINESS, Event::ERROR | Event::CLOSED);
+        for open in opens {
+            open.bus
+                .lock()
+                .change(READINESS, Event::ERROR | Event::CLOSED);
         }
     }
 
@@ -336,19 +519,39 @@ impl INode for ServedNode {
     }
 }
 
+/// What an open of a served node is to its node.
+struct Open {
+    /// The server's name for it, on the server of turn `turn`.
+    fh: AtomicU32,
+    turn: AtomicU64,
+    /// What it was opened with: what the next server is asked to open it
+    /// with again.
+    flags: usize,
+    /// Its readiness, as the server last said.
+    bus: Arc<Mutex<EventBus>>,
+    /// The next server would not open it again: it has hung up.
+    lost: AtomicBool,
+}
+
 /// One open of a served node.
 pub struct ServedOpen {
     node: Arc<Core>,
-    /// The server's name for it.
-    fh: u32,
-    /// Its readiness, as the server last said.
-    bus: Arc<Mutex<EventBus>>,
+    open: Arc<Open>,
 }
 
 impl ServedOpen {
     /// Where its readiness is: what a reader, `poll` or `epoll` waits on.
     pub fn bus(&self) -> Arc<Mutex<EventBus>> {
-        self.bus.clone()
+        self.open.bus.clone()
+    }
+
+    /// Ask the server of the moment with `ask`, given the link and its
+    /// name for this open: [`Core::asking`].
+    fn ask<T>(
+        &self,
+        ask: impl FnMut(&Arc<Link>, u32, u64) -> core::result::Result<T, Fail>,
+    ) -> core::result::Result<T, Fail> {
+        self.node.asking(Some(&self.open), ask)
     }
 
     /// `mmap(offset, len)` of this open, `shared` or not, with `write`
@@ -369,16 +572,7 @@ impl ServedOpen {
         let vmos = self.node.vmos.lock().clone().ok_or(LxError::ENODEV)?;
         let how = if shared { MMAP_SHARED } else { 0 } | if write { MMAP_WRITE } else { 0 };
         let answer = self
-            .node
-            .link
-            .call(
-                OP_MMAP,
-                self.fh,
-                how as usize,
-                offset as u64,
-                len as u64,
-                &[],
-            )
+            .ask(|link, fh, _| link.call(OP_MMAP, fh, how as usize, offset as u64, len as u64, &[]))
             .map_err(lx_of)?;
         let at = if answer.len >= 8 {
             let mut b = [0u8; 8];
@@ -427,12 +621,16 @@ impl ServedOpen {
         } else {
             Vec::new()
         };
-        let link = &self.node.link;
         // The caller's memory, which the server may reach while it answers
         // ([`asker_of`]): what NVIDIA's commands hold is pointers to more.
         let asker = current_vmar();
-        let mut answer = link
-            .call_for(asker.clone(), OP_IOCTL, self.fh, 0, a, arg as u64, &data)
+        // The rounds of one call go to the one server that answered its
+        // first.
+        let (link, fh, mut answer) = self
+            .ask(|link, fh, _| {
+                link.call_for(asker.clone(), OP_IOCTL, fh, 0, a, arg as u64, &data)
+                    .map(|answer| (link.clone(), fh, answer))
+            })
             .map_err(lx_of)?;
         if answer.a != wire::IOCTL_FETCH {
             if out > 0 {
@@ -461,7 +659,7 @@ impl ServedOpen {
                 req.extend_from_slice(&bytes);
             }
             answer = link
-                .call_for(asker.clone(), OP_IOCTL_IOV, self.fh, 0, a, arg as u64, &req)
+                .call_for(asker.clone(), OP_IOCTL_IOV, fh, 0, a, arg as u64, &req)
                 .map_err(lx_of)?;
             if answer.a == wire::IOCTL_FETCH {
                 continue;
@@ -503,9 +701,7 @@ impl ServedOpen {
     /// back (`_IOR`), into `out`. How many bytes it gave.
     pub fn ioctl_read(&self, cmd: u32, out: &mut [u8]) -> LxResult<usize> {
         let answer = self
-            .node
-            .link
-            .call(OP_IOCTL, self.fh, 0, cmd as u64, 0, &[])
+            .ask(|link, fh, _| link.call(OP_IOCTL, fh, 0, cmd as u64, 0, &[]))
             .map_err(lx_of)?;
         if answer.a == wire::IOCTL_FETCH {
             return Err(LxError::EIO);
@@ -525,12 +721,12 @@ impl ServedOpen {
         loop {
             // Read before the call: what the server says on its way to the
             // answer, or right after it, counts.
-            let seen = self.bus.lock().seq();
+            let seen = self.open.bus.lock().seq();
             match self.ioctl_as(cmd, arg, true) {
                 Err(LxError::EAGAIN) => {}
                 done => return done,
             }
-            let bus = self.bus.clone();
+            let bus = self.open.bus.clone();
             crate::process::interruptible(SaidSince {
                 bus,
                 seen,
@@ -543,8 +739,22 @@ impl ServedOpen {
 
 impl Drop for ServedOpen {
     fn drop(&mut self) {
-        self.node.opens.lock().remove(&self.fh);
-        self.node.link.tell(OP_RELEASE, self.fh);
+        let fh = self.open.fh.load(Ordering::Acquire);
+        {
+            // Only its own entry: an open not opened again on the next
+            // server has none, and its old name may be another's there.
+            let mut opens = self.node.opens.lock();
+            if opens
+                .get(&fh)
+                .is_some_and(|o| core::ptr::eq(o.as_ptr(), Arc::as_ptr(&self.open)))
+            {
+                opens.remove(&fh);
+            }
+        }
+        // Only the server it was opened on knows it.
+        if self.open.turn.load(Ordering::Acquire) == self.node.turn.load(Ordering::Acquire) {
+            self.node.link().tell(OP_RELEASE, fh);
+        }
     }
 }
 
@@ -552,9 +762,7 @@ impl INode for ServedOpen {
     fn read_at(&self, offset: usize, buf: &mut [u8]) -> Result<usize> {
         let room = buf.len().min(SLOT_LEN);
         let answer = self
-            .node
-            .link
-            .call(OP_READ, self.fh, room, offset as u64, 0, &[])
+            .ask(|link, fh, _| link.call(OP_READ, fh, room, offset as u64, 0, &[]))
             .map_err(fs_of)?;
         let n = answer.count.min(room);
         answer.data(&mut buf[..n]).map_err(fs_of)?;
@@ -564,16 +772,13 @@ impl INode for ServedOpen {
     fn write_at(&self, offset: usize, buf: &[u8]) -> Result<usize> {
         let mut done = 0;
         for chunk in buf.chunks(SLOT_LEN) {
-            let taken =
-                match self
-                    .node
-                    .link
-                    .call(OP_WRITE, self.fh, 0, (offset + done) as u64, 0, chunk)
-                {
-                    Ok(answer) => answer.count.min(chunk.len()),
-                    Err(fail) if done == 0 => return Err(fs_of(fail)),
-                    Err(_) => break,
-                };
+            let taken = match self
+                .ask(|link, fh, _| link.call(OP_WRITE, fh, 0, (offset + done) as u64, 0, chunk))
+            {
+                Ok(answer) => answer.count.min(chunk.len()),
+                Err(fail) if done == 0 => return Err(fs_of(fail)),
+                Err(_) => break,
+            };
             done += taken;
             if taken < chunk.len() {
                 break;
@@ -583,7 +788,7 @@ impl INode for ServedOpen {
     }
 
     fn poll(&self) -> Result<PollStatus> {
-        let events = self.bus.lock().events();
+        let events = self.open.bus.lock().events();
         Ok(PollStatus {
             read: events.contains(Event::READABLE),
             write: events.contains(Event::WRITABLE),
@@ -599,7 +804,7 @@ impl INode for ServedOpen {
     ) -> Pin<alloc::boxed::Box<dyn Future<Output = Result<PollStatus>> + Send + Sync + 'a>> {
         alloc::boxed::Box::pin(async move {
             let mask = Event::READABLE | Event::ERROR | Event::CLOSED;
-            crate::sync::wait_for_event(self.bus.clone(), mask)
+            crate::sync::wait_for_event(self.open.bus.clone(), mask)
                 .await
                 .map_err(|_| FsError::Interrupted)?;
             self.poll()
@@ -697,19 +902,38 @@ pub fn serve(
     }
     let koid = fifo.id();
     let link = Arc::new(Link::new(fifo, window).map_err(|_| LxError::EINVAL)?);
-    let node = ServedNode::new(
-        link.clone(),
-        name,
-        rcore_fs::vfs::make_rdev(major, minor),
-        mode,
-    );
+    let rdev = rcore_fs::vfs::make_rdev(major, minor);
     let root = crate::fs::DEVFS_ROOT.lock().clone();
     let root: Arc<dyn INode> = root.ok_or(LxError::ENODEV)?;
+    // The node of a server that died, waiting for the next: this one's, as
+    // it is, with what is open of it.
+    if let Some(core) = waiting_at(&root, name, rdev, mode) {
+        core.take_over(link.clone());
+        remember(koid, &link);
+        info!("served dev: /dev/{name} ({major}:{minor}) is taken over");
+        return Ok(Served {
+            node: Arc::new(ServedNode(core)),
+        });
+    }
+    let node = ServedNode::new(link.clone(), name, rdev, mode);
     add(&root, name, node.clone())?;
     remember(koid, &link);
     info!("served dev: /dev/{name} ({major}:{minor})");
     input::attach(&node);
     Ok(Served { node })
+}
+
+/// The node at `path` under `dir` when it is a served one with the device
+/// number `rdev` and permissions `mode` whose server died and that waits
+/// for the next ([`Core::keeps`]).
+fn waiting_at(dir: &Arc<dyn INode>, path: &str, rdev: usize, mode: u32) -> Option<Arc<Core>> {
+    let mut at = dir.clone();
+    for part in path.split('/') {
+        at = at.find(part).ok()?;
+    }
+    let core = &at.downcast_ref::<ServedNode>()?.0;
+    (core.keeps && core.rdev == rdev && core.mode == mode && core.link().is_dead() && core.waits())
+        .then(|| core.clone())
 }
 
 /// `node` at `path` under `dir`, with the directories on the way.
