@@ -2918,7 +2918,7 @@ mod poll_number_tests {
     use super::{PollEvents, PollStatus};
 
     /// Every bit the table carries, with the number `poll.h` gives it.
-    const EVERY_BIT: [(PollEvents, u16); 10] = [
+    const EVERY_BIT: [(PollEvents, u16); 11] = [
         (PollEvents::IN, 0x0001),
         (PollEvents::PRI, 0x0002),
         (PollEvents::OUT, 0x0004),
@@ -2929,6 +2929,7 @@ mod poll_number_tests {
         (PollEvents::RDBAND, 0x0080),
         (PollEvents::WRNORM, 0x0100),
         (PollEvents::WRBAND, 0x0200),
+        (PollEvents::RDHUP, 0x2000),
     ];
 
     fn status(read: bool, write: bool) -> PollStatus {
@@ -2967,8 +2968,8 @@ mod poll_number_tests {
             "a bit was added to PollEvents without a number of its own above"
         );
         assert_eq!(
-            named, 0x03ff,
-            "the ten bits of poll.h are not what is named"
+            named, 0x23ff,
+            "the ten bits of poll.h and POLLRDHUP are not what is named"
         );
     }
 
