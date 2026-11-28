@@ -1309,3 +1309,129 @@ fn a_mount_that_is_not_posix_is_files_and_directories_of_roots() {
     m.root().metadata().unwrap();
     assert_eq!(m.asked(OP_STAT), 0);
 }
+
+/// The open file whose lock [`serve_watching`] looks at while it answers,
+/// and how many of its answers found it held.
+static WATCHED: std::sync::Mutex<Option<Arc<crate::fs::File>>> = std::sync::Mutex::new(None);
+static ANSWERED_UNDER_THE_LOCK: AtomicUsize = AtomicUsize::new(0);
+
+/// [`serve`], noting each answer given while the watched file's lock is
+/// held: a request asked with it held.
+fn serve_watching(
+    tree: &mut Tree,
+    op: u32,
+    names: &str,
+    a: u64,
+    b: usize,
+    data: &[u8],
+) -> (i64, u64, Vec<u8>) {
+    if let Some(file) = WATCHED.lock().unwrap().as_ref() {
+        if !file.lock_is_free() {
+            ANSWERED_UNDER_THE_LOCK.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+    serve(tree, op, names, a, b, data)
+}
+
+impl Mount {
+    /// A mount of the usual tree whose server answers with `answers`.
+    fn answering(answers: Answers) -> Self {
+        let tree = Arc::new(std::sync::Mutex::new(tree()));
+        let asked = Arc::new([const { AtomicUsize::new(0) }; 16]);
+        let (link, server) = server_with(&tree, &asked, None, answers);
+        let fs = ServedFs::new(link, true, false);
+        fs.mounted.store(true, Ordering::Release);
+        Mount {
+            fs,
+            tree,
+            asked,
+            servers: vec![server],
+        }
+    }
+}
+
+/// The server is asked with the open file's lock let go. In the kernel the
+/// wait for its answer gives the CPU to other tasks, and one of them that
+/// wrote to the same open file spun on that lock under the wait that held
+/// it: `make -j4`, whose jobs all write to one `t.out`, stopped the machine.
+#[test]
+fn the_server_is_asked_with_the_open_files_lock_let_go() {
+    use crate::fs::{File, FileLike, OpenFlags};
+    let _registry = crate::fs::file::REGISTRY_TEST_LOCK.lock();
+    let mount = Mount::answering(serve_watching);
+    let root = mount.root();
+    let watch = |file: &Arc<File>| *WATCHED.lock().unwrap() = Some(file.clone());
+
+    let out = File::new(
+        root.find("big.bin").unwrap(),
+        OpenFlags::RDWR,
+        String::from("/mnt/big.bin"),
+    );
+    watch(&out);
+    assert_eq!(FileLike::write(&*out, b"one"), Ok(3));
+    assert_eq!(FileLike::write_at(&*out, 10, b"two"), Ok(3));
+    out.set_len(50).unwrap();
+    assert_eq!(
+        &mount.on_server("big.bin").unwrap()[..13],
+        b"one\x03\x04\x05\x06\x07\x08\x09two"
+    );
+    assert_eq!(mount.on_server("big.bin").unwrap().len(), 50);
+    // The offset is the file's still: the next write goes on from the last.
+    assert_eq!(FileLike::write(&*out, b"three"), Ok(5));
+    assert_eq!(&mount.on_server("big.bin").unwrap()[3..8], b"three");
+
+    let docs = File::new(
+        root.find("docs").unwrap(),
+        OpenFlags::RDONLY,
+        String::from("/mnt/docs"),
+    );
+    watch(&docs);
+    let mut names = Vec::new();
+    while let Ok((_, name)) = docs.read_entry_with_metadata() {
+        names.push(name);
+    }
+    assert_eq!(names.len(), 302);
+    *WATCHED.lock().unwrap() = None;
+
+    assert!(mount.asked(OP_WRITE) >= 3 && mount.asked(OP_LIST) >= 1);
+    assert_eq!(ANSWERED_UNDER_THE_LOCK.load(Ordering::SeqCst), 0);
+}
+
+/// Two writers of one open file, each `write(2)` with its turn as the
+/// syscall takes it: every byte lands, none over another's.
+#[test]
+fn two_writers_of_one_served_file_take_turns_and_lose_nothing() {
+    use crate::fs::{File, FileLike, OpenFlags};
+    use async_std::task::block_on;
+    let _registry = crate::fs::file::REGISTRY_TEST_LOCK.lock();
+    let mount = Mount::new();
+    let file = File::new(
+        mount.root().find("full.bin").unwrap(),
+        OpenFlags::WRONLY,
+        String::from("/mnt/full.bin"),
+    );
+    let writers: Vec<_> = [b'a', b'b']
+        .iter()
+        .map(|&byte| {
+            let file = file.clone();
+            thread::spawn(move || {
+                for _ in 0..200 {
+                    block_on(async {
+                        let _turn = file.served_write_turn().await;
+                        assert!(_turn.is_some());
+                        assert_eq!(FileLike::write(&*file, &[byte; 7]), Ok(7));
+                    });
+                }
+            })
+        })
+        .collect();
+    for writer in writers {
+        writer.join().unwrap();
+    }
+    let bytes = mount.on_server("full.bin").unwrap();
+    assert_eq!(bytes.len(), 2 * 200 * 7);
+    assert_eq!(bytes.iter().filter(|b| **b == b'a').count(), 200 * 7);
+    for record in bytes.chunks(7) {
+        assert!(record.iter().all(|b| *b == record[0]));
+    }
+}

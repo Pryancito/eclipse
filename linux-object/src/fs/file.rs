@@ -290,6 +290,11 @@ pub struct File {
     path: String,
     /// file inner mut data
     inner: RwLock<FileInner>,
+    /// The turn of a `write(2)` to a file served from userspace, which is
+    /// made with `inner` let go (see [`File::write`]): what keeps two
+    /// writers of this open file from taking the same offset, as Linux's
+    /// `f_pos_lock` does.
+    served_write: TurnGate,
 }
 
 impl_kobject!(File);
@@ -1145,39 +1150,53 @@ impl FileInner {
     }
 
     fn write_at_limited(&mut self, offset: u64, buf: &[u8], limited: bool) -> LxResult<usize> {
-        if !self.flags.writable() {
-            return Err(LxError::EBADF);
-        }
-        let buf = if limited {
-            &buf[..fsize::fsize_room(&self.inode, offset, buf.len())?]
-        } else {
-            buf
-        };
-        // A memfd sealed against writes refuses them here, at the one
-        // chokepoint every write(2)/pwrite(2)/writev(2) passes through
-        // (fcntl(2), F_SEAL_WRITE / F_SEAL_FUTURE_WRITE).
-        if !crate::fs::memfd_write_allowed(&self.inode) {
-            return Err(LxError::EPERM);
-        }
-        // And one sealed against growing refuses a write past its end
-        // (`shmem_write_begin`), which used to grow it.
-        if !buf.is_empty() && !crate::fs::memfd_grow_allowed(&self.inode, offset + buf.len() as u64)
-        {
-            return Err(LxError::EPERM);
-        }
-        // `/dev/dsp`: the OSS write needs the fd's O_NONBLOCK, which the
-        // `INode::write_at` contract cannot carry (the same reason the ALSA
-        // PCM ioctl is routed with its flags in `File::ioctl`).
-        use super::devfs::DspDev;
-        let n = if let Some(dsp) = self.inode.downcast_ref::<DspDev>() {
-            dsp.write_pcm(buf, self.flags.non_block())
-        } else {
-            self.inode.write_at(offset as usize, buf)
-        }
-        .map_err(|e| fs_grow_error(&self.inode, e))?;
-        cache_overlay_write(&self.inode, offset as usize, &buf[..n]);
-        Ok(n)
+        write_to_inode(&self.inode, self.flags, offset, buf, limited)
     }
+}
+
+/// The write of `buf` at `offset` into `inode`, opened with `flags`: what
+/// every write(2)/pwrite(2)/writev(2) of a [`File`] comes down to, with
+/// `RLIMIT_FSIZE` (`limited`), the memfd seals and `/dev/dsp` seen to. It
+/// takes no lock of the open file, so a write that waits (a file served from
+/// userspace, see [`File::write`]) can be made with that lock let go.
+fn write_to_inode(
+    inode: &Arc<dyn INode>,
+    flags: OpenFlags,
+    offset: u64,
+    buf: &[u8],
+    limited: bool,
+) -> LxResult<usize> {
+    if !flags.writable() {
+        return Err(LxError::EBADF);
+    }
+    let buf = if limited {
+        &buf[..fsize::fsize_room(inode, offset, buf.len())?]
+    } else {
+        buf
+    };
+    // A memfd sealed against writes refuses them here, at the one
+    // chokepoint every write(2)/pwrite(2)/writev(2) passes through
+    // (fcntl(2), F_SEAL_WRITE / F_SEAL_FUTURE_WRITE).
+    if !crate::fs::memfd_write_allowed(inode) {
+        return Err(LxError::EPERM);
+    }
+    // And one sealed against growing refuses a write past its end
+    // (`shmem_write_begin`), which used to grow it.
+    if !buf.is_empty() && !crate::fs::memfd_grow_allowed(inode, offset + buf.len() as u64) {
+        return Err(LxError::EPERM);
+    }
+    // `/dev/dsp`: the OSS write needs the fd's O_NONBLOCK, which the
+    // `INode::write_at` contract cannot carry (the same reason the ALSA
+    // PCM ioctl is routed with its flags in `File::ioctl`).
+    use super::devfs::DspDev;
+    let n = if let Some(dsp) = inode.downcast_ref::<DspDev>() {
+        dsp.write_pcm(buf, flags.non_block())
+    } else {
+        inode.write_at(offset as usize, buf)
+    }
+    .map_err(|e| fs_grow_error(inode, e))?;
+    cache_overlay_write(inode, offset as usize, &buf[..n]);
+    Ok(n)
 }
 
 /// Errno for a failed write/resize. A regular file that cannot grow is
@@ -1296,6 +1315,7 @@ impl File {
                 seq: None,
                 not_seq: false,
             }),
+            served_write: TurnGate::new(),
         })
     }
 
@@ -1354,16 +1374,40 @@ impl File {
 
     /// resize the file
     pub fn set_len(&self, len: u64) -> LxResult {
-        let inner = self.inner.write();
-        if !inner.flags.writable() {
+        // Resized with no lock held: a file served from userspace waits for
+        // its server, see `write`.
+        let (flags, inode) = {
+            let inner = self.inner.read();
+            (inner.flags, inner.inode.clone())
+        };
+        if !flags.writable() {
             return Err(LxError::EBADF);
         }
-        inner
-            .inode
+        inode
             .resize(len as usize)
-            .map_err(|e| fs_grow_error(&inner.inode, e))?;
-        cache_truncate(&inner.inode, len as usize);
+            .map_err(|e| fs_grow_error(&inode, e))?;
+        cache_truncate(&inode, len as usize);
         Ok(())
+    }
+
+    /// Whether nobody holds this open file's lock: what a fake server in
+    /// the tests asks while it answers.
+    #[cfg(test)]
+    pub(crate) fn lock_is_free(&self) -> bool {
+        self.inner.try_write().is_some()
+    }
+
+    /// The turn [`write`](FileLike::write) of a file served from userspace
+    /// needs, taken asleep for the whole `write(2)`: its offset is read and
+    /// set again with the lock let go, and a second writer of this open file
+    /// between the two would write at the same place. `None` for every
+    /// other file, whose write holds the lock throughout.
+    pub async fn served_write_turn(&self) -> Option<TurnGuard<'_>> {
+        let served = super::served::is_file(&*self.inner.read().inode);
+        match served {
+            true => Some(self.served_write.turn().await),
+            false => None,
+        }
     }
 
     /// Sync all data and metadata
@@ -1481,18 +1525,23 @@ impl File {
 
     /// get the next directory entry and its metadata
     pub fn read_entry_with_metadata(&self) -> LxResult<(Metadata, String)> {
-        let mut inner = self.inner.write();
-        if !inner.flags.readable() {
+        // A served directory is read by places, which stay where they are
+        // while its entries are removed; and with no lock held, because its
+        // listing may be the server's to give (see `write`).
+        let (flags, inode, offset) = {
+            let inner = self.inner.read();
+            (inner.flags, inner.inode.clone(), inner.offset as usize)
+        };
+        if !flags.readable() {
             return Err(LxError::EBADF);
         }
-        let offset = inner.offset as usize;
-        // A served directory is read by places, which stay where they are
-        // while its entries are removed.
-        if let Some(entry) = super::served::entry_at(&*inner.inode, offset) {
+        if let Some(entry) = super::served::entry_at(&*inode, offset) {
             let (meta, name, next) = entry?;
-            inner.offset = next as u64;
+            self.inner.write().offset = next as u64;
             return Ok((meta, name));
         }
+        let mut inner = self.inner.write();
+        let offset = inner.offset as usize;
         match inner.inode.get_entry_with_metadata(offset) {
             Ok(entry) => {
                 inner.offset += 1;
@@ -1787,6 +1836,35 @@ impl FileLike for File {
             inner.offset += n as u64;
             return Ok(n);
         }
+        // A file served from userspace is written with the lock let go. The
+        // server answers while this CPU gives itself to other tasks turn by
+        // turn (`SyncWait`), and one of them writing to this same open file
+        // (the `make -j4` whose jobs all have one `t.out` as stdout) spun on
+        // the lock under the very wait that held it: the CPU never got back
+        // to the holder. Two writers' offsets are kept apart by
+        // `served_write_turn` instead, which `write(2)` takes asleep.
+        if super::served::is_file(&*inner.inode) {
+            let (flags, inode) = (inner.flags, inner.inode.clone());
+            let offset = if flags.is_append() {
+                inode
+                    .metadata()
+                    .map(|m| m.size as u64)
+                    .unwrap_or(inner.offset)
+            } else {
+                inner.offset
+            };
+            drop(inner);
+            let r = write_to_inode(&inode, flags, offset, buf, true);
+            match r {
+                Ok(n) => self.inner.write().offset = offset + n as u64,
+                Err(LxError::ENOSPC) => {
+                    let size = inode.metadata().ok().map(|m| m.size as u64);
+                    report_enospc(&self.path, offset, buf.len(), size);
+                }
+                Err(_) => {}
+            }
+            return r;
+        }
         // The offset `FileInner::write` will actually try (O_APPEND writes at
         // the current end, not at `inner.offset`).
         let offset = if inner.flags.is_append() {
@@ -1885,7 +1963,19 @@ impl FileLike for File {
             return Err(LxError::ESPIPE);
         }
         let mut inner = self.inner.write();
-        let r = inner.write_at(offset, buf);
+        // Served from userspace: with the lock let go, as in `write`.
+        let r = if super::served::is_file(&*inner.inode) {
+            let (flags, inode) = (inner.flags, inner.inode.clone());
+            drop(inner);
+            let r = write_to_inode(&inode, flags, offset, buf, true);
+            if matches!(r, Err(LxError::ENOSPC)) {
+                let size = inode.metadata().ok().map(|m| m.size as u64);
+                report_enospc(&self.path, offset, buf.len(), size);
+            }
+            return r;
+        } else {
+            inner.write_at(offset, buf)
+        };
         if matches!(r, Err(LxError::ENOSPC)) {
             let size = inner.inode.metadata().ok().map(|m| m.size as u64);
             report_enospc(&self.path, offset, buf.len(), size);
