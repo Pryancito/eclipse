@@ -289,3 +289,42 @@ fn what_it_has_not_is_einval_and_capture_is_eio() {
     assert_eq!(d.control(SNDCTL_DSP_SYNC, &mut b), Ok((0, 0)));
     assert_eq!(int(&mut d, OSS_GETVERSION, 0), OSS_VERSION);
 }
+
+#[test]
+fn the_next_driver_told_the_kept_setup_plays_the_open_as_it_was_set_up() {
+    let mut d = dsp();
+    // What the kernel keeps: the latest of each command `keeps` says, last,
+    // with what came back of it.
+    let mut kept: Vec<(u32, Vec<u8>)> = Vec::new();
+    for (cmd, v) in [
+        (SNDCTL_DSP_SETFMT, AFMT_U8),
+        (SNDCTL_DSP_SPEED, 44100),
+        (SNDCTL_DSP_GETBLKSIZE, 0),
+        (SNDCTL_DSP_CHANNELS, 1),
+        (SNDCTL_DSP_SPEED, 22050),
+    ] {
+        let mut b = v.to_ne_bytes().to_vec();
+        d.control(cmd, &mut b).unwrap();
+        if keeps(cmd) {
+            kept.retain(|(k, _)| *k != cmd);
+            kept.push((cmd, b));
+        }
+    }
+    let cmds: Vec<u32> = kept.iter().map(|(c, _)| *c).collect();
+    assert_eq!(
+        cmds,
+        [SNDCTL_DSP_SETFMT, SNDCTL_DSP_CHANNELS, SNDCTL_DSP_SPEED]
+    );
+    let mut next = dsp();
+    for (cmd, b) in &kept {
+        next.control(*cmd, &mut b.clone()).unwrap();
+    }
+    assert_eq!(
+        int(&mut next, SOUND_PCM_READ_RATE, 0),
+        int(&mut d, SOUND_PCM_READ_RATE, 0)
+    );
+    assert_eq!(int(&mut next, SNDCTL_DSP_SETFMT, AFMT_QUERY), AFMT_U8);
+    assert_eq!(int(&mut next, SOUND_PCM_READ_CHANNELS, 0), 1);
+    // A mono U8 frame is a byte, on the next as on the first.
+    assert_eq!(next.play(&[0x80; 10]), Ok(10));
+}

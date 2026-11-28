@@ -89,6 +89,16 @@ pub const OP_READY: u32 = 16;
 /// kernel asks again with [`OP_IOCTL_IOV`]; `status` is not looked at. It
 /// is CUSE's retry of an unrestricted `ioctl`.
 pub const IOCTL_FETCH: u64 = 1;
+/// In the reply to an [`OP_IOCTL`], in `a`: done, and part of the open's
+/// setup (OSS's rate and format, ALSA's `HW_PARAMS` and `PREPARE`). The
+/// kernel keeps the command, its argument and what it carries -- what came
+/// back of an `_IOWR`, what went in of an `_IOW` -- one of each command,
+/// the latest last, and tells them again, in that order, to the next
+/// server that takes the open over ([`OPEN_SETUP_MAX`]).
+pub const IOCTL_KEEP: u64 = 2;
+/// The most commands an open keeps for the next server: one of each, and
+/// a server has a handful.
+pub const OPEN_SETUP_MAX: usize = 16;
 /// How many ranges an [`Iov`] may name, each way.
 pub const IOV_MAX: usize = 8;
 /// How many times one `ioctl` may be asked again: an argument that holds

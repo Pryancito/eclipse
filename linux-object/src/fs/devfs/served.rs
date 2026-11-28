@@ -18,7 +18,10 @@
 //! When the server goes the node goes with it, as an unplugged device's
 //! does: what is open of it reads as hung up (`POLLERR | POLLHUP`) and
 //! every request on it is `ENODEV`. The next server puts the node back, and
-//! programs open it again, as they would a device plugged in again.
+//! programs open it again, as they would a device plugged in again. An
+//! input or sound node is the exception ([`Core::keeps`]): what is open of
+//! it waits for the next server, which opens each open again and is told
+//! its setup again ([`wire::IOCTL_KEEP`]), and the program goes on.
 //!
 //! What this trusts: the server is a process root started for the purpose.
 //! Its answers are whatever it says, and it sees no kernel memory, only the
@@ -92,6 +95,19 @@ pub type VmoOf = alloc::boxed::Box<dyn Fn(u64) -> Option<(Arc<VmObject>, bool)> 
 /// starts of a service that keeps dying (8 s).
 const SERVER_GRACE_MS: u64 = 10_000;
 
+/// Whether the node at `name` outlives its server ([`Core::keeps`]): an
+/// evdev node, whose open is a stream of events; and a sound card's
+/// (`dspN`, `snd/pcmCND0p`, `snd/controlCN`), whose open the next server
+/// is told the setup of again ([`wire::IOCTL_KEEP`]).
+fn outlives_server(name: &str, rdev: usize) -> bool {
+    let sound = name
+        .strip_prefix("dsp")
+        .is_some_and(|n| n.bytes().all(|b| b.is_ascii_digit()))
+        || name.starts_with("snd/pcmC")
+        || name.starts_with("snd/controlC");
+    sound || input::event_id(name, rdev).is_some()
+}
+
 /// What the node and its opens share.
 struct Core {
     /// The link to the server of the moment.
@@ -99,9 +115,11 @@ struct Core {
     /// Whether the node outlives its server: it stays in `/dev`, what is
     /// open of it waits for the next server for [`SERVER_GRACE_MS`], and
     /// the next server, serving the same name and number, takes it over
-    /// and is asked to open again each open of it. An evdev node only: an
-    /// open of one is a stream of events and nothing more, so another open
-    /// of the next server is the same open to its reader.
+    /// and is asked to open again each open of it, and told again the
+    /// setup the last said to keep ([`wire::IOCTL_KEEP`]). Evdev and sound
+    /// nodes only ([`outlives_server`]): an open of one is a stream and its
+    /// setup, so another open of the next server, set up the same, is the
+    /// same open to its program.
     keeps: bool,
     /// How many servers it has had: the turn each open's `fh` is of.
     turn: AtomicU64,
@@ -195,7 +213,7 @@ impl ServedNode {
     fn new(link: Arc<Link>, name: &str, rdev: usize, mode: u32) -> Arc<Self> {
         let node = Arc::new(Core {
             link: Mutex::new(link.clone()),
-            keeps: input::event_id(name, rdev).is_some(),
+            keeps: outlives_server(name, rdev),
             turn: AtomicU64::new(1),
             until: AtomicU64::new(0),
             name: String::from(name),
@@ -374,6 +392,18 @@ impl Core {
                     Ok(answer) => {
                         let (fh, mut mask) = (answer.fh, answer.a);
                         drop(answer);
+                        if let Err(cmd) = open.set_up_again(&link, fh) {
+                            warn!(
+                                "served dev: /dev/{}: the next server would not take {:#x} again",
+                                core.name, cmd
+                            );
+                            link.tell(OP_RELEASE, fh);
+                            open.lost.store(true, Ordering::Release);
+                            open.bus
+                                .lock()
+                                .change(READINESS, Event::ERROR | Event::CLOSED);
+                            continue;
+                        }
                         core.opens.lock().insert(fh, Arc::downgrade(&open));
                         if let Some(at) = core.early.lock().iter().position(|(f, _)| *f == fh) {
                             mask = core.early.lock().remove(at).1;
@@ -432,6 +462,7 @@ impl Core {
             flags,
             bus: bus.clone(),
             lost: AtomicBool::new(false),
+            setup: Mutex::new(Vec::new()),
         });
         {
             let mut opens = self.opens.lock();
@@ -531,6 +562,46 @@ struct Open {
     bus: Arc<Mutex<EventBus>>,
     /// The next server would not open it again: it has hung up.
     lost: AtomicBool,
+    /// Its setup, as the server said to keep it ([`wire::IOCTL_KEEP`]).
+    setup: Mutex<Vec<Kept>>,
+}
+
+/// An `ioctl` of an open's setup: what the next server is told again.
+struct Kept {
+    cmd: u32,
+    arg: u64,
+    /// What it carries in, as the server last answered it.
+    bytes: Vec<u8>,
+}
+
+impl Open {
+    /// Keep `ioctl(cmd, arg)` with `bytes` in, the latest of its command.
+    fn keep(&self, cmd: u32, arg: u64, bytes: Vec<u8>) {
+        let mut setup = self.setup.lock();
+        setup.retain(|k| k.cmd != cmd);
+        if setup.len() >= wire::OPEN_SETUP_MAX {
+            setup.remove(0);
+        }
+        setup.push(Kept { cmd, arg, bytes });
+    }
+
+    /// Tell the server on `link`, whose name for this open is `fh`, the
+    /// setup kept, in order. The command it refused, if one.
+    fn set_up_again(&self, link: &Arc<Link>, fh: u32) -> core::result::Result<(), u32> {
+        let setup: Vec<(u32, u64, Vec<u8>)> = self
+            .setup
+            .lock()
+            .iter()
+            .map(|k| (k.cmd, k.arg, k.bytes.clone()))
+            .collect();
+        for (cmd, arg, bytes) in setup {
+            match link.call(OP_IOCTL, fh, 0, cmd as u64, arg, &bytes) {
+                Ok(answer) if answer.a != wire::IOCTL_FETCH => {}
+                _ => return Err(cmd),
+            }
+        }
+        Ok(())
+    }
 }
 
 /// One open of a served node.
@@ -633,10 +704,17 @@ impl ServedOpen {
             })
             .map_err(lx_of)?;
         if answer.a != wire::IOCTL_FETCH {
+            let keep = answer.a == wire::IOCTL_KEEP;
+            // What the next server is told: what went in, as it came back.
+            let mut kept = data;
             if out > 0 {
                 let n = answer.len.min(out);
                 let mut back = vec![0u8; n];
                 answer.data(&mut back).map_err(lx_of)?;
+                if keep {
+                    let m = n.min(kept.len());
+                    kept[..m].copy_from_slice(&back[..m]);
+                }
                 kernel_hal::user::UserOutPtr::<u8>::from(arg)
                     .write_array(&back)
                     .map_err(|_| LxError::EFAULT)?;
@@ -645,6 +723,9 @@ impl ServedOpen {
                 if cmd & 0xffff == 0x4111 {
                     super::snd::note_served_hw_params(&self.node.name, &back);
                 }
+            }
+            if keep {
+                self.open.keep(cmd, arg as u64, kept);
             }
             return Ok(answer.count);
         }
