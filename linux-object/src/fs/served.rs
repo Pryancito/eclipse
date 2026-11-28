@@ -114,6 +114,8 @@ const MAX_ENTRIES: usize = 1 << 20;
 
 /// `st_dev` of each served mount, apart from the other filesystems'.
 static DEV_COUNTER: AtomicU64 = AtomicU64::new(0x5E70_0000);
+/// Part of each mount's nonce: two mounts made in the same tick differ.
+static MOUNT_NONCE: AtomicU64 = AtomicU64::new(0x9E37_79B9_7F4A_7C15);
 
 /// The served mounts, by where they are mounted: what an unmount closes,
 /// and what the next server of one finds.
@@ -185,6 +187,12 @@ struct Node {
     ctime: AtomicI64,
     /// Removed: its path is nobody's, or another file's by now.
     gone: AtomicBool,
+    /// Removed while it was open: under a hidden name of its own until its
+    /// last close, as a removed file is on Linux (see `ServedINode::unlink`).
+    unlinked: AtomicBool,
+    /// The open files of it (`crate::fs::File`s), which [`opened`] and
+    /// [`closed`] count.
+    opens: AtomicU32,
     /// The changes to its bytes: how many are with the server now, and how
     /// many there have been. See [`read_token`].
     changes: Mutex<(u32, u64)>,
@@ -319,6 +327,24 @@ pub struct ServedFs {
     /// The top's own owner and mode were asked for ([`OP_STAT`]): a listing
     /// only has what is below it.
     root_asked: AtomicBool,
+    /// What tells this mount's hidden names ([`HIDDEN`]) from those an
+    /// earlier one left behind.
+    nonce: u64,
+    /// The hidden names nobody has any more, for the server to remove at
+    /// the next change to a directory: a node is let go wherever its last
+    /// holder is, and a request from there could wait under a lock.
+    reap: Mutex<Vec<String>>,
+}
+
+/// The start of the name a removed file that is still open has: listings
+/// leave such names out. The rest is the mount's nonce and the node's
+/// number, `.eclipse-unlinked-<nonce>-<ino>`.
+const HIDDEN: &str = ".eclipse-unlinked-";
+
+/// The nonce of the mount that gave `name` its hidden name, if it is one.
+fn hidden_nonce(name: &str) -> Option<Option<u64>> {
+    let rest = name.strip_prefix(HIDDEN)?;
+    Some(rest.split('-').next().and_then(|n| n.parse().ok()))
 }
 
 /// A change to the directories, from before the server is asked for it
@@ -373,6 +399,8 @@ impl ServedFs {
                 atime: AtomicI64::new(0),
                 ctime: AtomicI64::new(0),
                 gone: AtomicBool::new(false),
+                unlinked: AtomicBool::new(false),
+                opens: AtomicU32::new(0),
                 changes: Mutex::new((0, 0)),
             }),
             next_ino: AtomicU64::new(2),
@@ -387,6 +415,9 @@ impl ServedFs {
             posix: flags & SERVE_POSIX != 0,
             extras: flags & SERVE_EXTRAS != 0,
             root_asked: AtomicBool::new(false),
+            nonce: MOUNT_NONCE.fetch_add(1, Ordering::Relaxed)
+                ^ kernel_hal::timer::timer_now().as_nanos() as u64,
+            reap: Mutex::new(Vec::new()),
         })
     }
 
@@ -417,6 +448,8 @@ impl ServedFs {
             atime: AtomicI64::new(entry.atime),
             ctime: AtomicI64::new(entry.ctime),
             gone: AtomicBool::new(false),
+            unlinked: AtomicBool::new(false),
+            opens: AtomicU32::new(0),
             changes: Mutex::new((0, 0)),
         })
     }
@@ -599,7 +632,17 @@ impl ServedFs {
                 }
                 (dirs.changing == 0).then_some(dirs.changes)
             };
-            let entries = self.ask_listing(path)?;
+            let mut entries = self.ask_listing(path)?;
+            entries.retain(|entry| match hidden_nonce(&entry.name) {
+                None => true,
+                // An earlier mount's, whose holders are all gone with it.
+                Some(nonce) => {
+                    if nonce != Some(self.nonce) {
+                        self.reap.lock().push(join_path(path, &entry.name));
+                    }
+                    false
+                }
+            });
             let listing: Listing = entries
                 .iter()
                 .map(|entry| {
@@ -742,6 +785,21 @@ impl ServedFs {
 
     /// Drop the removed file's pages: its number is no other file's, but
     /// they are memory nothing will read.
+    /// Remove the hidden files nobody has any more (see [`Self::reap`]).
+    /// From a directory change, which is a request already.
+    fn reap_unlinked(&self) {
+        let paths = core::mem::take(&mut *self.reap.lock());
+        if paths.is_empty() || self.read_only {
+            return;
+        }
+        let _changing = self.changing_dirs();
+        for path in paths {
+            // Whatever the answer: a server that cannot remove it now will
+            // be asked again by the next mount, which sees it in a listing.
+            let _ = self.ask(OP_REMOVE, path.as_bytes(), 0, 0, &[]);
+        }
+    }
+
     fn forget_pages(&self, node: &Arc<Node>) {
         if !node.is_dir {
             let inode: Arc<dyn INode> = Arc::new(self.inode(node.clone()));
@@ -868,7 +926,7 @@ impl ServedINode {
             ctime: at(&node.ctime),
             type_: file_type(node.mode.load(Ordering::Relaxed)),
             mode: (node.mode.load(Ordering::Relaxed) & 0o7777) as u16,
-            nlinks: if node.is_gone() {
+            nlinks: if node.is_gone() || node.unlinked.load(Ordering::Acquire) {
                 0
             } else {
                 node.nlink.load(Ordering::Relaxed) as usize
@@ -1085,6 +1143,7 @@ impl INode for ServedINode {
         if self.fs.position(&*self.fs.listing(&dir)?, name).is_some() {
             return Err(FsError::EntryExist);
         }
+        self.fs.reap_unlinked();
         let _changing = self.fs.changing_dirs();
         let path = join_path(&dir, name);
         let entry = match self.fs.ask(OP_CREATE, path.as_bytes(), mode as u64, 0, &[]) {
@@ -1127,14 +1186,35 @@ impl INode for ServedINode {
             return Err(FsError::EntryNotFound);
         };
         drop(listing);
+        self.fs.reap_unlinked();
         let path = node.path();
         let _changing = self.fs.changing_dirs();
-        match self.fs.ask(OP_REMOVE, path.as_bytes(), 0, 0, &[]) {
-            // The server that was asked first removed it, and died.
-            (Err(FsError::EntryNotFound), true) => {}
-            (answer, _) => drop(answer?),
+        // A file that is open is renamed out of sight instead, and removed
+        // after its last close. Removed outright, the file was the server's
+        // to forget while it was still being read and written: SQLite's
+        // temporary files, opened and removed at once, were `disk I/O error`.
+        let held = !node.is_dir && node.opens.load(Ordering::Acquire) > 0;
+        if held {
+            let hidden = join_path(
+                &dir,
+                &alloc::format!("{HIDDEN}{}-{}", self.fs.nonce, node.ino),
+            );
+            let names = alloc::format!("{path}\0{hidden}");
+            match self.fs.ask(OP_RENAME, names.as_bytes(), 0, 0, &[]) {
+                // The server that was asked first renamed it, and died.
+                (Err(FsError::EntryNotFound), true) => {}
+                (answer, _) => drop(answer?),
+            }
+            *node.path.lock() = hidden;
+            node.unlinked.store(true, Ordering::Release);
+        } else {
+            match self.fs.ask(OP_REMOVE, path.as_bytes(), 0, 0, &[]) {
+                // The server that was asked first removed it, and died.
+                (Err(FsError::EntryNotFound), true) => {}
+                (answer, _) => drop(answer?),
+            }
+            node.gone.store(true, Ordering::Release);
         }
-        node.gone.store(true, Ordering::Release);
         {
             let mut dirs = self.fs.dirs.lock();
             if let Some(listing) = dirs.listed.get_mut(&dir) {
@@ -1153,7 +1233,9 @@ impl INode for ServedINode {
             }
         }
         self.node.mtime.store(now(), Ordering::Relaxed);
-        self.fs.forget_pages(&node);
+        if !held {
+            self.fs.forget_pages(&node);
+        }
         Ok(())
     }
 
@@ -1337,6 +1419,29 @@ impl INode for ServedINode {
 
     fn as_any_ref(&self) -> &dyn Any {
         self
+    }
+}
+
+/// A [`crate::fs::File`] of `inode` was made: if it is a file of a served
+/// filesystem, it is open until [`closed`].
+pub(super) fn opened(inode: &dyn INode) {
+    if let Some(inode) = inode.downcast_ref::<ServedINode>() {
+        inode.node.opens.fetch_add(1, Ordering::AcqRel);
+    }
+}
+
+/// That file was closed, the last of its descriptors. The last close of a
+/// file removed while it was open leaves its hidden name to the server to
+/// remove, at the next change to a directory: the close may be anywhere,
+/// and a request from there could wait under a lock.
+pub(super) fn closed(inode: &dyn INode) {
+    let Some(inode) = inode.downcast_ref::<ServedINode>() else {
+        return;
+    };
+    let node = &inode.node;
+    if node.opens.fetch_sub(1, Ordering::AcqRel) == 1 && node.unlinked.load(Ordering::Acquire) {
+        node.gone.store(true, Ordering::Release);
+        inode.fs.reap.lock().push(node.path());
     }
 }
 
