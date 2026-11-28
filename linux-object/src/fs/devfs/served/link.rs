@@ -34,6 +34,16 @@ pub const LEFT: Signal = Signal::USER_SIGNAL_0;
 /// The `reqid` of a message that wants no answer.
 pub const NO_REPLY: u32 = u32::MAX;
 
+/// The `reqid` of the watch's ping ([`Link::look_quiet`]): an operation no
+/// server knows, which every server answers (`EINVAL`), from the thread
+/// that answers everything else.
+pub const PING_REQID: u32 = u32::MAX - 1;
+const OP_PING: u32 = 0x7069;
+
+/// How long a server with something open of it may say nothing before the
+/// watch pings it.
+const PING_AFTER_MS: u64 = 5_000;
+
 const PENDING: u8 = 0;
 const ANSWERED: u8 = 1;
 
@@ -67,6 +77,13 @@ pub(super) struct Link {
     asker: [Lent; SLOTS],
     dead: AtomicBool,
     answered_at: AtomicU64,
+    /// When the watch pinged the server, while no answer came since; 0
+    /// when none is out. And how many times the server had been heard
+    /// then, of [`Link::heard`].
+    pinged_at: AtomicU64,
+    heard_at_ping: AtomicU64,
+    /// How many times [`Link::pump`] read something of the server's.
+    heard: AtomicU64,
     pub hung_after_ms: AtomicU64,
     /// The process that answers on this link, 0 until it is said
     /// ([`Link::killed_with`]): what a server's other links are found by.
@@ -141,6 +158,9 @@ impl Link {
             asker: [const { lock::Mutex::new(None) }; SLOTS],
             dead: AtomicBool::new(false),
             answered_at: AtomicU64::new(0),
+            pinged_at: AtomicU64::new(0),
+            heard_at_ping: AtomicU64::new(0),
+            heard: AtomicU64::new(0),
             hung_after_ms: AtomicU64::new(HUNG_AFTER_MS),
             server: AtomicU64::new(0),
             ready: lock::Mutex::new(None),
@@ -237,9 +257,14 @@ impl Link {
         };
         if n > 0 {
             self.answered_at.store(now_ms(), Ordering::Release);
+            self.heard.fetch_add(1, Ordering::AcqRel);
         }
         for m in back.as_chunks::<MSG>().0.iter().take(n) {
             let reply = Msg::decode(m);
+            // What it said is the answer: it was heard.
+            if reply.reqid == PING_REQID {
+                continue;
+            }
             if reply.op == OP_READY {
                 if let Some(ready) = &*self.ready.lock() {
                     ready(reply.fh, reply.a);
@@ -294,6 +319,47 @@ impl Link {
                 between_looks(&mut away);
             }
         }
+    }
+
+    /// The watch's look at `now` at a server that something is `open` of:
+    /// one that has said nothing for [`PING_AFTER_MS`] is pinged, which a
+    /// live one answers at once; one that leaves the ping unanswered for as
+    /// long as a request waits is hung, and is killed. What a reader waits
+    /// for is the server's word that an open can be read, with no request
+    /// out, so without this a frozen server would never be found out.
+    pub fn look_quiet(&self, now: u64, open: bool) {
+        if self.is_dead() {
+            return;
+        }
+        let heard = self.heard.load(Ordering::Acquire);
+        let pinged = self.pinged_at.load(Ordering::Acquire);
+        if pinged != 0 {
+            if heard != self.heard_at_ping.load(Ordering::Acquire) {
+                self.pinged_at.store(0, Ordering::Release);
+            } else if now > pinged + self.hung_after_ms.load(Ordering::Relaxed)
+                && !super::long_request_waits(self, now)
+            {
+                self.hung();
+            }
+            return;
+        }
+        if !open || now <= self.answered_at.load(Ordering::Acquire) + PING_AFTER_MS {
+            return;
+        }
+        let Some(fifo) = self.fifo.lock().clone() else {
+            return;
+        };
+        let msg = Msg {
+            op: OP_PING,
+            reqid: PING_REQID,
+            ..Msg::default()
+        }
+        .encode();
+        // A FIFO too full to take it is the server not reading: the ping is
+        // out as much as it would be.
+        self.heard_at_ping.store(heard, Ordering::Release);
+        let _ = fifo.write(MSG, &msg, 1);
+        self.pinged_at.store(now.max(1), Ordering::Release);
     }
 
     /// Tell the server `op` on open `fh`, and wait for no answer: what a
@@ -620,5 +686,66 @@ mod patience_tests {
         assert!(!late.silent_since(long_ago));
         let (later, _c) = link_of(4301);
         assert!(!later.silent_since(long_ago), "made after the ask");
+    }
+}
+
+#[cfg(test)]
+mod ping_tests {
+    use super::*;
+
+    /// A link whose server says nothing until the test does, and whether
+    /// its kill was called.
+    fn quiet_link() -> (Arc<Link>, Arc<Fifo>, Arc<AtomicBool>) {
+        let (ours, theirs) = Fifo::create(SLOTS * 2, MSG);
+        let window = VmObject::new_paged((SLOTS * SLOT_LEN).div_ceil(4096));
+        let link = Arc::new(Link::new(ours, window).unwrap());
+        link.hung_after_ms.store(0, Ordering::Relaxed);
+        let killed = Arc::new(AtomicBool::new(false));
+        let k = killed.clone();
+        link.killed_with(0, Box::new(move || k.store(true, Ordering::Release)));
+        (link, theirs, killed)
+    }
+
+    #[test]
+    fn a_quiet_server_that_nothing_is_open_of_is_never_pinged() {
+        let (link, theirs, killed) = quiet_link();
+        link.look_quiet(now_ms() + PING_AFTER_MS + 1, false);
+        let mut m = [0u8; MSG];
+        assert!(theirs.read(MSG, &mut m, 1).is_err(), "nothing sent");
+        assert!(!killed.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn a_frozen_server_leaves_its_ping_unanswered_and_is_killed() {
+        let (link, theirs, killed) = quiet_link();
+        let now = now_ms() + PING_AFTER_MS + 1;
+        link.look_quiet(now, true);
+        let mut m = [0u8; MSG];
+        theirs.read(MSG, &mut m, 1).unwrap();
+        assert_eq!(Msg::decode(&m).reqid, PING_REQID);
+        link.look_quiet(now + 1, true);
+        assert!(
+            killed.load(Ordering::Acquire),
+            "no answer for as long as a request waits"
+        );
+        assert!(link.is_dead());
+    }
+
+    #[test]
+    fn a_live_server_answers_its_ping_and_lives() {
+        let (link, theirs, killed) = quiet_link();
+        let now = now_ms() + PING_AFTER_MS + 1;
+        link.look_quiet(now, true);
+        let mut m = [0u8; MSG];
+        theirs.read(MSG, &mut m, 1).unwrap();
+        // The server's answer: whatever it says of an operation it does not
+        // know, under the same id.
+        let mut reply = Msg::decode(&m);
+        reply.b = (-22i64) as u64;
+        theirs.write(MSG, &reply.encode(), 1).unwrap();
+        assert_eq!(link.pump(), 1, "read, and handed to no request");
+        link.look_quiet(now + 1, true);
+        assert!(!killed.load(Ordering::Acquire));
+        assert_eq!(link.pinged_at.load(Ordering::Acquire), 0, "no ping out");
     }
 }

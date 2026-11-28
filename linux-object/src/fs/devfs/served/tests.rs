@@ -38,10 +38,38 @@ fn send(fifo: &Fifo, m: Msg) {
 /// A server whose opens are echo queues. `quiet` opens are said to be
 /// readable before the open's answer goes, as a server may.
 fn echo() -> Echo {
+    echo_at("test/echo0", rcore_fs::vfs::make_rdev(240, 1))
+}
+
+/// [`echo`], of a node at `name` numbered `rdev`.
+fn echo_at(name: &str, rdev: usize) -> Echo {
+    let (link, released, server, servers) = echo_server();
+    let node = ServedNode::new(link, name, rdev, 0o660);
+    node.vmos_from(alloc::boxed::Box::new(|handle| match handle {
+        5 => Some((device_memory(), true)),
+        6 => Some((device_memory(), false)),
+        _ => None,
+    }));
+    Echo {
+        node,
+        released,
+        server: Some(server),
+        servers,
+    }
+}
+
+/// The echo server alone, and the kernel's link to it: how many closes it
+/// was told, the thread, and its end of the FIFO.
+#[allow(clippy::type_complexity)]
+fn echo_server() -> (
+    Arc<Link>,
+    Arc<AtomicUsize>,
+    thread::JoinHandle<ZxError>,
+    Arc<std::sync::Mutex<Option<Arc<Fifo>>>>,
+) {
     let (ours, theirs) = Fifo::create(SLOTS * 2, MSG);
     let window = VmObject::new_paged((SLOTS * SLOT_LEN).div_ceil(4096));
     let link = Arc::new(Link::new(ours, window.clone()).unwrap());
-    let node = ServedNode::new(link, "test/echo0", rcore_fs::vfs::make_rdev(240, 1), 0o660);
     let released = Arc::new(AtomicUsize::new(0));
     let servers = Arc::new(std::sync::Mutex::new(Some(theirs.clone())));
     let rel = released.clone();
@@ -205,17 +233,7 @@ fn echo() -> Echo {
             send(&theirs, reply);
         }
     });
-    node.vmos_from(alloc::boxed::Box::new(|handle| match handle {
-        5 => Some((device_memory(), true)),
-        6 => Some((device_memory(), false)),
-        _ => None,
-    }));
-    Echo {
-        node,
-        released,
-        server: Some(server),
-        servers,
-    }
+    (link, released, server, servers)
 }
 
 impl Echo {
@@ -566,4 +584,62 @@ fn the_server_reads_no_further_than_the_asker_could() {
 fn a_request_that_lent_nothing_reaches_nothing() {
     let (status, _, _) = lend(None, 0x1000, 4);
     assert_eq!(status, -14);
+}
+
+/// An evdev node, served by [`echo_server`].
+fn input_echo() -> Echo {
+    echo_at("input/event0", rcore_fs::vfs::make_rdev(13, 64))
+}
+
+#[test]
+fn an_input_node_keeps_what_is_open_of_it_for_the_next_server() {
+    let mut echo = input_echo();
+    let open = echo.node.open_client(2).unwrap();
+    let other = echo.node.open_client(2).unwrap();
+    // The server dies: the node waits for the next, and what is open of it
+    // has not hung up.
+    let turn = echo.node.server_went().expect("an evdev node waits");
+    let _ = echo.server.take().unwrap().join();
+    assert_eq!(ready(&open), (false, true, false, false));
+    // A request meanwhile waits for the next server.
+    let writer = thread::spawn(move || {
+        let wrote = open.write_at(0, b"hi");
+        (open, wrote)
+    });
+    thread::sleep(std::time::Duration::from_millis(20));
+    let (link, _released, server, _servers) = echo_server();
+    echo.node.0.take_over(link);
+    echo.server = Some(server);
+    let (open, wrote) = writer.join().unwrap();
+    assert_eq!(wrote, Ok(2));
+    // Each open is the next server's own open now: what one wrote is its
+    // own, and readable.
+    let mut buf = [0u8; 4];
+    assert_eq!(open.read_at(0, &mut buf), Ok(2));
+    assert_eq!(&buf[..2], b"hi");
+    assert!(matches!(other.read_at(0, &mut buf), Err(FsError::Again)));
+    assert!(echo.node.taken_over_since(turn));
+    // A new open is the next server's too.
+    assert!(echo.node.open_client(2).is_ok());
+}
+
+#[test]
+fn an_input_node_whose_server_never_comes_back_hangs_up_after_the_wait() {
+    let mut echo = input_echo();
+    let open = echo.node.open_client(2).unwrap();
+    let turn = echo.node.server_went().unwrap();
+    let _ = echo.server.take().unwrap().join();
+    assert!(!echo.node.taken_over_since(turn), "none came");
+    assert_eq!(ready(&open), (false, false, true, true));
+    let mut buf = [0u8; 4];
+    assert!(matches!(open.read_at(0, &mut buf), Err(FsError::NoDevice)));
+}
+
+#[test]
+fn any_other_node_hangs_up_as_soon_as_its_server_goes() {
+    let mut echo = echo();
+    let open = echo.node.open_client(2).unwrap();
+    assert_eq!(echo.node.server_went(), None);
+    let _ = echo.server.take().unwrap().join();
+    assert_eq!(ready(&open), (false, false, true, true));
 }

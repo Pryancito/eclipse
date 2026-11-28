@@ -369,6 +369,9 @@ pub(super) fn asker(proc: &Arc<Process>, args: &[usize; 6]) -> ZxResult<Arc<VmAd
 /// The longest `name`.
 const NAME_MAX: usize = 256;
 
+/// How often a served node's watch looks at a quiet server.
+const WATCH_EVERY: core::time::Duration = core::time::Duration::from_secs(1);
+
 pub(super) fn dev_serve(proc: &Arc<Process>, args: &[usize; 6]) -> ZxResult {
     let fifo = proc.get_object_with_rights::<Fifo>(args[0] as u32, Rights::READ | Rights::WRITE);
     let window =
@@ -421,13 +424,35 @@ pub(super) fn dev_serve(proc: &Arc<Process>, args: &[usize; 6]) -> ZxResult {
         }),
     );
     // What the server says while nobody asks it anything -- an open became
-    // readable -- and its going are read here.
+    // readable -- and its going are read here. And once a second, whether
+    // a server that something is open of still answers ([`look_quiet`]).
+    //
+    // [`look_quiet`]: served::ServedNode::look_quiet
     kernel_hal::thread::spawn(async move {
+        use core::future::Future;
+        use core::task::Poll;
         let wire: Arc<dyn KernelObject> = fifo;
+        let tick = || kernel_hal::thread::sleep_until(kernel_hal::timer::timer_now() + WATCH_EVERY);
+        let mut timer = alloc::boxed::Box::pin(tick());
         loop {
-            let seen = wire
-                .wait_signal(Signal::READABLE | Signal::PEER_CLOSED | SERVER_LEFT)
-                .await;
+            let mut said = core::pin::pin!(
+                wire.wait_signal(Signal::READABLE | Signal::PEER_CLOSED | SERVER_LEFT)
+            );
+            let seen = core::future::poll_fn(|cx| {
+                if let Poll::Ready(seen) = said.as_mut().poll(cx) {
+                    Poll::Ready(Some(seen))
+                } else if timer.as_mut().poll(cx).is_ready() {
+                    Poll::Ready(None)
+                } else {
+                    Poll::Pending
+                }
+            })
+            .await;
+            let Some(seen) = seen else {
+                timer = alloc::boxed::Box::pin(tick());
+                node.look_quiet();
+                continue;
+            };
             if seen.contains(Signal::READABLE) && node.look() {
                 continue;
             }
@@ -438,7 +463,15 @@ pub(super) fn dev_serve(proc: &Arc<Process>, args: &[usize; 6]) -> ZxResult {
             break;
         }
         drop(wire);
-        node.server_left();
+        // A node that outlives its server waits for the next; then, if none
+        // came, it goes as any other.
+        if let Some(turn) = node.server_went() {
+            let grace = core::time::Duration::from_millis(served::ServedNode::GRACE_MS);
+            kernel_hal::thread::sleep_until(kernel_hal::timer::timer_now() + grace).await;
+            if node.taken_over_since(turn) {
+                return;
+            }
+        }
         served::unserve(&node);
     });
     Ok(())

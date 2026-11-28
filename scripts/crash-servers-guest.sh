@@ -28,11 +28,9 @@ if [ "$1" = -p ]; then PORT=$2; shift 2; fi
 WANT=" $* "
 
 # The known gaps: checks expected to fail until their step is done.
-# input.frozen and audio.frozen: a client that waits for an input event or
-# for room in the sound buffer waits on the kernel, with no request out to
-# the driver, so a frozen driver is never found out (one with a request out
-# is killed after 10 s).
-KNOWN=" input.death input.frozen audio.death audio.frozen "
+# audio.death: what was open of a sound card is the dead driver's; the next
+# one does not know its setup (format, rate), so it hangs up.
+KNOWN=" audio.death "
 
 failed=0
 report() { # report name ok|why
