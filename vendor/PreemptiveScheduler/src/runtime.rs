@@ -1395,6 +1395,12 @@ fn cpu_polling(cpu: usize) -> bool {
     cpu < MAX_CORE_NUM && POLLING_CPUS.load(Ordering::SeqCst) & (1 << cpu) != 0
 }
 
+/// Whether the CPU this runs on is in the idle poll: for a profiler that
+/// must not count the poll's spinning as work.
+pub fn current_cpu_halt_polling() -> bool {
+    cpu_polling(crate::arch::cpu_id() as usize)
+}
+
 /// How many looks at the queue [`halt_poll`] takes between clock reads.
 const HALT_POLL_CLOCK_EVERY: u32 = 64;
 /// How many turns of [`halt_poll`]'s loop pass between looks at the queue.

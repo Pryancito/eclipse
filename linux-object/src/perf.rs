@@ -1806,13 +1806,15 @@ fn render_ktop(t: &kernel_hal::ktop::Taken, name: impl Fn(u64) -> String) -> Str
         "eclipse perf — kernel CPU profile (ring 0, since the previous read)"
     );
     let _ = writeln!(out);
-    let ticks = t.samples + t.idle_ticks + t.lock_misses;
+    let ticks = t.samples + t.idle_ticks + t.poll_ticks + t.lock_misses;
     let _ = writeln!(
         out,
-        "kernel ticks: {} busy ({:.1}%), {} idle; lost: {} (table locked) + {} (table full)",
+        "kernel ticks: {} busy ({:.1}%), {} idle, {} polling for work before halting; \
+         lost: {} (table locked) + {} (table full)",
         t.samples + t.lock_misses,
         ktop_pct(t.samples + t.lock_misses, ticks),
         t.idle_ticks,
+        t.poll_ticks,
         t.lock_misses,
         t.full
     );
@@ -2923,6 +2925,7 @@ mod tests {
             full: 0,
             lock_misses: 0,
             idle_ticks: 0,
+            poll_ticks: 0,
         }
     }
 
@@ -3016,7 +3019,8 @@ mod tests {
         let out = render_ktop(&t, ktop_name);
         assert!(
             out.contains(
-                "kernel ticks: 65 busy (65.0%), 35 idle; lost: 5 (table locked) + 10 (table full)"
+                "kernel ticks: 65 busy (65.0%), 35 idle, 0 polling for work before halting; \
+                 lost: 5 (table locked) + 10 (table full)"
             ),
             "{}",
             out
@@ -3024,6 +3028,21 @@ mod tests {
         assert_eq!(
             ktop_table(&out, "SELF")[0],
             ("100.00%".into(), "sys_futex".into()),
+            "{}",
+            out
+        );
+    }
+
+    /// The idle poll's spinning is not work: it is counted on its own and
+    /// left out of the busy share, which is what the profile is a share of.
+    #[test]
+    fn ktop_counts_the_idle_poll_apart_from_the_busy_ticks() {
+        let mut t = ktop_taken(&[([0x1000, 0, 0, 0, 0, 0], 50)]);
+        t.idle_ticks = 25;
+        t.poll_ticks = 25;
+        let out = render_ktop(&t, ktop_name);
+        assert!(
+            out.contains("50 busy (50.0%), 25 idle, 25 polling for work before halting"),
             "{}",
             out
         );
