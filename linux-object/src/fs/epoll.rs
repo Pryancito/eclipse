@@ -1061,7 +1061,7 @@ impl Epoll {
             // and a wait that misses it never pumps the network stack. Asked
             // of every entry, the ones a quick look passes too: a quiet
             // socket only wakes once the stack is pumped.
-            let (interest_list, edges, watch_net, watch_interactive) = {
+            let (interest_list, edges, watch_net, watch_interactive, watch_input) = {
                 let inner = self.inner.lock();
                 let n = inner.interest_list.len();
                 let mut list: Vec<Watched> = Vec::new();
@@ -1071,13 +1071,17 @@ impl Epoll {
                     stats::returned_error();
                     return Err(LxError::ENOMEM);
                 }
-                let (mut net, mut interactive) = (false, false);
+                let (mut net, mut interactive, mut input) = (false, false, false);
                 let mut armed = inner.armed.iter().peekable();
                 for (fd, (event, file)) in &inner.interest_list {
                     if file.is_socket() {
                         net = true;
                     } else {
                         interactive = true;
+                        // A terminal or an input node: what the xHCI poll
+                        // of the wait's tick is for (`net::polls_input`).
+                        // An eventfd or a pipe is neither.
+                        input = input || file.is_char_device() || file.is_input_device();
                     }
                     while armed.peek().is_some_and(|(k, _)| *k < fd) {
                         armed.next();
@@ -1093,7 +1097,7 @@ impl Epoll {
                     };
                     list.push((*fd, *event, file.clone(), kept));
                 }
-                (list, inner.edge.clone(), net, interactive)
+                (list, inner.edge.clone(), net, interactive, input)
             };
             // (`watch_hid`, below, is asked only once the scan found nothing
             // and the wait is about to sleep: a call that returns at once has
@@ -1110,7 +1114,7 @@ impl Epoll {
             // task is not in yet, and would cost it the fallback tick. The
             // wait compares this after registering and re-scans if it moved.
             let hid_seq = crate::fs::devfs::input::wait::input_seq();
-            crate::net::io_wait_tick(watch_net, watch_interactive);
+            crate::net::io_wait_tick(watch_net, watch_input);
             // Sync readiness scan. Do NOT call `async_poll` here: each scan used
             // to Box::pin+poll+drop a future per watched fd (libinput epoll in
             // labwc touches dozens). The futures never stayed parked across

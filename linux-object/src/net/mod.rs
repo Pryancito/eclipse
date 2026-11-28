@@ -868,8 +868,13 @@ const DEFERRED_JOBS_PER_TICK_MAX: usize = 12;
 /// and is told of what arrives by the card's interrupt. A wait that
 /// watches no socket runs that work more rarely, so that shell and TTY
 /// loops are not held by it.
-pub fn io_wait_tick(watch_net: bool, _watch_interactive: bool) {
-    kernel_hal::input_poll::poll_input_devices();
+///
+/// `watch_input` is whether the wait has a terminal or an input node in
+/// it, which is what the xHCI poll is for: see [`polls_input`].
+pub fn io_wait_tick(watch_net: bool, watch_input: bool) {
+    if polls_input(watch_net, watch_input) {
+        kernel_hal::input_poll::poll_input_devices();
+    }
     if watch_net {
         let pending = kernel_hal::deferred_job::pending_deferred_jobs();
         let most = DEFERRED_JOBS_PER_TICK_MAX - DEFERRED_JOBS_PER_TICK;
@@ -879,6 +884,20 @@ pub fn io_wait_tick(watch_net: bool, _watch_interactive: bool) {
     } else if claim_interval(&LAST_DEFERRED_IDLE_US, mono_us(), DEFERRED_IDLE_INTERVAL_US) {
         kernel_hal::deferred_job::drain_deferred_jobs_max(1);
     }
+}
+
+/// Whether a wait polls the USB keyboard and mouse on its tick.
+///
+/// Not one on sockets with no terminal or input node among them (an
+/// eventfd or a pipe beside them is neither): no key or mouse frame is
+/// anything it waits for, and the timer polls the controller anyway
+/// (125 Hz) besides its MSI. Under nginx every `epoll_wait` of a worker
+/// came here (its eventfd made the set "interactive"), and the xHCI poll
+/// it ran up to a thousand times a second -- MMIO, the controller's locks
+/// and a copy of its list -- was 3% of the kernel's work, the network's
+/// waits paying for input nobody there reads.
+pub(crate) fn polls_input(watch_net: bool, watch_input: bool) -> bool {
+    watch_input || !watch_net
 }
 
 /// Pre-DHCP sentinel (Class E); must never be used for TX or ICMP.
@@ -2762,5 +2781,19 @@ mod ioctl_arg_tests {
         #[allow(unsafe_code)]
         let metric = unsafe { ifr.ifr_ifru.ifmetric };
         assert_eq!(metric, 0);
+    }
+}
+
+#[cfg(test)]
+mod polls_input_tests {
+    use super::polls_input;
+
+    /// Only a wait on nothing but sockets leaves the USB input alone.
+    #[test]
+    fn a_wait_on_sockets_alone_does_not_poll_the_keyboard() {
+        assert!(!polls_input(true, false));
+        assert!(polls_input(true, true));
+        assert!(polls_input(false, true));
+        assert!(polls_input(false, false));
     }
 }
