@@ -990,6 +990,8 @@ pub extern "C" fn trap_handler(tf: &mut TrapFrame) {
                 if tf.cs & 0b11 == 0b00 {
                     if crate::kstats::current_cpu_in_idle() {
                         crate::ktop::note_idle_tick();
+                    } else if executor::current_cpu_halt_polling() {
+                        crate::ktop::note_poll_tick();
                     } else {
                         crate::ktop::note_kernel_tick(tf.rip as u64, tf.rbp as u64);
                     }

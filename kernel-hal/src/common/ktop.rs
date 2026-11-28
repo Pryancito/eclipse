@@ -199,6 +199,12 @@ static LOCK_MISSES: AtomicU64 = AtomicU64::new(0);
 /// Ring-0 ticks on a CPU that was idle: not profiled, counted so the report
 /// can say how much of the machine the profile covers.
 static IDLE_TICKS: AtomicU64 = AtomicU64::new(0);
+/// Ring-0 ticks on a CPU spinning in the scheduler's idle poll (the window
+/// it looks at its run queue for before it halts, `HALTPOLL`). Not work
+/// either: they used to be profiled, and under nginx they were 27% of the
+/// "busy" kernel ticks, two `pause` loops at the top of the table that read
+/// as the scheduler itself being the cost.
+static POLL_TICKS: AtomicU64 = AtomicU64::new(0);
 
 /// One profile period, as [`take`] hands it over.
 pub struct Taken {
@@ -207,6 +213,7 @@ pub struct Taken {
     pub full: u64,
     pub lock_misses: u64,
     pub idle_ticks: u64,
+    pub poll_ticks: u64,
 }
 
 /// Everything recorded since the previous call, and start a new period.
@@ -219,12 +226,18 @@ pub fn take() -> Taken {
         full,
         lock_misses: LOCK_MISSES.swap(0, Relaxed),
         idle_ticks: IDLE_TICKS.swap(0, Relaxed),
+        poll_ticks: POLL_TICKS.swap(0, Relaxed),
     }
 }
 
 /// A timer tick interrupted ring 0 on an idle CPU.
 pub fn note_idle_tick() {
     IDLE_TICKS.fetch_add(1, Relaxed);
+}
+
+/// A timer tick interrupted ring 0 on a CPU polling for work before it halts.
+pub fn note_poll_tick() {
+    POLL_TICKS.fetch_add(1, Relaxed);
 }
 
 /// A timer tick interrupted ring 0 on a busy CPU at `rip` with frame pointer
@@ -237,8 +250,11 @@ pub fn note_kernel_tick(rip: u64, rbp: u64) {
     // One page-table walk per page, not per word: a frame chain mostly stays
     // on one or two pages of the stack.
     let last_page = core::cell::Cell::new(u64::MAX);
+    // A frame lives on a coroutine stack, and those are mapped outside the
+    // image window (`vmap_stack`'s PML4 slot, or the heap's grown regions):
+    // `is_kernel_addr` alone refused every one, so no path ever had a caller.
     let readable = |a: u64| {
-        if !crate::kaddr::is_kernel_addr(a) {
+        if !crate::kaddr::is_kernel_stack_addr(a) {
             return false;
         }
         let page = a & !0xfff;
