@@ -22,6 +22,15 @@ const SUM: u32 = 0x4010_5403;
 /// `_IO('T', 4)`: `EAGAIN` the first time, and the open is said to be
 /// writable a little after; 5 the next.
 const LATER: u32 = 0x5404;
+/// `_IOWR('T', 5, u32)`: the open's rate, at most 48000, which comes back;
+/// part of the open's setup ([`super::wire::IOCTL_KEEP`]).
+const SET_RATE: u32 = 0xc004_5405;
+/// `_IO('T', 6)`: returns the open's rate, 0 before one is set.
+const GET_RATE: u32 = 0x5406;
+/// `_IO('T', 7)`: the open starts, `EBADFD` before it has a rate; kept too.
+const START: u32 = 0x5407;
+/// `_IO('T', 8)`: returns how many times the open was started.
+const STARTS: u32 = 0x5408;
 
 struct Echo {
     node: Arc<ServedNode>,
@@ -67,6 +76,19 @@ fn echo_server() -> (
     thread::JoinHandle<ZxError>,
     Arc<std::sync::Mutex<Option<Arc<Fifo>>>>,
 ) {
+    echo_server_with(false)
+}
+
+/// [`echo_server`], one that refuses every rate if `no_rates`.
+#[allow(clippy::type_complexity)]
+fn echo_server_with(
+    no_rates: bool,
+) -> (
+    Arc<Link>,
+    Arc<AtomicUsize>,
+    thread::JoinHandle<ZxError>,
+    Arc<std::sync::Mutex<Option<Arc<Fifo>>>>,
+) {
     let (ours, theirs) = Fifo::create(SLOTS * 2, MSG);
     let window = VmObject::new_paged((SLOTS * SLOT_LEN).div_ceil(4096));
     let link = Arc::new(Link::new(ours, window.clone()).unwrap());
@@ -75,6 +97,8 @@ fn echo_server() -> (
     let rel = released.clone();
     let server = thread::spawn(move || {
         let mut queues: BTreeMap<u32, Vec<u8>> = BTreeMap::new();
+        // Each open's rate and starts.
+        let mut rates: BTreeMap<u32, (u32, i64)> = BTreeMap::new();
         let mut next = 7u32;
         let mut later = 0;
         loop {
@@ -207,6 +231,32 @@ fn echo_server() -> (
                     }
                     5
                 }
+                OP_IOCTL if req.a == SET_RATE as u64 => {
+                    let mut got = [0u8; 4];
+                    window.read(slot, &mut got).unwrap();
+                    let rate = u32::from_ne_bytes(got).min(48_000);
+                    if no_rates || rate == 0 {
+                        -22
+                    } else {
+                        rates.entry(req.fh).or_default().0 = rate;
+                        window.write(slot, &rate.to_ne_bytes()).unwrap();
+                        reply.len = 4;
+                        reply.a = super::wire::IOCTL_KEEP;
+                        0
+                    }
+                }
+                OP_IOCTL if req.a == GET_RATE as u64 => {
+                    rates.get(&req.fh).map_or(0, |r| r.0 as i64)
+                }
+                OP_IOCTL if req.a == START as u64 => match rates.get_mut(&req.fh) {
+                    Some(r) if r.0 != 0 => {
+                        r.1 += 1;
+                        reply.a = super::wire::IOCTL_KEEP;
+                        0
+                    }
+                    _ => -77,
+                },
+                OP_IOCTL if req.a == STARTS as u64 => rates.get(&req.fh).map_or(0, |r| r.1),
                 OP_IOCTL => -25,
                 // The device's memory: page 0 is the second page of the
                 // writable VMO (handle 5), page 1 the read-only one
@@ -642,4 +692,97 @@ fn any_other_node_hangs_up_as_soon_as_its_server_goes() {
     assert_eq!(echo.node.server_went(), None);
     let _ = echo.server.take().unwrap().join();
     assert_eq!(ready(&open), (false, false, true, true));
+}
+
+/// A sound card's PCM node, served by [`echo_server`].
+fn sound_echo() -> Echo {
+    echo_at("snd/pcmC0D0p", rcore_fs::vfs::make_rdev(116, 16))
+}
+
+#[test]
+fn a_sound_node_tells_the_next_server_the_setup_of_each_open() {
+    let mut echo = sound_echo();
+    let open = echo.node.open_client(2).unwrap();
+    let other = echo.node.open_client(2).unwrap();
+    {
+        let open = open.downcast_ref::<ServedOpen>().unwrap();
+        // What comes back is what is kept: the rate the server settled on.
+        let mut rate = 96_000u32;
+        open.ioctl(SET_RATE, &mut rate as *mut u32 as usize)
+            .unwrap();
+        assert_eq!(rate, 48_000);
+        open.ioctl(START, 0).unwrap();
+        // The latest of a command goes last, as a stream set up again is
+        // started again after.
+        let mut rate = 44_100u32;
+        open.ioctl(SET_RATE, &mut rate as *mut u32 as usize)
+            .unwrap();
+        open.ioctl(START, 0).unwrap();
+        // Refused: not kept.
+        let mut zero = 0u32;
+        assert_eq!(
+            open.ioctl(SET_RATE, &mut zero as *mut u32 as usize),
+            Err(LxError::EINVAL)
+        );
+        assert_eq!(open.ioctl(GET_RATE, 0).unwrap(), 44_100);
+    }
+    let turn = echo.node.server_went().expect("a sound node waits");
+    let _ = echo.server.take().unwrap().join();
+    let (link, _released, server, _servers) = echo_server();
+    echo.node.0.take_over(link);
+    echo.server = Some(server);
+    let open = open.downcast_ref::<ServedOpen>().unwrap();
+    // The next server was told the setup, in order: the rate first, so the
+    // start it was told after was one it took.
+    assert_eq!(open.ioctl(GET_RATE, 0).unwrap(), 44_100);
+    assert_eq!(open.ioctl(STARTS, 0).unwrap(), 1);
+    // An open with nothing kept is opened again, and nothing more.
+    let other = other.downcast_ref::<ServedOpen>().unwrap();
+    assert_eq!(other.ioctl(GET_RATE, 0).unwrap(), 0);
+    assert!(echo.node.taken_over_since(turn));
+}
+
+#[test]
+fn an_open_the_next_server_will_not_set_up_again_hangs_up() {
+    let mut echo = sound_echo();
+    let open = echo.node.open_client(2).unwrap();
+    let mut rate = 8_000u32;
+    open.downcast_ref::<ServedOpen>()
+        .unwrap()
+        .ioctl(SET_RATE, &mut rate as *mut u32 as usize)
+        .unwrap();
+    let plain = echo.node.open_client(2).unwrap();
+    let _ = echo.node.server_went().unwrap();
+    let _ = echo.server.take().unwrap().join();
+    let (link, released, server, _servers) = echo_server_with(true);
+    echo.node.0.take_over(link);
+    echo.server = Some(server);
+    // The one it refused hangs up, and is let go of on the next server;
+    // the other goes on.
+    let open = open.downcast_ref::<ServedOpen>().unwrap();
+    assert_eq!(open.ioctl(GET_RATE, 0), Err(LxError::ENODEV));
+    assert_eq!(ready(&plain), (false, true, false, false));
+    for _ in 0..200 {
+        if released.load(Ordering::SeqCst) == 1 {
+            break;
+        }
+        thread::sleep(std::time::Duration::from_millis(5));
+    }
+    assert_eq!(released.load(Ordering::SeqCst), 1);
+}
+
+#[test]
+fn the_nodes_that_outlive_their_server_are_input_and_sound() {
+    let input = rcore_fs::vfs::make_rdev(13, 64);
+    assert!(outlives_server("input/event0", input));
+    assert!(outlives_server("dsp", 0));
+    assert!(outlives_server("dsp1", 0));
+    assert!(outlives_server("snd/pcmC1D0p", 0));
+    assert!(outlives_server("snd/controlC0", 0));
+    assert!(!outlives_server("dspx", 0));
+    assert!(!outlives_server("test/echo0", 0));
+    assert!(!outlives_server(
+        "input/event0",
+        rcore_fs::vfs::make_rdev(240, 1)
+    ));
 }

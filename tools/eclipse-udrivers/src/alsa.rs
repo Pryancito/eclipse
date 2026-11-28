@@ -1328,6 +1328,16 @@ pub struct PcmNode<'a, O> {
     pub stream: &'a mut Stream<O>,
 }
 
+/// Whether `cmd` sets a PCM open up ([`crate::served::Device::keeps`]):
+/// `TSTAMP`, `TTSTAMP`, `USER_PVERSION`, `HW_PARAMS`, `HW_FREE`,
+/// `SW_PARAMS`, `PREPARE` and `DROP`. The latest of each, in order, leaves
+/// the next driver's stream where the program's was, or prepared for a
+/// stream that ran: the program's next write starts it again.
+pub fn pcm_keeps(cmd: u32) -> bool {
+    (cmd >> 8) & 0xff == b'A' as u32
+        && matches!(cmd & 0xff, 0x02..=0x04 | 0x11 | 0x12 | 0x13 | 0x40 | 0x43)
+}
+
 /// `SNDRV_PCM_IOCTL_WRITEI_FRAMES`, by its type and number.
 fn is_writei(cmd: u32) -> bool {
     cmd & 0xffff == 0x4150
@@ -1367,6 +1377,12 @@ impl<O: Output> Device for PcmNode<'_, O> {
         let r = self.pcm.control(self.stream, cmd, data, false);
         self.pcm.tell(self.stream, Some(node), false);
         r
+    }
+
+    /// The stream's setup and state: its parameters, and whether it is
+    /// prepared, which the next driver is told again should this one die.
+    fn keeps(&self, cmd: u32) -> bool {
+        pcm_keeps(cmd)
     }
 
     fn fetch(

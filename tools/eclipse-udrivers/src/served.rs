@@ -54,6 +54,10 @@ pub const OP_READY: u32 = 16;
 /// In an `ioctl`'s reply, in `a`: the slot holds an [`Iov`], what more of
 /// the program's memory it needs.
 pub const IOCTL_FETCH: u64 = 1;
+/// In an `ioctl`'s reply, in `a`: done, and part of the open's setup
+/// ([`Device::keeps`]). The kernel tells it again to the next server that
+/// takes the open over, once this one dies.
+pub const IOCTL_KEEP: u64 = 2;
 /// In an `ioctl`'s request, above the command in `a`: the open waits, and
 /// an `EAGAIN` is asked again once the node says something of it.
 pub const IOCTL_WAITS: u64 = 1 << 32;
@@ -185,6 +189,16 @@ pub trait Device {
     /// not memory it can read; every other command is then answered
     /// `EFAULT` without reaching [`Device::ioctl`].
     fn by_value(&self, cmd: u32) -> bool {
+        let _ = cmd;
+        false
+    }
+    /// Whether `cmd`, done, is part of the open's setup: what the next
+    /// server, should this one die, is told again of each open the kernel
+    /// keeps for it ([`IOCTL_KEEP`]), the latest of each command in the
+    /// order they were last done, before the open's next request. Only a
+    /// plain `ioctl` ([`Device::ioctl`]); what comes back of an `_IOWR` is
+    /// what is told again.
+    fn keeps(&self, cmd: u32) -> bool {
         let _ = cmd;
         false
     }
@@ -543,10 +557,16 @@ impl Node {
                             reply.a = IOCTL_FETCH;
                             Ok(0)
                         }
-                        Ok(None) => dev.ioctl(self, req.fh, cmd, req.b, data).map(|(ret, n)| {
-                            reply.len = n.min(out) as u32;
-                            ret
-                        }),
+                        Ok(None) => {
+                            let keep = dev.keeps(cmd);
+                            dev.ioctl(self, req.fh, cmd, req.b, data).map(|(ret, n)| {
+                                reply.len = n.min(out) as u32;
+                                if keep {
+                                    reply.a = IOCTL_KEEP;
+                                }
+                                ret
+                            })
+                        }
                     }
                 }
             }

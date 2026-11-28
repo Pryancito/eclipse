@@ -423,3 +423,84 @@ fn the_control_lists_its_two_elements_and_sets_the_cards_volume() {
         Err(ENOENT)
     );
 }
+
+/// The setup the kernel keeps of an open, as it keeps it
+/// (`linux-object`'s `Open::keep`): the latest of each command the node
+/// [`pcm_keeps`], last, with what came back of it.
+#[derive(Default)]
+struct Kept(Vec<(u32, Vec<u8>)>);
+
+impl Kept {
+    fn call(&mut self, c: &mut Card, cmd: u32, mut b: Vec<u8>) -> Result<Vec<u8>, i32> {
+        c.pcm.control(&mut c.s, cmd, &mut b, false)?;
+        if pcm_keeps(cmd) {
+            self.0.retain(|(k, _)| *k != cmd);
+            self.0.push((cmd, b.clone()));
+        }
+        Ok(b)
+    }
+
+    /// What the kernel tells the next driver's open.
+    fn replay(&self, c: &mut Card) {
+        for (cmd, b) in &self.0 {
+            let mut b = b.clone();
+            c.pcm.control(&mut c.s, *cmd, &mut b, false).unwrap();
+        }
+    }
+}
+
+fn bytes<T: Copy>(v: &T) -> Vec<u8> {
+    let mut b = vec![0u8; core::mem::size_of::<T>()];
+    put(&mut b, v).unwrap();
+    b
+}
+
+#[test]
+fn the_next_driver_told_the_kept_setup_has_the_stream_set_up_and_prepared() {
+    let mut k = Kept::default();
+    let mut c = Card::new();
+    let bare = |nr: u32| ((b'A' as u32) << 8) | nr;
+    k.call(&mut c, bare(0x04), vec![]).unwrap();
+    let mut p = any();
+    pin(&mut p, IV_RATE, 44100);
+    pin(&mut p, IV_PERIOD_SIZE, 1024);
+    k.call(&mut c, cmd::<SndPcmHwParams>(b'A', 0x11), bytes(&p))
+        .unwrap();
+    let mut sw: SndPcmSwParams = zeroed();
+    sw.avail_min = 1024;
+    sw.start_threshold = 2048;
+    sw.stop_threshold = c.pcm.buffer_size;
+    k.call(&mut c, cmd::<SndPcmSwParams>(b'A', 0x13), bytes(&sw))
+        .unwrap();
+    k.call(&mut c, bare(0x40), vec![]).unwrap();
+    // It ran, was dropped and prepared again: what is kept is the latest
+    // prepare, after the drop.
+    assert_eq!(c.writei(4096, 7, false), Ok(4096));
+    assert_eq!(c.pcm.state, STATE_RUNNING);
+    k.call(&mut c, bare(0x43), vec![]).unwrap();
+    k.call(&mut c, bare(0x40), vec![]).unwrap();
+    // Asked, not set up: not kept.
+    k.call(
+        &mut c,
+        cmd::<SndPcmStatus>(b'A', 0x20),
+        bytes(&zeroed::<SndPcmStatus>()),
+    )
+    .unwrap();
+    let kept: Vec<u32> = k.0.iter().map(|(cmd, _)| cmd & 0xff).collect();
+    assert_eq!(kept, [0x04, 0x11, 0x13, 0x43, 0x40]);
+    let (buffer, period, rate) = (c.pcm.buffer_size, c.pcm.period_size, c.pcm.rate);
+
+    // The driver dies; the next one is told what was kept.
+    let mut next = Card::new();
+    k.replay(&mut next);
+    assert_eq!(next.pcm.state, STATE_PREPARED);
+    assert_eq!(
+        (next.pcm.buffer_size, next.pcm.period_size, next.pcm.rate),
+        (buffer, period, rate)
+    );
+    // The program writes on, and the stream starts at its threshold.
+    assert_eq!(next.writei(1024, 7, false), Ok(1024));
+    assert!(!next.s.running());
+    assert_eq!(next.writei(1024, 7, false), Ok(1024));
+    assert_eq!(next.pcm.state, STATE_RUNNING);
+}

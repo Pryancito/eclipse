@@ -27,10 +27,9 @@ PORT=
 if [ "$1" = -p ]; then PORT=$2; shift 2; fi
 WANT=" $* "
 
-# The known gaps: checks expected to fail until their step is done.
-# audio.death: what was open of a sound card is the dead driver's; the next
-# one does not know its setup (format, rate), so it hangs up.
-KNOWN=" audio.death "
+# The known gaps: checks expected to fail until their step is done. None
+# left: each step of the plan closed one.
+KNOWN=" "
 
 failed=0
 report() { # report name ok|why
@@ -305,7 +304,9 @@ done
 wanted fs && fs_checks
 wanted net && net_checks
 wanted input && chardev_checks input uinput "$(input_node)" cat "$(input_node)"
-wanted audio && chardev_checks audio uhda /dev/dsp dd if=/dev/zero of=/dev/dsp bs=4096 count=200
+# /dev/dsp plays 8-bit mono at 8 kHz until told otherwise: 80 KB is 10 s of
+# sound, which outlasts the driver's death and ends well within the wait.
+wanted audio && chardev_checks audio uhda /dev/dsp dd if=/dev/zero of=/dev/dsp bs=4096 count=20
 
 echo "crash-servers: $failed failed"
 [ $failed -eq 0 ]
