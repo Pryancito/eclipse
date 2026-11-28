@@ -1438,8 +1438,31 @@ fn syscall_ret(ret: SysResult) -> isize {
 /// the table with no implementation behind it. Half of "we do not do that"
 /// was already correct, which is why the other half went unnoticed.
 fn unknown_syscall_number(num: u32) -> isize {
-    error!("invalid syscall number: {}", num);
+    if first_report_of_unknown(num) {
+        error!("invalid syscall number: {} (reported once per number)", num);
+    }
     syscall_ret(Err(LxError::ENOSYS))
+}
+
+/// Numbers below this get one report each; any number above it shares the
+/// last bit, so a program probing far past the table still logs once.
+const UNKNOWN_REPORT_BITS: usize = 1024;
+
+/// Whether this is the first time `num` reaches [`unknown_syscall_number`].
+///
+/// Every unknown number used to print an `error!` line, and with the serial
+/// console that is a synchronous write of the whole line: measured in QEMU
+/// (TCG) an ENOSYS cost ~2.7 M TSC cycles (about 1.3 ms), against ~650 on
+/// Linux in the same VM. A program that probes for a syscall in a loop, or a
+/// libc that falls back on every call, paid that each time. Linux answers
+/// ENOSYS silently; one line per number still says what is missing.
+fn first_report_of_unknown(num: u32) -> bool {
+    use core::sync::atomic::{AtomicU64, Ordering};
+    static SEEN: [AtomicU64; UNKNOWN_REPORT_BITS / 64] =
+        [const { AtomicU64::new(0) }; UNKNOWN_REPORT_BITS / 64];
+    let bit = (num as usize).min(UNKNOWN_REPORT_BITS - 1);
+    let mask = 1u64 << (bit % 64);
+    SEEN[bit / 64].fetch_or(mask, Ordering::Relaxed) & mask == 0
 }
 
 /// The `flags` argument for a `*at` syscall whose handler takes one, from the
@@ -2045,5 +2068,29 @@ mod benches {
     #[bench]
     fn alsa_ioctl_name_of_a_pcm_call(b: &mut Bencher) {
         b.iter(|| black_box(alsa_ioctl_name(black_box(0xc250_4110))));
+    }
+}
+
+#[cfg(test)]
+mod unknown_syscall_tests {
+    use super::*;
+
+    #[test]
+    fn an_unknown_number_is_reported_once_and_still_answers_enosys() {
+        // Numbers no other test asks about: the bitmap is one per binary.
+        assert!(first_report_of_unknown(777));
+        assert!(!first_report_of_unknown(777));
+        assert!(first_report_of_unknown(778));
+        assert_eq!(
+            unknown_syscall_number(777),
+            syscall_ret(Err(LxError::ENOSYS))
+        );
+    }
+
+    #[test]
+    fn numbers_past_the_bitmap_share_its_last_bit() {
+        assert!(first_report_of_unknown(u32::MAX));
+        assert!(!first_report_of_unknown(5000));
+        assert!(!first_report_of_unknown(UNKNOWN_REPORT_BITS as u32 - 1));
     }
 }
