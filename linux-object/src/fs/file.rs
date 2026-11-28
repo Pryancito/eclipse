@@ -1414,13 +1414,17 @@ impl File {
 
     /// Sync all data and metadata
     pub fn sync_all(&self) -> LxResult {
-        self.inner.read().inode.sync_all()?;
+        // With the lock let go: a served filesystem waits for its server,
+        // see `write`.
+        let inode = self.inner.read().inode.clone();
+        inode.sync_all()?;
         Ok(())
     }
 
     /// Sync data (not include metadata)
     pub fn sync_data(&self) -> LxResult {
-        self.inner.read().inode.sync_data()?;
+        let inode = self.inner.read().inode.clone();
+        inode.sync_data()?;
         Ok(())
     }
 
@@ -1443,7 +1447,9 @@ impl File {
 
     /// lookup the file following the link
     pub fn lookup_follow(&self, path: &str, max_follow: usize) -> LxResult<Arc<dyn INode>> {
-        Ok(self.inner.read().inode.lookup_follow(path, max_follow)?)
+        // With the lock let go: a served directory may ask its server.
+        let inode = self.inner.read().inode.clone();
+        Ok(inode.lookup_follow(path, max_follow)?)
     }
 
     /// get the name of dir entry

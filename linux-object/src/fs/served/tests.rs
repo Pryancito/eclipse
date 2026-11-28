@@ -1383,6 +1383,8 @@ fn the_server_is_asked_with_the_open_files_lock_let_go() {
     // The offset is the file's still: the next write goes on from the last.
     assert_eq!(FileLike::write(&*out, b"three"), Ok(5));
     assert_eq!(&mount.on_server("big.bin").unwrap()[3..8], b"three");
+    out.sync_data().unwrap();
+    out.sync_all().unwrap();
 
     let docs = File::new(
         root.find("docs").unwrap(),
@@ -1395,9 +1397,12 @@ fn the_server_is_asked_with_the_open_files_lock_let_go() {
         names.push(name);
     }
     assert_eq!(names.len(), 302);
+    mount.fs.dirs.lock().listed.clear();
+    assert!(docs.lookup_follow("file-007", 1).is_ok());
     *WATCHED.lock().unwrap() = None;
 
-    assert!(mount.asked(OP_WRITE) >= 3 && mount.asked(OP_LIST) >= 1);
+    assert!(mount.asked(OP_WRITE) >= 3 && mount.asked(OP_LIST) >= 2);
+    assert!(mount.asked(OP_SYNC) >= 2);
     assert_eq!(ANSWERED_UNDER_THE_LOCK.load(Ordering::SeqCst), 0);
 }
 
