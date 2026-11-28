@@ -26,6 +26,11 @@ const READY: &str = "/run/eclipse-mountd";
 /// `mount(2)`, `b` bytes of options in the data area.
 const OP_MOUNT: u32 = 1;
 
+/// Start a server that takes over the served mount, which has none: the
+/// server before it died and so did the process that would have started
+/// the next. The same names and options; `a` only `MS_RDONLY`.
+const OP_ADOPT: u32 = 2;
+
 /// `MS_RDONLY`, which the kernel sets for an `ro` among the options too.
 const MS_RDONLY: u64 = 1;
 
@@ -126,13 +131,17 @@ impl<'a> Mount<'a> {
             .ok_or(libc::ENODEV)
     }
 
-    /// The command that makes it: its program and arguments.
-    fn command(&self) -> Result<(&'static str, Vec<&'a str>), i32> {
+    /// The command that makes it, or with `take_over` that takes over the
+    /// mount that is there: its program and arguments.
+    fn command(&self, take_over: bool) -> Result<(&'static str, Vec<&'a str>), i32> {
         let server = self.server()?;
         if server.on_a_file && !self.source.starts_with('/') {
             return Err(libc::EINVAL);
         }
-        let mut args = Vec::with_capacity(5);
+        let mut args = Vec::with_capacity(6);
+        if take_over {
+            args.push("-t");
+        }
         if self.read_only {
             args.push("-r");
         }
@@ -146,13 +155,17 @@ impl<'a> Mount<'a> {
     }
 }
 
-/// Make the mount asked for: 0, or a negative `errno`.
-fn make(names: &[u8], a: u64, options: &[u8]) -> i64 {
+/// Make the mount asked for, or with `take_over` start the server of the
+/// one that is there: 0, or a negative `errno`.
+fn make(names: &[u8], a: u64, options: &[u8], take_over: bool) -> i64 {
     let mount = match Mount::parse(names, a, options) {
         Ok(mount) => mount,
         Err(errno) => return -errno as i64,
     };
-    let (program, args) = match mount.command() {
+    if take_over {
+        eprintln!("{NAME}: {} has no server: starting one", mount.target);
+    }
+    let (program, args) = match mount.command(take_over) {
         Ok(command) => command,
         Err(errno) => {
             if errno == libc::ENODEV {
@@ -241,7 +254,9 @@ fn main() {
         for msg in &mut msgs[..n] {
             let slot = msg.reqid as usize & (SLOTS - 1);
             msg.status = match msg.op {
-                OP_MOUNT if msg.names as usize <= NAME_AREA && msg.b as usize <= DATA_AREA => {
+                OP_MOUNT | OP_ADOPT
+                    if msg.names as usize <= NAME_AREA && msg.b as usize <= DATA_AREA =>
+                {
                     // SAFETY: inside the slot, which is inside the mapping;
                     // the kernel wrote it before the message and leaves it
                     // alone until the reply.
@@ -252,9 +267,9 @@ fn main() {
                             std::slice::from_raw_parts(at.add(NAME_AREA), msg.b as usize),
                         )
                     };
-                    make(names, msg.a, options)
+                    make(names, msg.a, options, msg.op == OP_ADOPT)
                 }
-                OP_MOUNT => -libc::EINVAL as i64,
+                OP_MOUNT | OP_ADOPT => -libc::EINVAL as i64,
                 _ => -libc::ENOSYS as i64,
             };
             msg.b = 0;
@@ -299,7 +314,7 @@ mod tests {
     fn each_type_is_made_by_its_server() {
         let command = |names: &[u8], a, options: &[u8]| {
             Mount::parse(names, a, options).and_then(|m| {
-                m.command()
+                m.command(false)
                     .map(|(p, args)| (p, args.iter().map(|a| a.to_string()).collect::<Vec<_>>()))
             })
         };
@@ -330,7 +345,49 @@ mod tests {
         // A block filesystem's source is a path; NFS's is not.
         assert_eq!(command(b"srv:/x\0/mnt\0btrfs", 0, b""), Err(libc::EINVAL));
         assert_eq!(command(b"/img\0/mnt\0ext4", 0, b""), Err(libc::ENODEV));
-        assert_eq!(make(b"/img\0/mnt\0ext4", 0, b""), -libc::ENODEV as i64);
+        assert_eq!(
+            make(b"/img\0/mnt\0ext4", 0, b"", false),
+            -libc::ENODEV as i64
+        );
+    }
+
+    /// A mount with no server, whose watcher died too, gets one that takes
+    /// it over: the same command with `-t` first.
+    #[test]
+    fn a_mount_taken_over_is_the_same_command_with_t() {
+        let command = |names: &[u8], a, options: &[u8]| {
+            let m = Mount::parse(names, a, options).unwrap();
+            let (program, args) = m.command(true).unwrap();
+            (
+                program,
+                args.iter().map(|a| a.to_string()).collect::<Vec<_>>(),
+            )
+        };
+        assert_eq!(
+            command(b"/dev/vdb1\0/mnt/usb\0vfat", MS_RDONLY, b""),
+            (
+                "/bin/eclipse-fatfs",
+                vec![
+                    "-t".to_string(),
+                    "-r".into(),
+                    "/dev/vdb1".into(),
+                    "/mnt/usb".into()
+                ]
+            )
+        );
+        assert_eq!(
+            command(b"srv:/x\0/mnt\0nfs", 0, b"addr=10.0.2.2"),
+            (
+                "/bin/eclipse-nfs",
+                vec![
+                    "-t".to_string(),
+                    "-o".into(),
+                    "addr=10.0.2.2".into(),
+                    "srv:/x".into(),
+                    "/mnt".into()
+                ]
+            )
+        );
     }
 
     /// What a mount its server did not make is: the kernel's own for btrfs

@@ -99,6 +99,15 @@ pub const SERVE_EXTRAS: usize = 16;
 /// between two starts of a service that keeps dying (8 s).
 const SERVER_GRACE_MS: u64 = 10_000;
 
+/// How long a mount waits for the next server from its own watcher (the
+/// process its server came from, which starts another within two seconds)
+/// before the mount helper is asked for one ([`ServedFs::adopted`]): the
+/// watcher may have died too, and then nothing else would start one.
+const ADOPT_AFTER_MS: u64 = 5_000;
+/// The least time between two such asks of one mount: a mount whose
+/// servers die as soon as they start does not keep the helper busy.
+const ADOPT_EVERY_MS: u64 = 30_000;
+
 /// The most entries of one directory the kernel takes: a server that never
 /// says its listing is over does not fill the heap.
 const MAX_ENTRIES: usize = 1 << 20;
@@ -250,6 +259,19 @@ struct Server {
     turns: usize,
 }
 
+/// What a mount knows of asking the helper for its next server.
+#[derive(Default)]
+struct Adoption {
+    /// The turn of the dead server it was last asked for after.
+    turn: usize,
+    /// When, and until when a request waits for the server asked for.
+    asked_at: u64,
+    waiting_until: u64,
+    /// The options of the `mount(2)` that made it, which the server of an
+    /// NFS mount needs again (`addr=`, `vers=`).
+    options: String,
+}
+
 /// A filesystem behind a FIFO.
 ///
 /// When its server dies the mount stays, with what is open on it. A
@@ -272,6 +294,10 @@ pub struct ServedFs {
     /// The source and the type of the mount's line in the mount table, and
     /// the flags it was made with: what the next server must say again.
     shown: Mutex<(String, String, usize)>,
+    /// Asking the helper for a server when its own watcher starts none,
+    /// after [`ADOPT_AFTER_MS`].
+    adoption: Mutex<Adoption>,
+    adopt_after_ms: AtomicU64,
     this: Weak<Self>,
     dev_id: u64,
     fold_case: bool,
@@ -327,6 +353,8 @@ impl ServedFs {
             grace_ms: AtomicU64::new(SERVER_GRACE_MS),
             kept: Mutex::new(None),
             shown: Mutex::new((String::new(), String::new(), 0)),
+            adoption: Mutex::new(Adoption::default()),
+            adopt_after_ms: AtomicU64::new(ADOPT_AFTER_MS),
             this: this.clone(),
             dev_id: DEV_COUNTER.fetch_add(1, Ordering::Relaxed),
             fold_case,
@@ -436,6 +464,66 @@ impl ServedFs {
         link.is_dead() && link::now_ms() > link.died_at() + self.grace_ms.load(Ordering::Relaxed)
     }
 
+    /// Where it is mounted, while it is.
+    fn place(&self) -> Option<String> {
+        MOUNTS
+            .lock()
+            .iter()
+            .find(|(_, fs)| core::ptr::eq(Arc::as_ptr(fs), self))
+            .map(|(at, _)| at.clone())
+    }
+
+    /// Whether a request waits on a server the mount helper was asked for.
+    ///
+    /// A request that finds the server of `link` dead for
+    /// [`ADOPT_AFTER_MS`], with no next one from its watcher, has the
+    /// helper start one that takes the mount over (`eclipse-mountd`, which
+    /// init starts again when it dies): the watcher died too, or gave up.
+    /// Once for each dead server, and no more often than
+    /// [`ADOPT_EVERY_MS`]; the requests then wait for that server as long
+    /// as for any next one. Asked from the request's own thread, with no
+    /// lock held: the helper answers when the server has taken the mount.
+    fn adopted(&self, link: &Link) -> bool {
+        if !link.is_dead() {
+            return false;
+        }
+        let now = link::now_ms();
+        let grace = self.grace_ms.load(Ordering::Relaxed);
+        let turn = self.server.lock().turns;
+        let options = {
+            let mut adoption = self.adoption.lock();
+            if adoption.turn == turn {
+                return now <= adoption.waiting_until;
+            }
+            let soon = adoption.asked_at != 0 && now < adoption.asked_at + ADOPT_EVERY_MS;
+            let after = self.adopt_after_ms.load(Ordering::Relaxed);
+            if now < link.died_at() + after || soon {
+                return false;
+            }
+            adoption.turn = turn;
+            adoption.asked_at = now;
+            adoption.waiting_until = now + grace;
+            adoption.options.clone()
+        };
+        let Some(at) = self.place() else {
+            self.adoption.lock().waiting_until = 0;
+            return false;
+        };
+        let (source, fstype, flags) = self.shown.lock().clone();
+        let read_only = flags & SERVE_READ_ONLY != 0;
+        match helper::adopt(&source, &at, &fstype, read_only, &options) {
+            Ok(()) => {
+                info!("served fs: {at} had no server: the mount helper started one");
+                true
+            }
+            Err(e) => {
+                warn!("served fs: {at} has no server, and the mount helper started none: {e:?}");
+                self.adoption.lock().waiting_until = 0;
+                false
+            }
+        }
+    }
+
     /// Ask the server `op` with `names` in the slot (a path, or two with a
     /// NUL between), `a`, `b` and `data`. When the server dies under the
     /// request it is made again with the next one, and the answer says so:
@@ -468,7 +556,8 @@ impl ServedFs {
                 if !Arc::ptr_eq(&now, &link) {
                     break now;
                 }
-                if !self.mounted.load(Ordering::Acquire) || self.deserted(&link) {
+                let adopted = self.adopted(&link);
+                if !self.mounted.load(Ordering::Acquire) || (!adopted && self.deserted(&link)) {
                     return (Err(Fail::Said(FsError::DeviceError)), again);
                 }
                 link::between_looks(&mut away);
@@ -1395,6 +1484,15 @@ pub fn serve(
         kept: None,
         taken_over: false,
     })
+}
+
+/// The served mount at `target` was made by a `mount(2)` with the option
+/// string `options`: what the helper is given again for its next server.
+pub(super) fn made_with_options(target: &str, options: &str) {
+    let at = super::mount_ops::normalize_target(target);
+    if let Some((_, fs)) = MOUNTS.lock().iter().find(|(place, _)| *place == at) {
+        fs.adoption.lock().options = String::from(options);
+    }
 }
 
 /// `target` was unmounted, with whatever was mounted under it: the servers

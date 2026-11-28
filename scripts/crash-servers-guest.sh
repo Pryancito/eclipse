@@ -32,7 +32,7 @@ WANT=" $* "
 # for room in the sound buffer waits on the kernel, with no request out to
 # the driver, so a frozen driver is never found out (one with a request out
 # is killed after 10 s).
-KNOWN=" fs.fat.watcher input.death input.frozen audio.death audio.frozen "
+KNOWN=" input.death input.frozen audio.death audio.frozen "
 
 failed=0
 report() { # report name ok|why

@@ -48,3 +48,4 @@ tools/gfx-probe/gfx-probe
 tools/nvctl-probe/nvctl-probe
 tools/cuda-probe/cuda-probe
 tools/abiprobe/abiprobe
+crash-servers-qemu.log

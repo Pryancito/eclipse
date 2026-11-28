@@ -32,6 +32,14 @@ use crate::process::LinuxProcess;
 /// area the options.
 pub const OP_MOUNT: u32 = 1;
 
+/// Start a server that takes over the served mount at `target`, which has
+/// none: the names and the rest as for [`OP_MOUNT`], the flags only
+/// `MS_RDONLY`. 0 once the server has the mount, or a negative `errno`.
+pub const OP_ADOPT: u32 = 2;
+
+/// `MS_RDONLY`.
+const MS_RDONLY: u64 = 1;
+
 /// How long a mount may take before the helper is taken for hung: a
 /// server's start and the first read of its volume, or a network
 /// filesystem's greeting, which waits a minute for its server.
@@ -96,6 +104,26 @@ pub fn present() -> bool {
 /// type is one the kernel has no code for, as it would be on Linux without
 /// the module.
 pub fn ask(source: &str, target: &str, fstype: &str, flags: usize, data: &str) -> LxResult<()> {
+    call(OP_MOUNT, source, target, fstype, flags as u64, data)?;
+    super::made_with_options(target, data);
+    Ok(())
+}
+
+/// Have the helper start a server for the served mount of `source` at
+/// `target` as `fstype` that has none ([`OP_ADOPT`]), with the options
+/// `data` of the `mount(2)` that made it. `ENODEV` when there is no helper.
+pub fn adopt(
+    source: &str,
+    target: &str,
+    fstype: &str,
+    read_only: bool,
+    data: &str,
+) -> LxResult<()> {
+    let flags = if read_only { MS_RDONLY } else { 0 };
+    call(OP_ADOPT, source, target, fstype, flags, data)
+}
+
+fn call(op: u32, source: &str, target: &str, fstype: &str, flags: u64, data: &str) -> LxResult<()> {
     let link = HELPER
         .lock()
         .clone()
@@ -111,13 +139,7 @@ pub fn ask(source: &str, target: &str, fstype: &str, flags: usize, data: &str) -
         }
         names.extend_from_slice(part.as_bytes());
     }
-    match link.call_with(
-        OP_MOUNT,
-        &names,
-        flags as u64,
-        data.len() as u32,
-        data.as_bytes(),
-    ) {
+    match link.call_with(op, &names, flags, data.len() as u32, data.as_bytes()) {
         Ok(_) => Ok(()),
         Err(Fail::Errno(n)) => Err(LxError::from_errno(n)),
         Err(Fail::Said(e)) => Err(LxError::from(e)),
@@ -125,9 +147,13 @@ pub fn ask(source: &str, target: &str, fstype: &str, flags: usize, data: &str) -
     }
 }
 
+/// What a test that installs a fake helper holds: there is one helper.
+#[cfg(test)]
+pub(super) static TEST_LOCK: Mutex<()> = Mutex::new(());
+
 /// The helper `link`, as [`register`] makes it, for a test's fake one.
 #[cfg(test)]
-fn install(link: Arc<Link>) -> Helper {
+pub(super) fn install(link: Arc<Link>) -> Helper {
     *HELPER.lock() = Some(link.clone());
     Helper { link }
 }

@@ -281,10 +281,12 @@ fn address(parsed: &NfsSource, opts: &NfsOptions) -> IpAddr {
 
 fn usage() -> ! {
     eprintln!(
-        "usage: {NAME} [-f] [-r] [-o OPTIONS] HOST:/EXPORT DIR\n\
+        "usage: {NAME} [-f] [-r] [-t] [-o OPTIONS] HOST:/EXPORT DIR\n\
          Mount the NFSv3 export at DIR, served by this process.\n\
          -f: stay in the foreground, with nothing to start the server again.\n\
          -r: read-only.\n\
+         -t: take over the mount at DIR, which has no server (the mount helper\n\
+             asks for it when the process that started its servers is gone).\n\
          -o: the options of mount -t nfs (port=, mountport=, rsize=, wsize=, ...)."
     );
     exit(2)
@@ -293,11 +295,13 @@ fn usage() -> ! {
 fn main() {
     let mut args = std::env::args().skip(1);
     let (mut foreground, mut read_only, mut options) = (false, false, String::new());
+    let mut take_over = false;
     let mut rest = Vec::new();
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "-f" if rest.is_empty() => foreground = true,
             "-r" if rest.is_empty() => read_only = true,
+            "-t" if rest.is_empty() => take_over = true,
             "-o" if rest.is_empty() => options = args.next().unwrap_or_else(|| usage()),
             _ => rest.push(arg),
         }
@@ -323,7 +327,16 @@ fn main() {
         opts.wsize = DATA_AREA;
     }
     let addr = address(&parsed, &opts);
-    let dir = std::fs::canonicalize(dir).unwrap_or_else(|e| die(format_args!("{dir}: {e}")));
+    // The mount a server takes over is where the kernel said, and looking
+    // the place up would ask that mount, which has no server to answer.
+    let dir = if take_over {
+        if !dir.starts_with('/') {
+            die(format_args!("{dir}: not an absolute path"));
+        }
+        std::path::PathBuf::from(dir)
+    } else {
+        std::fs::canonicalize(dir).unwrap_or_else(|e| die(format_args!("{dir}: {e}")))
+    };
     let dir = dir
         .to_str()
         .unwrap_or_else(|| die("DIR is not text"))
@@ -337,7 +350,7 @@ fn main() {
         read_only,
     };
     if foreground {
-        serve(&m, false, None);
+        serve(&m, take_over, None);
     }
     let (mut told, tell) = pipe();
     // SAFETY: one thread, and the child goes on to `watch`.
@@ -347,7 +360,7 @@ fn main() {
             drop(told);
             // SAFETY: no pointers.
             unsafe { libc::setsid() };
-            watch(&m, tell)
+            watch(&m, take_over, tell)
         }
         _ => {
             drop(tell);
@@ -379,7 +392,7 @@ const LIVED: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// Start the server of the mount, and another each time one dies, until
 /// the mount is gone. `mounted` is told when the first has made the mount.
-fn watch(m: &Mount, mounted: File) -> ! {
+fn watch(m: &Mount, take_over: bool, mounted: File) -> ! {
     let mut mounted = Some(mounted);
     let mut quick = 0;
     loop {
@@ -392,7 +405,7 @@ fn watch(m: &Mount, mounted: File) -> ! {
             0 => {
                 drop(told);
                 drop(mounted);
-                serve(m, !first, Some(tell))
+                serve(m, !first || take_over, Some(tell))
             }
             server => server,
         };

@@ -56,6 +56,7 @@ fn helper(status: i64, answers: usize) -> (Helper, mpsc::Receiver<Asked>) {
 /// One test, as the helper is one for the whole kernel.
 #[test]
 fn a_mount_goes_to_the_helper_and_mount_returns_its_answer() {
+    let _one = TEST_LOCK.lock();
     // None there: the type is one the kernel has no code for.
     *HELPER.lock() = None;
     assert!(!present());
