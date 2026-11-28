@@ -25,6 +25,22 @@ pub(super) const F_SETOWN: usize = 8;
 /// `F_GETOWN`.
 pub(super) const F_GETOWN: usize = 9;
 
+/// `fcntl`'s owner commands: `None` when `cmd` is neither, so the caller
+/// goes on with its own.
+pub(super) fn fcntl(file: &Arc<dyn FileLike>, cmd: usize, arg: usize) -> Option<LxResult<usize>> {
+    match cmd {
+        F_GETOWN => Some(Ok(owner(file) as isize as usize)),
+        F_SETOWN => Some(
+            set_owner(file, arg as i32, |id| {
+                linux_object::process::find_task(id).is_some()
+                    || linux_object::process::find_thread(id).is_some()
+            })
+            .map(|_| 0),
+        ),
+        _ => None,
+    }
+}
+
 /// The owners set, by description: a pid, or minus a process group.
 static OWNERS: Mutex<Vec<(Weak<dyn FileLike>, i32)>> = Mutex::new(Vec::new());
 

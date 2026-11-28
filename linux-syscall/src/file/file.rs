@@ -210,25 +210,19 @@ impl linux_object::fs::FsIoctlContext for FsIoctlCtx<'_> {
 }
 
 #[cfg(test)]
+mod drm_ioctl_layout_tests;
+#[cfg(test)]
 mod ioctl_number_tests;
-
 #[cfg(test)]
 mod permission_tests;
-
 #[cfg(test)]
 mod positional_io_tests;
-
-#[cfg(test)]
-mod sync_file_range_tests;
-
-#[cfg(test)]
-mod wire_layout_tests;
-
-#[cfg(test)]
-mod drm_ioctl_layout_tests;
-
 #[cfg(test)]
 mod setlkw_tests;
+#[cfg(test)]
+mod sync_file_range_tests;
+#[cfg(test)]
+mod wire_layout_tests;
 
 /// A char device of major 1 (`/dev/null`, `zero`, `full`, `random`,
 /// `urandom`, `kmsg`...): `mem` devices that Linux never answers a terminal
@@ -2705,20 +2699,11 @@ impl Syscall<'_> {
                 .fcntl_record_lock(&file_like, get, wait, ofd, arg)
                 .await;
         }
+        if let Some(done) = super::fown::fcntl(&file_like, cmd, arg) {
+            return done;
+        }
         // Pipe capacity (fcntl(2), F_SETPIPE_SZ/F_GETPIPE_SZ): valid only on
         // pipe fds — Linux answers EBADF for other fd kinds.
-        // The owner of the description, for `SIGIO`: kept and given back
-        // (`fown`), which nginx needs to start a worker.
-        if cmd == super::fown::F_GETOWN {
-            return Ok(super::fown::owner(&file_like) as isize as usize);
-        }
-        if cmd == super::fown::F_SETOWN {
-            return super::fown::set_owner(&file_like, arg as i32, |id| {
-                linux_object::process::find_task(id).is_some()
-                    || linux_object::process::find_thread(id).is_some()
-            })
-            .map(|_| 0);
-        }
         if cmd == F_SETPIPE_SZ || cmd == F_GETPIPE_SZ {
             let file = file_like.downcast_ref::<File>().ok_or(LxError::EBADF)?;
             let inode = file.inode();
@@ -3461,17 +3446,13 @@ fn setfl_pipe_direct(file_like: &Arc<dyn FileLike>, next: OpenFlags) -> LxResult
 }
 
 #[cfg(test)]
+mod not_a_file_tests;
+#[cfg(test)]
 mod setfl_pipe_direct_tests;
-
 #[cfg(test)]
 mod statfs_flags_tests;
-
 #[cfg(test)]
 mod statfs_pseudo_tests;
-
-#[cfg(test)]
-mod not_a_file_tests;
-
 #[cfg(test)]
 mod statfs_type_tests;
 
@@ -3608,13 +3589,11 @@ pub(crate) fn grows_past_fsize(limit: u64, size: u64, new_len: u64) -> bool {
 }
 
 #[cfg(test)]
-mod staging_tests;
-
+mod pipe_size_tests;
 #[cfg(test)]
 mod pipe_write_tests;
-
 #[cfg(test)]
-mod pipe_size_tests;
+mod staging_tests;
 
 /// Two more arguments that the syscall declares wider than this tree read them:
 /// `lseek`'s `whence` (an `int`, read as a `u8`) and `faccessat`'s `mode`
@@ -3625,7 +3604,6 @@ mod pipe_size_tests;
 /// F_OK, which is the one answer a permission probe must never invent.
 #[cfg(test)]
 mod seek_and_access_tests;
-
 #[cfg(test)]
 mod truncate_type_tests;
 
@@ -3711,16 +3689,13 @@ mod syncobj_fd;
 use syncobj_fd::*;
 
 #[cfg(test)]
-mod syncobj_fd_ioctl_tests;
-
-#[cfg(test)]
-mod syncobj_fd_table_tests;
-
+mod sync_file_ioctl_tests;
 #[cfg(test)]
 mod sync_file_merge_table_tests;
-
 #[cfg(test)]
-mod sync_file_ioctl_tests;
+mod syncobj_fd_ioctl_tests;
+#[cfg(test)]
+mod syncobj_fd_table_tests;
 
 /// `posix_fadvise(2)` advice values. All of zCore's target arches
 /// (x86_64/aarch64/riscv64) share the asm-generic numbering; s390 is the one
@@ -3937,11 +3912,14 @@ pub(crate) fn utimes_times(
 }
 
 #[cfg(test)]
+mod utimes_gate_tests;
+#[cfg(test)]
 mod utimes_times_tests;
 
 #[cfg(test)]
-mod utimes_gate_tests;
-
+mod copy_file_range_flag_tests;
+#[cfg(test)]
+mod fallocate_mode_tests;
 /// `utimes` through the syscall. Its pure half has `utimes_times_tests`
 /// beside it; what only this can see is that the `timeval` microseconds
 /// become nanoseconds on the way to the inode, and that a null pathname
@@ -3950,19 +3928,12 @@ mod utimes_gate_tests;
 mod utimes_wiring_tests;
 
 #[cfg(test)]
-mod fallocate_mode_tests;
-
-#[cfg(test)]
-mod copy_file_range_flag_tests;
-
+mod benches;
 /// `sendfile(2)` and `copy_file_range(2)` on a ramfs file and a bounded,
 /// socket-like output: own file for the size ceiling (`xtask tamano`), no
 /// change to the tests.
 #[cfg(test)]
 mod copy_range_tests;
-
-#[cfg(test)]
-mod benches;
 
 /// `pwritev2` flags (`include/uapi/linux/fs.h`).
 const RWF_DSYNC: usize = 0x2;
@@ -3976,32 +3947,27 @@ fn atomic_write_valid(len: usize, pos: u64, min: usize, max: usize) -> bool {
 }
 
 #[cfg(test)]
-mod rwf_atomic_tests;
-
-#[cfg(test)]
-mod vfs_ioctl_tests;
-
-#[cfg(test)]
-mod record_lock_wiring_tests;
-
-#[cfg(test)]
 mod fcntl_families_tests;
-
 #[cfg(test)]
 mod read_write_refusal_tests;
+#[cfg(test)]
+mod record_lock_wiring_tests;
+#[cfg(test)]
+mod rwf_atomic_tests;
+#[cfg(test)]
+mod vfs_ioctl_tests;
 
 /// The syscall halves of the two pipe-write rules `pipe_write_tests` decides
 /// with pure helpers: the wait for room and the signal behind the `EPIPE`.
 #[cfg(test)]
 mod pipe_write_wiring_tests;
 
+#[cfg(test)]
+mod dsp_close_tests;
 /// What the positional calls answer when the file takes less than it was
 /// given, which nothing already in this tree does.
 #[cfg(test)]
 mod short_write_tests;
-
-#[cfg(test)]
-mod dsp_close_tests;
 
 /// Memfd seals: `F_SEAL_GROW` and `F_SEAL_EXEC` kept, and who may add one.
 #[cfg(test)]
