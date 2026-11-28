@@ -30,7 +30,7 @@ use std::io::{Read, Seek, SeekFrom};
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU8, Ordering};
 use std::sync::{Mutex, OnceLock};
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 mod boot_timeline;
 use boot_timeline::*;
@@ -511,6 +511,9 @@ struct Service {
     restart_now: bool,
     /// How many times this boot has started it, for the state file.
     total_starts: u32,
+    /// How its last run ended: the wall-clock second, and the cause
+    /// ([`control::death_cause`]), for the state file.
+    last_death: Option<(u64, String)>,
 }
 
 /// Default environment handed to every service (and inherited by their
@@ -1733,6 +1736,7 @@ fn parse_service(name: &str, text: &str) -> Option<Service> {
         held: false,
         restart_now: false,
         total_starts: 0,
+        last_death: None,
     })
 }
 
@@ -3486,6 +3490,20 @@ fn note_exit(services: &mut BTreeMap<String, Service>, pid: i32, status: i32, at
         } else {
             format!("status {:#x}", status)
         };
+        // A `SIGKILL` may be the kernel's, for a server that stopped
+        // answering: its list says so, and the line and the state file too.
+        let killed = libc::WIFSIGNALED(status) && libc::WTERMSIG(status) == libc::SIGKILL;
+        let hung = killed
+            .then(|| control::hung_of(pid, svc.started_at))
+            .flatten();
+        let how = match &hung {
+            Some(what) => format!("{how}, killed by the kernel for hanging: {what}"),
+            None => how,
+        };
+        let wall = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_or(0, |d| d.as_secs());
+        svc.last_death = Some((wall, control::death_cause(status, hung.as_deref())));
         // GPU-renderer fallback for the compositor (see COMPOSITOR_DEGRADED):
         // count labwc's exits while nvidia.wlr_gles2/vulkan is requested and,
         // past the tolerance, flip later respawns to pixman. Counted on EVERY

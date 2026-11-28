@@ -6286,6 +6286,8 @@ use parked_wait::wake_parked_wait;
 pub use parked_wait::{check_signals_parking, unpark_wait};
 mod send_signal;
 pub use send_signal::*;
+mod hung_kill;
+pub use hung_kill::{hung_text, kill_hung};
 
 mod job_stop;
 use job_stop::wake_for_job_control;

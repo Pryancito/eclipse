@@ -133,6 +133,9 @@ pub struct Server {
     pub init_restarts: u32,
     /// Times a stack started its driver again, which init never sees.
     pub driver_restarts: u32,
+    /// How its last run ended, as init says ([`crate::sysmon::Svc::died`]).
+    pub died: Option<u64>,
+    pub cause: Option<String>,
 }
 
 impl Server {
@@ -214,6 +217,8 @@ pub fn servers(svcs: &[Svc], said: &[Said], kernel: &Kernel, alive: &dyn Fn(i32)
                 gives,
                 init_restarts: svc.starts.saturating_sub(1),
                 driver_restarts,
+                died: svc.died,
+                cause: svc.cause.clone(),
             })
         })
         .collect()

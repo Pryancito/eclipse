@@ -1080,6 +1080,14 @@ strings! {
     mon_driver => { both: "driver" },
     mon_restarts_by_init => { es: "reinicios (init)", en: "restarts (init)" },
     mon_restarts_by_stack => { es: "reinicios (pila)", en: "restarts (stack)" },
+    /// How the service's last run this boot ended, and how long ago.
+    mon_last_death => { es: "última caída", en: "last death" },
+    /// The kernel killed it because it stopped answering; `{}` is what it served.
+    mon_death_hung => { es: "colgado ({}): lo mató el núcleo", en: "hung ({}): killed by the kernel" },
+    mon_death_signal => { es: "señal {}", en: "signal {}" },
+    mon_death_exit => { es: "salió con {}", en: "exited with {}" },
+    /// `fue hace 3 min` / `3 min ago`.
+    mon_death_ago => { es: "fue hace {}", en: "{} ago" },
     /// `eth0 · 52:54:00:12:34:56`, when no interface has the card's MAC yet.
     mon_no_interface_yet => { es: "sin interfaz todavía", en: "no interface yet" },
     mon_no_disk_node => { es: "sin nodo de disco claro", en: "no clear disk node" },

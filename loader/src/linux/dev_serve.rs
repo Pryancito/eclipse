@@ -109,8 +109,7 @@ pub(super) fn drm_serve(proc: &Arc<Process>, args: &[usize; 6]) -> ZxResult {
     card.killed_with(
         proc.id(),
         alloc::boxed::Box::new(move || {
-            let kill = linux_object::signal::Signal::SIGKILL;
-            if let Err(e) = linux_object::process::send_signal_to_process(pid, kill) {
+            if let Err(e) = linux_object::process::kill_hung(pid, "served DRM card") {
                 warn!("served drm: the hung server {pid} was not killed: {e:?}");
             }
         }),
@@ -199,8 +198,7 @@ pub(super) fn nvctl_serve(proc: &Arc<Process>, args: &[usize; 6]) -> ZxResult {
     rm.killed_with(
         proc.id(),
         alloc::boxed::Box::new(move || {
-            let kill = linux_object::signal::Signal::SIGKILL;
-            if let Err(e) = linux_object::process::send_signal_to_process(pid, kill) {
+            if let Err(e) = linux_object::process::kill_hung(pid, "/dev/nvidiactl") {
                 warn!("[nvidiactl] the hung RM server {pid} was not killed: {e:?}");
             }
         }),
@@ -414,11 +412,11 @@ pub(super) fn dev_serve(proc: &Arc<Process>, args: &[usize; 6]) -> ZxResult {
     // A server that stops answering is killed, by its pid, which is its
     // own for as long as it holds the other end of the FIFO.
     let pid = proc.id() as usize;
+    let what = alloc::format!("/dev/{}", node.name());
     node.killed_with(
         proc.id(),
         alloc::boxed::Box::new(move || {
-            let kill = linux_object::signal::Signal::SIGKILL;
-            if let Err(e) = linux_object::process::send_signal_to_process(pid, kill) {
+            if let Err(e) = linux_object::process::kill_hung(pid, &what) {
                 warn!("served dev: the hung server {pid} was not killed: {e:?}");
             }
         }),

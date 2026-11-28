@@ -46,8 +46,7 @@ pub(super) fn mount_help(proc: &Arc<Process>, args: &[usize; 6]) -> Result<(), Z
         })?;
     let pid = proc.id() as usize;
     helper.killed_with(alloc::boxed::Box::new(move || {
-        let kill = linux_object::signal::Signal::SIGKILL;
-        if let Err(e) = linux_object::process::send_signal_to_process(pid, kill) {
+        if let Err(e) = linux_object::process::kill_hung(pid, "mount helper") {
             warn!("mount helper: the hung helper {pid} was not killed: {e:?}");
         }
     }));

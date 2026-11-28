@@ -767,8 +767,7 @@ fn netstack_serve(proc: &Arc<Process>, args: &[usize; 6]) -> ZxResult {
                      it is killed, and its sockets wait for the next",
                     STACK_HUNG_AFTER_MS / 1000
                 );
-                let kill = linux_object::signal::Signal::SIGKILL;
-                if let Err(e) = linux_object::process::send_signal_to_process(pid, kill) {
+                if let Err(e) = linux_object::process::kill_hung(pid, "network stack") {
                     warn!("network stack: the hung process {pid} was not killed: {e:?}");
                 }
                 killed = true;
