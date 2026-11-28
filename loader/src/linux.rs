@@ -732,12 +732,12 @@ fn netstack_serve(proc: &Arc<Process>, args: &[usize; 6]) -> ZxResult {
         let mut killed = false;
         // One timer at a time, made again only when it has gone off: not
         // one for every wake of the channel, which is every burst of frames.
-        let tick = || {
-            kernel_hal::thread::sleep_until(kernel_hal::timer::timer_now() + STACK_WATCH_EVERY)
-        };
+        let tick =
+            || kernel_hal::thread::sleep_until(kernel_hal::timer::timer_now() + STACK_WATCH_EVERY);
         let mut timer = alloc::boxed::Box::pin(tick());
         while !serving.is_over() {
-            let mut said = core::pin::pin!(wire.wait_signal(Signal::READABLE | Signal::PEER_CLOSED));
+            let mut said =
+                core::pin::pin!(wire.wait_signal(Signal::READABLE | Signal::PEER_CLOSED));
             let woke = core::future::poll_fn(|cx| {
                 if said.as_mut().poll(cx).is_ready() {
                     Poll::Ready(true)
@@ -803,6 +803,7 @@ const STACK_HUNG_AFTER_MS: u64 = 10_000;
 /// How long a stack may say nothing before the watch asks it for a `PING`:
 /// one small message for each such while on an idle machine, none on a busy
 /// one, whose stack is heard from all the time.
+#[cfg(feature = "zircon-gateway")]
 const STACK_PING_AFTER_MS: u64 = 5_000;
 
 /// How long a connection the stack died while making waits for the next
